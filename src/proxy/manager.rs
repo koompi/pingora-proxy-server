@@ -207,6 +207,9 @@ impl ProxyHttp for ManagerProxy {
         resp.insert_header("content-type", "application/json")
             .unwrap();
 
+        // Add Connection: close header to force the connection to close after response
+        resp.insert_header("connection", "close").unwrap();
+
         // Write the response header - passing true for end_of_stream if there's no body
         let body_bytes = response_body.into_bytes();
         session
@@ -216,14 +219,19 @@ impl ProxyHttp for ManagerProxy {
         // Only write body if there is something to write
         if !body_bytes.is_empty() {
             // Write the response body and mark it as the end of the stream (true)
-            // Note: Session::write_response_body expects Option<Bytes>, not Bytes directly
             session
                 .write_response_body(Some(bytes::Bytes::from(body_bytes)), true)
                 .await?;
         }
 
-        // Mark that the response has been written
+        // Explicitly mark the response as complete
         session.response_written();
+
+        // Disable keepalive
+        session.set_keepalive(None);
+
+        // Log completion
+        println!("Response complete, connection will be closed");
 
         // Return false to indicate we've handled the request and no proxying is needed
         Ok(false)

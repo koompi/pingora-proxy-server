@@ -1,20 +1,20 @@
 {
   "servers": [
     {
-      "from": "koompi.cloud",
-      "to": "192.168.1.109:3000"
-    },
-    {
       "from": "weteka.com",
       "to": "192.168.1.103:50000"
     },
     {
-      "from": "domain.koompi.com",
-      "to": "192.168.1.132:81"
+      "from": "koompi.cloud",
+      "to": "192.168.1.109:3000"
     },
     {
       "from": "koompi.com",
       "to": "192.168.1.109:3002"
+    },
+    {
+      "from": "domain.koompi.com",
+      "to": "192.168.1.132:81"
     }
   ]
 }
