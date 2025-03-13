@@ -74,14 +74,18 @@ impl ProxyHttp for HttpProxy {
     }
 
     // Update this section in your HTTP proxy implementation
-    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
         let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-    
+
         match self.servers.lock() {
             Ok(servers) => match servers.get(&hostname) {
                 Some(to) => {
                     println!("Routing HTTP request to backend: {}", to);
-                    
+
                     // Parse swarm target if needed
                     let (target, use_tls, org_header) = if to.contains(".") && to.contains(":") {
                         // Likely a swarm DNS name
@@ -91,10 +95,10 @@ impl ProxyHttp for HttpProxy {
                         // Standard target
                         (to.to_owned(), false, None)
                     };
-                    
+
                     // Create HTTP peer
                     let mut peer = HttpPeer::new(target, use_tls, hostname.to_string());
-                    
+
                     // Add organization header if present
                     if let Some(org) = org_header {
                         // Access the correct location for extra headers in PeerOptions
@@ -103,7 +107,7 @@ impl ProxyHttp for HttpProxy {
                             org.to_string().into_bytes(),
                         );
                     }
-                    
+
                     Ok(Box::new(peer))
                 }
                 None => {

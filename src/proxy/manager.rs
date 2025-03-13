@@ -277,7 +277,7 @@ impl ProxyHttp for ManagerProxy {
             }
         } else if method == "POST" && path_segments.len() > 2 {
             let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-            
+
             let to = path_segments
                 .get(2)
                 .unwrap_or(&String::new())
@@ -318,21 +318,75 @@ impl ProxyHttp for ManagerProxy {
         }
         // Handle DELETE requests (remove mapping)
         else if method == "DELETE" && path_segments.len() > 1 {
-            let from = path_segments.get(1).unwrap_or(&String::new()).clone();
+            // Clean up path segments by removing trailing commas, semicolons, and whitespace
+            let clean_path_segments: Vec<String> = path_segments
+                .iter()
+                .map(|s| {
+                    s.trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
+                        .to_string()
+                })
+                .collect();
+
+            let from = clean_path_segments.get(1).unwrap_or(&String::new()).clone();
+
+            // Remove any trailing empty segments (which would come from trailing slashes)
+            let from = from.trim_end_matches('/');
+
+            println!("Processing DELETE request for: {}", from);
 
             println!("Processing DELETE request for: {}", from);
 
             if !from.is_empty() {
+                // Create a variable to track deletion success
+                let mut deletion_success = false;
+
                 // Use a block to limit the mutex lock scope
                 {
                     match self.servers.lock() {
                         Ok(mut servers) => {
-                            servers.remove(&from);
+                            // Check if the domain exists before trying to remove it
+                            if servers.contains_key(from) {
+                                // Remove the entry from the HashMap
+                                servers.remove(from);
+                                deletion_success = true;
 
-                            let updates = create_mappings_from_store(&servers);
-                            update_config(updates);
+                                println!("Removed mapping for: {} from in-memory store", from);
 
-                            println!("Removed mapping for: {}", from);
+                                // Create fresh mappings from the updated store
+                                let updates = create_mappings_from_store(&servers);
+
+                                // Log the updates we're going to write
+                                println!("Writing {} mappings to config file", updates.len());
+                                for mapping in &updates {
+                                    println!("  - {}: {}", mapping.from, mapping.to);
+                                }
+
+                                // Update the config file
+                                match update_config(updates) {
+                                    Ok(_) => {
+                                        println!(
+                                            "Successfully updated config file after removing {}",
+                                            from
+                                        );
+                                    }
+                                    Err(e) => {
+                                        println!("Error updating config file: {}", e);
+                                        response_status = 500;
+                                        response_body = format!(
+                                            "{{\"status\":\"error\",\"message\":\"Failed to persist configuration change: {}\"}}",
+                                            e
+                                        );
+                                        deletion_success = false;
+                                    }
+                                }
+                            } else {
+                                println!("Domain {} not found in configuration", from);
+                                response_status = 404;
+                                response_body = format!(
+                                    "{{\"status\":\"error\",\"message\":\"Domain {} not found\"}}",
+                                    from
+                                );
+                            }
                         }
                         Err(e) => {
                             println!("Error locking servers mutex: {}", e);
@@ -340,6 +394,56 @@ impl ProxyHttp for ManagerProxy {
                             response_body = format!(
                                 "{{\"status\":\"error\",\"message\":\"Internal server error: {}\"}}",
                                 "Failed to acquire lock on server configuration"
+                            );
+                        }
+                    }
+                }
+
+                // If deletion was successful, validate by checking the file
+                if deletion_success {
+                    // Read the config file to verify changes
+                    match std::fs::read_to_string("config.json") {
+                        Ok(content) => {
+                            match serde_json::from_str::<crate::config::model::Configuration>(
+                                &content,
+                            ) {
+                                Ok(config) => {
+                                    let domain_exists =
+                                        config.servers.iter().any(|m| m.from == from);
+                                    if domain_exists {
+                                        println!(
+                                            "WARNING: Domain {} still exists in config file after deletion!",
+                                            from
+                                        );
+                                        response_status = 500;
+                                        response_body = String::from(
+                                            "{{\"status\":\"error\",\"message\":\"Domain was removed from memory but still exists in config file\"}}",
+                                        );
+                                    } else {
+                                        println!(
+                                            "Verified domain {} was successfully removed from config file",
+                                            from
+                                        );
+                                        response_status = 200;
+                                        response_body = String::from("{{\"status\":\"success\"}}");
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("Error parsing config file after deletion: {}", e);
+                                    response_status = 500;
+                                    response_body = format!(
+                                        "{{\"status\":\"error\",\"message\":\"Failed to verify deletion: {}\"}}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error reading config file after deletion: {}", e);
+                            response_status = 500;
+                            response_body = format!(
+                                "{{\"status\":\"error\",\"message\":\"Failed to verify deletion: {}\"}}",
+                                e
                             );
                         }
                     }

@@ -49,43 +49,36 @@ pub fn get_config() -> ConfigStore {
 }
 
 /// Update configuration file with new server mappings
-pub fn update_config(servers: Vec<ServerMapping>) {
+pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> {
     let config = Configuration { servers };
     let data = match serde_json::to_string_pretty(&config) {
         Ok(data) => data,
         Err(err) => {
             println!("Error serializing config: {}", err);
-            return;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Serialization error: {}", err),
+            ));
         }
     };
 
-    let file_result = std::fs::File::options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(CONFIG_PATH);
+    // Use a more robust approach to writing the file:
+    // 1. First write to a temporary file
+    // 2. Then rename the temporary file to the target file
+    let temp_path = format!("{}.tmp", CONFIG_PATH);
 
-    match file_result {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(data.as_bytes()) {
-                println!("Error writing config: {}", err);
-                return;
-            }
-
-            if let Err(err) = file.sync_all() {
-                println!("Error syncing config file: {}", err);
-            }
-
-            if let Err(err) = file.flush() {
-                println!("Error flushing config file: {}", err);
-            }
-
-            println!("Config updated successfully");
-        }
-        Err(err) => {
-            println!("Error opening config file for writing: {}", err);
-        }
+    // Create and write to temp file
+    {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?; // Make sure all data is flushed to disk
     }
+
+    // Rename temp file to actual config file
+    std::fs::rename(&temp_path, CONFIG_PATH)?;
+
+    println!("Config updated successfully");
+    Ok(())
 }
 
 /// Create mappings from config store

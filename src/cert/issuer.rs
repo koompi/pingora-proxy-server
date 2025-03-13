@@ -107,23 +107,23 @@ impl CertificateIssuer {
     // Validate that the domain points to our server
     async fn validate_domain(&self, domain: &str) -> Result<()> {
         println!("Validating domain: {}", domain);
-        
+
         // 1. DNS resolution check
         let addresses = format!("{}:443", domain).to_socket_addrs()?;
-        
+
         // For testing purposes, consider any local IP as valid
         // You can remove or modify this for production
         let valid_ips = vec![
             "127.0.0.1".to_string(),
             "localhost".to_string(),
-            self.public_ip.clone()
+            self.public_ip.clone(),
         ];
-        
+
         let mut found_matching_ip = false;
         for addr in addresses {
             let ip = addr.ip().to_string();
             println!("Resolved IP for {}: {}", domain, ip);
-            
+
             // In testing mode, consider localhost as valid
             if valid_ips.contains(&ip) || ip.starts_with("192.168.") || ip.starts_with("10.") {
                 found_matching_ip = true;
@@ -131,18 +131,18 @@ impl CertificateIssuer {
                 break;
             }
         }
-        
+
         if !found_matching_ip {
             return Err(anyhow!(
-                "Domain {} does not resolve to a valid IP (local: 127.0.0.1 or public: {})", 
-                domain, 
+                "Domain {} does not resolve to a valid IP (local: 127.0.0.1 or public: {})",
+                domain,
                 self.public_ip
             ));
         }
-        
+
         // 2. Wait a moment to ensure DNS propagation
         tokio::time::sleep(Duration::from_secs(1)).await;
-        
+
         Ok(())
     }
 
@@ -203,31 +203,34 @@ impl CertificateIssuer {
         let domain = &request.domain;
         let email = &request.email;
         let staging = request.staging.unwrap_or(false);
-        
+
         println!("Issuing certificate for: {}", domain);
-        
+
         // For local testing, create dummy certificate files
         let dummy_testing = true; // Set to false for production
-        
+
         if dummy_testing {
             println!("Creating dummy certificate files for testing");
-            
+
             // Create directories
             let live_dir = self.certbot_dir.join("live").join(domain);
             fs::create_dir_all(&live_dir)?;
-            
+
             let cert_path = live_dir.join("fullchain.pem");
             let key_path = live_dir.join("privkey.pem");
-            
+
             // Create dummy certificate files
             fs::write(&cert_path, "DUMMY CERTIFICATE FOR TESTING\n")?;
             fs::write(&key_path, "DUMMY PRIVATE KEY FOR TESTING\n")?;
-            
+
             // Also copy to output directory
             fs::create_dir_all(self.output_dir.join(domain))?;
-            fs::copy(&cert_path, self.output_dir.join(domain).join("fullchain.pem"))?;
+            fs::copy(
+                &cert_path,
+                self.output_dir.join(domain).join("fullchain.pem"),
+            )?;
             fs::copy(&key_path, self.output_dir.join(domain).join("privkey.pem"))?;
-            
+
             return Ok(CertificateStatus {
                 domain: domain.to_string(),
                 status: "issued".to_string(),
