@@ -198,6 +198,11 @@ cargo build --release
 RUST_LOG=info ./target/release/pingora-proxy-server
 ```
 
+### Build and push new docker image
+```
+docker buildx build --platform linux/amd64,linux/arm64 -t image.koompi.org/pingora-proxy-server:latest --push .
+```
+
 ### Environment Variables
 
 | Variable | Description | Default |
