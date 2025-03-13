@@ -1,5 +1,5 @@
 [package]
-name = "web-server"
+name = "pingora-proxy-server"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,9 +14,11 @@ jemallocator = "0.5.4"
 log = "0.4.26"
 pingora = { version = "0.4.0", features = ["rustls"] }
 pingora-core = { version = "0.4.0", features = ["rustls"] }
-pingora-http = "0.4.0"  # pingora-http doesn't have rustls feature
+pingora-http = "0.4.0"                                       # pingora-http doesn't have rustls feature
 pingora-load-balancing = "0.4.0"
 pingora-proxy = { version = "0.4.0", features = ["rustls"] }
+bollard = "0.16.1"
+bollard-stubs = "=1.44.0-rc.2"
 regex = "1.11.1"
 serde = "1.0.219"
 serde_json = "1.0.140"

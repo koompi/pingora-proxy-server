@@ -6,6 +6,8 @@ use std::{
 use pingora::{Result, prelude::HttpPeer};
 use pingora_proxy::{ProxyHttp, Session};
 
+use crate::proxy::utils::parse_swarm_target;
+
 use super::utils::extract_hostname;
 
 /// HTTPS Proxy implementation
@@ -32,20 +34,37 @@ impl ProxyHttp for HttpsProxy {
         Ok(false)
     }
 
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
         let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-
+    
         match self.servers.lock() {
             Ok(servers) => match servers.get(&hostname) {
                 Some(to) => {
                     println!("Routing HTTPS request to backend: {}", to);
-                    // Create an HTTPS peer (TLS=false since we're terminating TLS at the proxy)
-                    let res = HttpPeer::new(to.to_owned(), false, hostname.to_string());
-                    Ok(Box::new(res))
+                    
+                    // Parse swarm target if needed
+                    let (target, use_tls, org_header) = if to.contains(".") && to.contains(":") {
+                        // Likely a swarm DNS name
+                        let (host, port, org_id) = parse_swarm_target(to);
+                        (format!("{}:{}", host, port), false, org_id)
+                    } else {
+                        // Standard target
+                        (to.to_owned(), false, None)
+                    };
+                    
+                    // Create HTTPS peer
+                    let mut peer = HttpPeer::new(target, use_tls, hostname.to_string());
+                    
+                    // Add organization header if present
+                    if let Some(org) = org_header {
+                        // Use the correct field: options.extra_proxy_headers instead of extra_headers
+                        peer.options.extra_proxy_headers.insert(
+                            "X-Organization-ID".to_string(),
+                            org.to_string().into_bytes(),
+                        );
+                    }
+                    
+                    Ok(Box::new(peer))
                 }
                 None => {
                     println!("No backend found for hostname: {}, using default", hostname);

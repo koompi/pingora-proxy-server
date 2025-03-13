@@ -5,6 +5,7 @@ use pingora::{listeners::tls::TlsSettings, server::Server};
 mod cert;
 mod config;
 mod proxy;
+mod services;
 
 use cert::certbot::find_certbot_certs;
 use config::file_manager::get_config;
@@ -12,6 +13,8 @@ use proxy::http::HttpProxy;
 use proxy::https::HttpsProxy;
 use proxy::manager::ManagerProxy;
 use proxy::utils::clean_backend_address;
+use crate::services::docker_swarm::SwarmDiscoveryService;
+
 
 fn fix_config_file() {
     // Load the configuration
@@ -174,6 +177,36 @@ fn main() {
     }
 
     server.add_service(manager_service);
+
+    let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
+    .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
+    
+let swarm_mode = std::env::var("SWARM_MODE")
+    .map(|v| v.to_lowercase() == "true")
+    .unwrap_or(false);
+    
+    if swarm_mode {
+        // Default swarm networks to check
+        let networks = std::env::var("SWARM_NETWORKS")
+            .map(|nets| nets.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|_| vec!["ingress".to_string()]);
+            
+        // Setup swarm discovery service
+        match SwarmDiscoveryService::new(
+            config_store.clone(),
+            &docker_endpoint,
+            networks,
+            30, // Check every 30 seconds
+        ) {
+            Ok(swarm_service) => {
+                println!("Adding Docker Swarm discovery service");
+                server.add_service(swarm_service); // Remove the Box::new() wrapper
+            },
+            Err(e) => {
+                println!("Failed to initialize Docker Swarm discovery: {}", e);
+            }
+        }
+    }
 
     // Start the server
     println!("Starting server with configured services");

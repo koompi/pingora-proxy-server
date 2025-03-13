@@ -10,6 +10,8 @@ use pingora::{Result, connectors::http, prelude::HttpPeer};
 use pingora_http::StatusCode;
 use pingora_proxy::{ProxyHttp, Session};
 
+use crate::proxy::utils::parse_swarm_target;
+
 use super::utils::extract_hostname;
 
 /// HTTP Proxy implementation
@@ -71,42 +73,51 @@ impl ProxyHttp for HttpProxy {
         Ok(false)
     }
 
-    fn upstream_peer<'life0, 'life1, 'life2, 'async_trait>(
-        &'life0 self,
-        session: &'life1 mut Session,
-        _ctx: &'life2 mut Self::CTX,
-    ) -> ::core::pin::Pin<
-        Box<
-            dyn ::core::future::Future<Output = Result<Box<HttpPeer>>>
-                + ::core::marker::Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        Self: 'async_trait,
-    {
+    // Update this section in your HTTP proxy implementation
+    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
         let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-
+    
         match self.servers.lock() {
             Ok(servers) => match servers.get(&hostname) {
                 Some(to) => {
-                    let res = HttpPeer::new(to.to_owned(), false, hostname.to_string());
-                    Box::pin(async move { Ok(Box::new(res)) })
+                    println!("Routing HTTP request to backend: {}", to);
+                    
+                    // Parse swarm target if needed
+                    let (target, use_tls, org_header) = if to.contains(".") && to.contains(":") {
+                        // Likely a swarm DNS name
+                        let (host, port, org_id) = parse_swarm_target(to);
+                        (format!("{}:{}", host, port), false, org_id)
+                    } else {
+                        // Standard target
+                        (to.to_owned(), false, None)
+                    };
+                    
+                    // Create HTTP peer
+                    let mut peer = HttpPeer::new(target, use_tls, hostname.to_string());
+                    
+                    // Add organization header if present
+                    if let Some(org) = org_header {
+                        // Access the correct location for extra headers in PeerOptions
+                        peer.options.extra_proxy_headers.insert(
+                            "X-Organization-ID".to_string(),
+                            org.to_string().into_bytes(),
+                        );
+                    }
+                    
+                    Ok(Box::new(peer))
                 }
                 None => {
                     // Default backend when no matching host is found
+                    println!("No backend found for host: {}", hostname);
                     let res = HttpPeer::new("127.0.0.1:5500", false, "".to_string());
-                    Box::pin(async move { Ok(Box::new(res)) })
+                    Ok(Box::new(res))
                 }
             },
             Err(e) => {
                 println!("Error locking servers mutex in HttpProxy: {:?}", e);
                 // Return default backend on lock error
                 let res = HttpPeer::new("127.0.0.1:5500", false, "".to_string());
-                Box::pin(async move { Ok(Box::new(res)) })
+                Ok(Box::new(res))
             }
         }
     }

@@ -214,7 +214,6 @@ impl ProxyHttp for ManagerProxy {
 
         println!("Full request URI: {}", session.req_header().uri);
 
-        // Also, modify how you're checking for certificate endpoints:
         if path_segments.len() > 1 && path_segments[1].starts_with("certificates") {
             // Remove any trailing commas from the path segment
             let segment = path_segments[1].trim_end_matches(",");
@@ -278,8 +277,7 @@ impl ProxyHttp for ManagerProxy {
             }
         } else if method == "POST" && path_segments.len() > 2 {
             let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-
-            // Clean the destination address - same fix as above
+            
             let to = path_segments
                 .get(2)
                 .unwrap_or(&String::new())
