@@ -1,4 +1,21 @@
 // src/proxy/manager.rs
+/*
+This file defines a "ManagerProxy" for a web service that manages domain routing.
+
+What it does:
+- Creates, updates, and deletes mappings between domains and backend servers
+- Handles certificate requests for domains
+- Serves as an admin interface through HTTP endpoints
+
+Main features:
+- GET: Lists all domain mappings
+- POST/PUT: Adds or updates where a domain points to
+- DELETE: Removes a domain mapping
+- Certificate management: Request and check status of SSL certificates
+
+It's part of a reverse proxy system that routes traffic based on domain names,
+allowing you to change where domains point without restarting the server.
+*/
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -8,9 +25,29 @@ use bytes::Bytes;
 use pingora::{Result, http, prelude::HttpPeer};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
+use serde::{Deserialize, Serialize};
 
 use crate::cert::issuer::{CertificateIssuer, CertificateRequest, CertificateStatus};
 use crate::config::file_manager::{create_mappings_from_store, update_config};
+
+// Response structure for API endpoints
+#[derive(Serialize)]
+struct ApiResponse {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mappings: Option<Vec<DomainMapping>>,
+}
+
+// Domain mapping structure
+#[derive(Serialize)]
+struct DomainMapping {
+    from: String,
+    to: String,
+}
 
 /// Manager Proxy for configuration endpoints
 #[derive(Clone)]
@@ -19,13 +56,15 @@ pub struct ManagerProxy {
 }
 
 impl ManagerProxy {
-    // Helper methods for responding to requests
-    async fn respond_with_json(
+    // Helper method to send JSON responses
+    async fn send_json_response(
         &self,
         session: &mut Session,
         status: http::StatusCode,
-        json: &str,
+        response: ApiResponse,
     ) -> Result<bool> {
+        let json = serde_json::to_string(&response).unwrap_or_default();
+
         let mut resp = ResponseHeader::build(status, None)?;
         resp.insert_header("content-type", "application/json")?;
         resp.insert_header("connection", "close")?;
@@ -42,14 +81,38 @@ impl ManagerProxy {
         Ok(true)
     }
 
-    async fn respond_with_error(
-        &self,
-        session: &mut Session,
-        status: http::StatusCode,
-        message: &str,
-    ) -> Result<bool> {
-        let error_json = format!("{{\"status\":\"error\",\"error\":\"{}\"}}", message);
-        self.respond_with_json(session, status, &error_json).await
+    // Helper to create success response
+    fn success_response() -> ApiResponse {
+        ApiResponse {
+            status: "success".to_string(),
+            error: None,
+            message: None,
+            mappings: None,
+        }
+    }
+
+    // Helper to create error response
+    fn error_response(message: &str) -> ApiResponse {
+        ApiResponse {
+            status: "error".to_string(),
+            error: Some(message.to_string()),
+            message: None,
+            mappings: None,
+        }
+    }
+
+    // Extract clean domain and backend from path segments
+    fn extract_domain_and_backend(&self, path_segments: &[String]) -> (String, String) {
+        let from = path_segments.get(1).unwrap_or(&String::new()).clone();
+
+        let to = path_segments
+            .get(2)
+            .unwrap_or(&String::new())
+            .clone()
+            .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
+            .to_string();
+
+        (from, to)
     }
 
     // Handle certificate requests
@@ -62,23 +125,21 @@ impl ManagerProxy {
         match method {
             // Request a new certificate
             "POST" => {
-                // Read the request body chunks directly
+                // Read the request body
                 let mut body = Vec::new();
                 loop {
                     match session.downstream_session.read_request_body().await {
-                        Ok(Some(chunk)) => {
-                            body.extend_from_slice(&chunk);
-                        }
-                        Ok(None) => {
-                            // End of body
-                            break;
-                        }
+                        Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                        Ok(None) => break,
                         Err(e) => {
                             return self
-                                .respond_with_error(
+                                .send_json_response(
                                     session,
                                     http::StatusCode::BAD_REQUEST,
-                                    &format!("Failed to read request body: {}", e),
+                                    Self::error_response(&format!(
+                                        "Failed to read request body: {}",
+                                        e
+                                    )),
                                 )
                                 .await;
                         }
@@ -90,10 +151,10 @@ impl ManagerProxy {
                     Ok(req) => req,
                     Err(e) => {
                         return self
-                            .respond_with_error(
+                            .send_json_response(
                                 session,
                                 http::StatusCode::BAD_REQUEST,
-                                &format!("Invalid request format: {}", e),
+                                Self::error_response(&format!("Invalid request format: {}", e)),
                             )
                             .await;
                     }
@@ -104,10 +165,13 @@ impl ManagerProxy {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
-                            .respond_with_error(
+                            .send_json_response(
                                 session,
                                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!("Certificate issuer initialization failed: {}", e),
+                                Self::error_response(&format!(
+                                    "Certificate issuer initialization failed: {}",
+                                    e
+                                )),
                             )
                             .await;
                     }
@@ -119,33 +183,44 @@ impl ManagerProxy {
                 );
                 let status = issuer.process_request(request).await;
 
-                // Respond with the result
-                let response_json = serde_json::to_string(&status).unwrap_or_else(|_| {
+                // Serialize the status directly
+                let json = serde_json::to_string(&status).unwrap_or_else(|_| {
                     String::from(
                         "{\"status\":\"error\",\"error\":\"Failed to serialize response\"}",
                     )
                 });
 
-                self.respond_with_json(
-                    session,
+                // Send raw JSON for certificate status
+                let mut resp = ResponseHeader::build(
                     if status.error.is_some() {
                         http::StatusCode::BAD_REQUEST
                     } else {
                         http::StatusCode::OK
                     },
-                    &response_json,
-                )
-                .await
+                    None,
+                )?;
+                resp.insert_header("content-type", "application/json")?;
+                resp.insert_header("connection", "close")?;
+
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(Bytes::copy_from_slice(json.as_bytes())), true)
+                    .await?;
+
+                session.response_written();
+                session.set_keepalive(None);
+
+                Ok(true)
             }
 
             // Check certificate status
             "GET" => {
                 if path_segments.len() < 3 {
                     return self
-                        .respond_with_error(
+                        .send_json_response(
                             session,
                             http::StatusCode::BAD_REQUEST,
-                            "Domain parameter required",
+                            Self::error_response("Domain parameter required"),
                         )
                         .await;
                 }
@@ -155,10 +230,13 @@ impl ManagerProxy {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
-                            .respond_with_error(
+                            .send_json_response(
                                 session,
                                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!("Certificate issuer initialization failed: {}", e),
+                                Self::error_response(&format!(
+                                    "Certificate issuer initialization failed: {}",
+                                    e
+                                )),
                             )
                             .await;
                     }
@@ -176,19 +254,201 @@ impl ManagerProxy {
                     },
                 };
 
-                let response_json = serde_json::to_string(&status).unwrap_or_default();
-                self.respond_with_json(session, http::StatusCode::OK, &response_json)
-                    .await
+                // Send certificate status
+                let json = serde_json::to_string(&status).unwrap_or_default();
+                let mut resp = ResponseHeader::build(http::StatusCode::OK, None)?;
+                resp.insert_header("content-type", "application/json")?;
+                resp.insert_header("connection", "close")?;
+
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(Bytes::copy_from_slice(json.as_bytes())), true)
+                    .await?;
+
+                session.response_written();
+                session.set_keepalive(None);
+
+                Ok(true)
             }
 
             // Method not supported
             _ => {
-                self.respond_with_error(
+                self.send_json_response(
                     session,
                     http::StatusCode::METHOD_NOT_ALLOWED,
-                    "Method not allowed for certificates endpoint",
+                    Self::error_response("Method not allowed for certificates endpoint"),
                 )
                 .await
+            }
+        }
+    }
+
+    // Handle adding or updating domain mapping
+    async fn handle_add_update_mapping(
+        &self,
+        method: &str,
+        path_segments: &[String],
+    ) -> (http::StatusCode, ApiResponse) {
+        let (from, to) = self.extract_domain_and_backend(path_segments);
+
+        println!("Processing {} request: mapping {} -> {}", method, from, &to);
+
+        if from.is_empty() || to.is_empty() {
+            return (
+                http::StatusCode::BAD_REQUEST,
+                Self::error_response("Invalid domain or backend address"),
+            );
+        }
+
+        match self.servers.lock() {
+            Ok(mut servers) => {
+                servers.insert(from.clone(), to.clone());
+                let updates = create_mappings_from_store(&servers);
+
+                match update_config(updates) {
+                    Ok(_) => {
+                        println!(
+                            "{} mapping: {} -> {}",
+                            if method == "POST" { "Added" } else { "Updated" },
+                            from,
+                            &to
+                        );
+                        (http::StatusCode::OK, Self::success_response())
+                    }
+                    Err(e) => {
+                        println!("Error updating config: {}", e);
+                        (
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Self::error_response(&format!(
+                                "Failed to persist configuration: {}",
+                                e
+                            )),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Error locking servers mutex: {}", e);
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Self::error_response("Failed to acquire lock on server configuration"),
+                )
+            }
+        }
+    }
+
+    // Handle removing domain mapping
+    async fn handle_delete_mapping(
+        &self,
+        path_segments: &[String],
+    ) -> (http::StatusCode, ApiResponse) {
+        // Get the domain to delete
+        if path_segments.len() < 2 {
+            return (
+                http::StatusCode::BAD_REQUEST,
+                Self::error_response("Missing domain parameter"),
+            );
+        }
+
+        let from =
+            path_segments[1].trim_end_matches(|c| c == ',' || c == ' ' || c == ';' || c == '/');
+
+        println!("Processing DELETE request for: {}", from);
+
+        if from.is_empty() {
+            return (
+                http::StatusCode::BAD_REQUEST,
+                Self::error_response("Invalid domain"),
+            );
+        }
+
+        match self.servers.lock() {
+            Ok(mut servers) => {
+                // Check if domain exists
+                if !servers.contains_key(from) {
+                    return (
+                        http::StatusCode::NOT_FOUND,
+                        Self::error_response(&format!("Domain {} not found", from)),
+                    );
+                }
+
+                // Remove from in-memory store
+                servers.remove(from);
+                println!("Removed mapping for: {} from in-memory store", from);
+
+                // Update config file
+                let updates = create_mappings_from_store(&servers);
+                match update_config(updates) {
+                    Ok(_) => {
+                        // Verify removal
+                        if let Ok(content) = std::fs::read_to_string("config.json") {
+                            if let Ok(config) = serde_json::from_str::<
+                                crate::config::model::Configuration,
+                            >(&content)
+                            {
+                                if config.servers.iter().any(|m| m.from == from) {
+                                    return (
+                                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        Self::error_response(
+                                            "Domain was removed from memory but still exists in config file",
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
+                        (http::StatusCode::OK, Self::success_response())
+                    }
+                    Err(e) => {
+                        println!("Error updating config file: {}", e);
+                        (
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Self::error_response(&format!(
+                                "Failed to persist configuration change: {}",
+                                e
+                            )),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Error locking servers mutex: {}", e);
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Self::error_response("Failed to acquire lock on server configuration"),
+                )
+            }
+        }
+    }
+
+    // Handle listing all mappings
+    async fn handle_list_mappings(&self) -> (http::StatusCode, ApiResponse) {
+        match self.servers.lock() {
+            Ok(servers) => {
+                let mappings = servers
+                    .iter()
+                    .map(|(domain, backend)| DomainMapping {
+                        from: domain.clone(),
+                        to: backend.clone(),
+                    })
+                    .collect();
+
+                (
+                    http::StatusCode::OK,
+                    ApiResponse {
+                        status: "success".to_string(),
+                        error: None,
+                        message: None,
+                        mappings: Some(mappings),
+                    },
+                )
+            }
+            Err(e) => {
+                println!("Error locking servers mutex: {}", e);
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Self::error_response("Failed to acquire lock on server configuration"),
+                )
             }
         }
     }
@@ -201,24 +461,20 @@ impl ProxyHttp for ManagerProxy {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        // Process admin commands
+        // Get request details
         let summary = session.request_summary();
         println!("Request summary: {}", summary);
 
+        // Parse request method and path
         let segments = summary.split_whitespace().collect::<Vec<&str>>();
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let pathname = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
+        // Split path into segments
         let path_segments: Vec<String> = pathname.split('/').map(|seg| seg.to_string()).collect();
-        println!("Request path segments: {:#?}", &path_segments);
 
-        println!("Full request URI: {}", session.req_header().uri);
-
+        // Handle certificate endpoints
         if path_segments.len() > 1 && path_segments[1].starts_with("certificates") {
-            // Remove any trailing commas from the path segment
-            let segment = path_segments[1].trim_end_matches(",");
-
-            // Create a cleaned vector
             let clean_segments: Vec<String> = path_segments
                 .iter()
                 .map(|s| s.trim_end_matches(",").to_string())
@@ -229,302 +485,32 @@ impl ProxyHttp for ManagerProxy {
                 .await;
         }
 
-        // Handle regular route management requests
-        let mut response_status = 200;
-        let mut response_body = String::from("{\"status\":\"success\"}");
-
-        // Handle PUT requests (update existing mapping)
-        if method == "PUT" && path_segments.len() > 2 {
-            let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-
-            // Clean the destination address by removing trailing commas or whitespace
-            let to = path_segments
-                .get(2)
-                .unwrap_or(&String::new())
-                .clone()
-                .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
-                .to_string();
-
-            println!("Processing PUT request: mapping {} -> {}", from, &to);
-
-            if !from.is_empty() && !to.is_empty() {
-                // Use a block to limit the mutex lock scope
-                {
-                    match self.servers.lock() {
-                        Ok(mut servers) => {
-                            servers.insert(from.clone(), to.clone());
-
-                            let updates = create_mappings_from_store(&servers);
-                            update_config(updates);
-
-                            println!("Updated mapping: {} -> {}", from, &to);
-                        }
-                        Err(e) => {
-                            println!("Error locking servers mutex: {}", e);
-                            response_status = 500;
-                            response_body = format!(
-                                "{{\"status\":\"error\",\"message\":\"Internal server error: {}\"}}",
-                                "Failed to acquire lock on server configuration"
-                            );
-                        }
-                    }
-                }
-            } else {
-                response_status = 400;
-                response_body = String::from(
-                    "{\"status\":\"error\",\"message\":\"Invalid domain or backend address\"}",
-                );
+        // Handle standard route management endpoints
+        let (status, response) = match method.as_str() {
+            "PUT" | "POST" => {
+                // Add or update domain mapping
+                self.handle_add_update_mapping(&method, &path_segments)
+                    .await
             }
-        } else if method == "POST" && path_segments.len() > 2 {
-            let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-
-            let to = path_segments
-                .get(2)
-                .unwrap_or(&String::new())
-                .clone()
-                .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
-                .to_string();
-
-            println!("Processing POST request: mapping {} -> {}", from, &to);
-
-            if !from.is_empty() && !to.is_empty() {
-                // Use a block to limit the mutex lock scope
-                {
-                    match self.servers.lock() {
-                        Ok(mut servers) => {
-                            servers.insert(from.clone(), to.clone());
-
-                            let updates = create_mappings_from_store(&servers);
-                            update_config(updates);
-
-                            println!("Added mapping: {} -> {}", from, &to);
-                        }
-                        Err(e) => {
-                            println!("Error locking servers mutex: {}", e);
-                            response_status = 500;
-                            response_body = format!(
-                                "{{\"status\":\"error\",\"message\":\"Internal server error: {}\"}}",
-                                "Failed to acquire lock on server configuration"
-                            );
-                        }
-                    }
-                }
-            } else {
-                response_status = 400;
-                response_body = String::from(
-                    "{\"status\":\"error\",\"message\":\"Invalid domain or backend address\"}",
-                );
+            "DELETE" => {
+                // Remove domain mapping
+                self.handle_delete_mapping(&path_segments).await
             }
-        }
-        // Handle DELETE requests (remove mapping)
-        else if method == "DELETE" && path_segments.len() > 1 {
-            // Clean up path segments by removing trailing commas, semicolons, and whitespace
-            let clean_path_segments: Vec<String> = path_segments
-                .iter()
-                .map(|s| {
-                    s.trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
-                        .to_string()
-                })
-                .collect();
-
-            let from = clean_path_segments.get(1).unwrap_or(&String::new()).clone();
-
-            // Remove any trailing empty segments (which would come from trailing slashes)
-            let from = from.trim_end_matches('/');
-
-            println!("Processing DELETE request for: {}", from);
-
-            println!("Processing DELETE request for: {}", from);
-
-            if !from.is_empty() {
-                // Create a variable to track deletion success
-                let mut deletion_success = false;
-
-                // Use a block to limit the mutex lock scope
-                {
-                    match self.servers.lock() {
-                        Ok(mut servers) => {
-                            // Check if the domain exists before trying to remove it
-                            if servers.contains_key(from) {
-                                // Remove the entry from the HashMap
-                                servers.remove(from);
-                                deletion_success = true;
-
-                                println!("Removed mapping for: {} from in-memory store", from);
-
-                                // Create fresh mappings from the updated store
-                                let updates = create_mappings_from_store(&servers);
-
-                                // Log the updates we're going to write
-                                println!("Writing {} mappings to config file", updates.len());
-                                for mapping in &updates {
-                                    println!("  - {}: {}", mapping.from, mapping.to);
-                                }
-
-                                // Update the config file
-                                match update_config(updates) {
-                                    Ok(_) => {
-                                        println!(
-                                            "Successfully updated config file after removing {}",
-                                            from
-                                        );
-                                    }
-                                    Err(e) => {
-                                        println!("Error updating config file: {}", e);
-                                        response_status = 500;
-                                        response_body = format!(
-                                            "{{\"status\":\"error\",\"message\":\"Failed to persist configuration change: {}\"}}",
-                                            e
-                                        );
-                                        deletion_success = false;
-                                    }
-                                }
-                            } else {
-                                println!("Domain {} not found in configuration", from);
-                                response_status = 404;
-                                response_body = format!(
-                                    "{{\"status\":\"error\",\"message\":\"Domain {} not found\"}}",
-                                    from
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error locking servers mutex: {}", e);
-                            response_status = 500;
-                            response_body = format!(
-                                "{{\"status\":\"error\",\"message\":\"Internal server error: {}\"}}",
-                                "Failed to acquire lock on server configuration"
-                            );
-                        }
-                    }
-                }
-
-                // If deletion was successful, validate by checking the file
-                if deletion_success {
-                    // Read the config file to verify changes
-                    match std::fs::read_to_string("config.json") {
-                        Ok(content) => {
-                            match serde_json::from_str::<crate::config::model::Configuration>(
-                                &content,
-                            ) {
-                                Ok(config) => {
-                                    let domain_exists =
-                                        config.servers.iter().any(|m| m.from == from);
-                                    if domain_exists {
-                                        println!(
-                                            "WARNING: Domain {} still exists in config file after deletion!",
-                                            from
-                                        );
-                                        response_status = 500;
-                                        response_body = String::from(
-                                            "{{\"status\":\"error\",\"message\":\"Domain was removed from memory but still exists in config file\"}}",
-                                        );
-                                    } else {
-                                        println!(
-                                            "Verified domain {} was successfully removed from config file",
-                                            from
-                                        );
-                                        response_status = 200;
-                                        response_body = String::from("{{\"status\":\"success\"}}");
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("Error parsing config file after deletion: {}", e);
-                                    response_status = 500;
-                                    response_body = format!(
-                                        "{{\"status\":\"error\",\"message\":\"Failed to verify deletion: {}\"}}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error reading config file after deletion: {}", e);
-                            response_status = 500;
-                            response_body = format!(
-                                "{{\"status\":\"error\",\"message\":\"Failed to verify deletion: {}\"}}",
-                                e
-                            );
-                        }
-                    }
-                }
-            } else {
-                response_status = 400;
-                response_body =
-                    String::from("{\"status\":\"error\",\"message\":\"Invalid domain\"}");
+            "GET" => {
+                // List all mappings
+                self.handle_list_mappings().await
             }
-        }
-        // Handle GET request (list all mappings)
-        else if method == "GET" {
-            println!("Processing GET request to list mappings");
-
-            match self.servers.lock() {
-                Ok(servers) => {
-                    let mut mappings_json = Vec::new();
-
-                    for (domain, backend) in servers.iter() {
-                        mappings_json.push(format!(
-                            "{{\"from\":\"{}\",\"to\":\"{}\"}}",
-                            domain, backend
-                        ));
-                    }
-
-                    response_body = format!(
-                        "{{\"status\":\"success\",\"mappings\":[{}]}}",
-                        mappings_json.join(",")
-                    );
-                }
-                Err(e) => {
-                    println!("Error locking servers mutex: {}", e);
-                    response_status = 500;
-                    response_body = format!(
-                        "{{\"status\":\"error\",\"message\":\"Internal server error: {}\"}}",
-                        "Failed to acquire lock on server configuration"
-                    );
-                }
+            _ => {
+                // Method not supported
+                (
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    Self::error_response("Method not allowed"),
+                )
             }
-        } else {
-            response_status = 404;
-            response_body = String::from("{\"status\":\"error\",\"message\":\"Not found\"}");
-        }
+        };
 
-        // Create response header with status code
-        let mut resp = pingora_http::ResponseHeader::build(
-            http::StatusCode::from_u16(response_status).unwrap_or(http::StatusCode::OK),
-            None,
-        )?;
-
-        // Add content-type header to the response
-        resp.insert_header("content-type", "application/json")?;
-
-        // Add Connection: close header to force the connection to close after response
-        resp.insert_header("connection", "close")?;
-
-        // Write the response header - passing true for end_of_stream if there's no body
-        let body_bytes = response_body.into_bytes();
-        session
-            .write_response_header(Box::new(resp), body_bytes.is_empty())
-            .await?;
-
-        // Only write body if there is something to write
-        if !body_bytes.is_empty() {
-            // Write the response body and mark it as the end of the stream (true)
-            session
-                .write_response_body(Some(Bytes::copy_from_slice(&body_bytes)), true)
-                .await?;
-        }
-
-        // Explicitly mark the response as complete
-        session.response_written();
-
-        // Disable keepalive
-        session.set_keepalive(None);
-
-        // Log completion
-        println!("Response complete, connection will be closed");
-
-        // Return true to indicate we've handled the request and no proxying is needed
-        Ok(true)
+        // Send response
+        self.send_json_response(session, status, response).await
     }
 
     async fn upstream_peer(
