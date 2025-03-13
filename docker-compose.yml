@@ -1,0 +1,34 @@
+# docker-compose.yml
+version: "3.7"
+
+services:
+  proxy:
+    image: your-proxy-image:latest
+    ports:
+      - "80:80"
+      - "443:443"
+      - "81:81"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - certs:/certs
+      - acme-challenge:/var/www/html/.well-known/acme-challenge
+    environment:
+      - SWARM_MODE=true
+      - SWARM_NETWORKS=ingress
+      - LOG_LEVEL=info
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == manager
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+
+volumes:
+  certs:
+  acme-challenge:
