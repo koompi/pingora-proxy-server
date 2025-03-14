@@ -14,6 +14,7 @@ services:
       - "81:81"
     networks:
       - proxy-network
+      - ingress
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - certbot:/certbot

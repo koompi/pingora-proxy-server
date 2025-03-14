@@ -28,13 +28,17 @@ pub fn clean_backend_address(address: &str) -> String {
 }
 
 pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
-    // Simplify this to use just the service name without the .ingress suffix
+    // Split by colon to separate host and port
     let parts: Vec<&str> = target.split(':').collect();
+    
+    // Extract port, default to 80 if not specified
     let port = if parts.len() > 1 {
         parts[1].parse::<u16>().unwrap_or(80)
     } else {
         80
     };
     
+    // Keep the full service DNS name without modification
+    // This is crucial for proper DNS resolution in Docker Swarm
     (parts[0].to_string(), port, None)
 }
