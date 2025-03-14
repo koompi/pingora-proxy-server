@@ -6,6 +6,8 @@ services:
     image: image.koompi.org/library/pingora-proxy-server:latest
     dns:
       - 127.0.0.11
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "80:80"
       - "443:443"
