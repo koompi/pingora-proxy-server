@@ -1,3 +1,4 @@
+# docker-compose.yml with enhanced security features
 version: "3.7"
 
 services:
@@ -13,18 +14,18 @@ services:
       - "81:81"
     networks:
       - proxy-network
+      - ingress
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - certbot:/certbot
       - acme-challenge:/var/www/html/.well-known/acme-challenge
-      - ./config.json:/app/config.json # Mount config file
-      - ./entrypoint.sh:/app/entrypoint.sh # Mount entrypoint script
-    entrypoint: ["/bin/bash", "/app/entrypoint.sh"] # Use custom entrypoint
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
-      - LOG_LEVEL=debug # Increased log level for debugging
-      - RUST_BACKTRACE=1 # Enable full backtrace
+      - LOG_LEVEL=info
+      - ENFORCE_NETWORK_ISOLATION=true
+      - DEFAULT_MEMORY_LIMIT=512M
+      - DEFAULT_CPU_LIMIT=0.5
     deploy:
       mode: global
       placement:
@@ -36,6 +37,25 @@ services:
       restart_policy:
         condition: any
         delay: 5s
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+      # Security configurations
+      # These are applied to the container runtime
+      config:
+        - source: proxy-security-policy
+          target: /etc/security-policy.json
+          mode: 0440
+    # Add security configurations
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges=true
+      - userns=host
+    read_only: true
 
 volumes:
   certbot:
@@ -44,3 +64,9 @@ volumes:
 networks:
   proxy-network:
     external: true
+    driver_opts:
+      encrypted: "true"
+
+configs:
+  proxy-security-policy:
+    file: ./security-policy.json
