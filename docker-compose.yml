@@ -27,7 +27,6 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-        max_attempts: 3
 
 volumes:
   certbot:
