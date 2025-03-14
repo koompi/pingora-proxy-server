@@ -98,17 +98,10 @@ impl SwarmDiscoveryService {
             // Create target using Docker Swarm DNS-based service discovery
             // Format depends on the context:
             let target = if let Some(org) = org_id.clone() {
-                // Track this service as part of the organization's network
-                org_services
-                    .entry(org.clone())
-                    .or_insert_with(HashSet::new)
-                    .insert(service_name.clone());
-                
-                // Use organization-specific format for stricter isolation
-                format!("{}.{}.{}:{}", org, service_name, self.networks[0], port)
+                // Use just the service name - the proxy will handle the DNS resolution
+                format!("tasks.{}:{}", service_name, port)
             } else {
-                // Use standard format - less secure but compatible
-                format!("{}.{}:{}", service_name, self.networks[0], port)
+                format!("tasks.{}:{}", service_name, port)
             };
 
             println!("Discovered service mapping: {} -> {}", domain, target);

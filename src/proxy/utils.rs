@@ -33,12 +33,7 @@ pub fn clean_backend_address(address: &str) -> String {
 
 /// Parse swarm target with enhanced error handling and better organization support
 pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
-    // Look for Docker Swarm service patterns:
-    // 1. tasks.service_name:port
-    // 2. service_name.network_name:port
-    // 3. org_id.service_name.network_name:port
-    
-    // First, split by colon to separate host and port
+    // Split by colon to separate host and port
     let parts: Vec<&str> = target.split(':').collect();
     
     // Extract port, default to 80 if not specified
@@ -48,37 +43,32 @@ pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
         80
     };
     
-    // Handle the hostname part
+    // Parse the host part to extract service name and org ID
     let host_parts: Vec<&str> = parts[0].split('.').collect();
     
-    // Case: org_id.service_name.network_name
-    if host_parts.len() >= 3 {
-        // Check if it's an organization-specific format
-        if host_parts[0].starts_with("org_") || !host_parts[0].chars().next().unwrap_or(' ').is_digit(10) {
+    if host_parts.len() >= 2 {
+        // If format includes an org ID prefix (something.service.network)
+        if host_parts[0].contains("_") || !host_parts[0].chars().next().unwrap_or('a').is_digit(10) {
+            // Extract org ID
             let org_id = Some(host_parts[0].to_string());
             
-            // Format host for Docker DNS resolution - important for inter-service communication
-            // in Swarm with overlay networks, we use tasks.service_name format
-            let host = format!("tasks.{}", host_parts[1]);
-            
-            return (host, port, org_id);
+            // Use the standard Docker service discovery DNS format
+            let service_name = host_parts[1].to_string();
+            return (format!("tasks.{}", service_name), port, org_id);
         }
-    }
-    
-    // Case: tasks.service_name
-    if parts[0].starts_with("tasks.") {
-        return (parts[0].to_string(), port, None);
-    }
-    
-    // Case: service_name.network_name
-    if host_parts.len() == 2 {
-        let host = format!("tasks.{}", host_parts[0]);
         
-        return (host, port, None);
+        // Handle the case where it's just service.network format
+        return (format!("tasks.{}", host_parts[0]), port, None);
     }
     
-    // Default case: just use the hostname as-is
-    (parts[0].to_string(), port, None)
+    // Default: assume it's a direct service name
+    let service_name = if parts[0].starts_with("tasks.") {
+        parts[0].to_string()
+    } else {
+        format!("tasks.{}", parts[0])
+    };
+    
+    (service_name, port, None)
 }
 
 /// Function to test if a Swarm service is reachable
