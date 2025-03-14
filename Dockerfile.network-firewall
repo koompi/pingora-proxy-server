@@ -1,0 +1,12 @@
+# Dockerfile to create a Docker-in-Docker image
+FROM alpine:latest
+
+RUN apk add --no-cache \
+    docker \
+    iptables \
+    bash \
+    curl \
+    && mkdir /var/run/docker.sock
+
+ENTRYPOINT ["/bin/bash"]
+

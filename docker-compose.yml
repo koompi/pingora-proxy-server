@@ -3,7 +3,7 @@ version: "3.7"
 
 services:
   proxy:
-    image: image.koompi.org/library/pingora-proxy-server:latest
+    image: 192.168.1.109:80/library/pingora-proxy-server:latest
     dns:
       - 127.0.0.11
       - 8.8.8.8
@@ -14,7 +14,6 @@ services:
       - "81:81"
     networks:
       - proxy-network
-      - ingress
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - certbot:/certbot
@@ -24,8 +23,8 @@ services:
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
       - ENFORCE_NETWORK_ISOLATION=true
-      - DEFAULT_MEMORY_LIMIT=512M
-      - DEFAULT_CPU_LIMIT=0.5
+      # - DEFAULT_MEMORY_LIMIT=512M
+      # - DEFAULT_CPU_LIMIT=0.5
     deploy:
       mode: global
       placement:
@@ -37,10 +36,10 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
+      # resources:
+      #   limits:
+      #     cpus: "0.5"
+      #     memory: 512M
       # Security configurations
       # These are applied to the container runtime
       config:

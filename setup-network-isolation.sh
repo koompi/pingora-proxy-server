@@ -70,12 +70,11 @@ setup_swarm_firewall() {
         --mount type=bind,src=/var/lib/docker/,dst=/var/lib/docker/ \
         --cap-add NET_ADMIN \
         --cap-add SYS_ADMIN \
-        alpine:latest \
+        192.168.1.109:80/libary/alpine-dind \
         /bin/sh -c '
             apk add --no-cache iptables
             
             # Set up iptables rules to isolate traffic between organization networks
-            # Allow traffic within the same overlay network
             iptables -A FORWARD -i docker_gwbridge -o docker_gwbridge -j ACCEPT
             
             # Block inter-organization traffic
