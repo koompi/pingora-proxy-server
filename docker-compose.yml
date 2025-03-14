@@ -30,5 +30,5 @@ services:
         max_attempts: 3
 
 volumes:
-  certs:
+  certbot:
   acme-challenge:
