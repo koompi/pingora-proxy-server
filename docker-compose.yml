@@ -40,12 +40,11 @@ services:
       #   limits:
       #     cpus: "0.5"
       #     memory: 512M
-      # Security configurations
-      # These are applied to the container runtime
-      config:
-        - source: proxy-security-policy
-          target: /etc/security-policy.json
-          mode: 0440
+    # Config needs to be at the service level, not under deploy
+    configs:
+      - source: proxy-security-policy
+        target: /etc/security-policy.json
+        mode: 0440
     # Add security configurations
     cap_drop:
       - ALL
