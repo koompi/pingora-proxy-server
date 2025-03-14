@@ -70,7 +70,7 @@ setup_swarm_firewall() {
         --mount type=bind,src=/var/lib/docker/,dst=/var/lib/docker/ \
         --cap-add NET_ADMIN \
         --cap-add SYS_ADMIN \
-        192.168.1.109:80/libary/alpine-dind \
+        192.168.1.109:80/library/alpine-dind \
         /bin/sh -c '
             apk add --no-cache iptables
             
