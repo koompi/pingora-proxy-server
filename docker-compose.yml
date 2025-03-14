@@ -3,11 +3,15 @@ version: "3.7"
 
 services:
   proxy:
-    image: image.koompi.org/library/pingora-proxy-server
+    image: image.koompi.org/library/pingora-proxy-server:latest
+    dns:
+      - 127.0.0.11
     ports:
       - "80:80"
       - "443:443"
       - "81:81"
+    networks:
+      - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - certbot:/certbot
@@ -31,3 +35,7 @@ services:
 volumes:
   certbot:
   acme-challenge:
+
+networks:
+  proxy-network:
+    external: true

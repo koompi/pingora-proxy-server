@@ -1,5 +1,5 @@
 # Use a multi-stage build with ARG for platform detection
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+FROM --platform=$TARGETPLATFORM ubuntu:24.04
 
 # Add ARG for platform detection
 ARG TARGETPLATFORM

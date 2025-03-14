@@ -28,35 +28,13 @@ pub fn clean_backend_address(address: &str) -> String {
 }
 
 pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
-    // Input format could be:
-    // 1. standard: service_name.network:port
-    // 2. org-specific: org_id.service_name.network:port
-
+    // Simplify this to use just the service name without the .ingress suffix
     let parts: Vec<&str> = target.split(':').collect();
     let port = if parts.len() > 1 {
         parts[1].parse::<u16>().unwrap_or(80)
     } else {
         80
     };
-
-    let dns_parts: Vec<&str> = parts[0].split('.').collect();
-
-    if dns_parts.len() >= 3 {
-        // This is an org-specific format
-        let org_id = dns_parts[0];
-        let service_name = dns_parts[1];
-        // Network name is in dns_parts[2]
-
-        (
-            format!("{}.{}", service_name, dns_parts[2]),
-            port,
-            Some(org_id.to_string()),
-        )
-    } else if dns_parts.len() == 2 {
-        // Standard format
-        (parts[0].to_string(), port, None)
-    } else {
-        // Default case
-        (parts[0].to_string(), port, None)
-    }
+    
+    (parts[0].to_string(), port, None)
 }
