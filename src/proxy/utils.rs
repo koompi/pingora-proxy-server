@@ -38,7 +38,8 @@ pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
         80
     };
     
-    // Keep the full service DNS name without modification
-    // This is crucial for proper DNS resolution in Docker Swarm
+    // For Swarm services, DNS name should be:
+    // service_name.network_name
+    // Don't modify the service DNS name
     (parts[0].to_string(), port, None)
 }
