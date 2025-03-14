@@ -1,4 +1,9 @@
-#!/bin/bash
+#!/bin/sh
+
+# Ensure proper DNS resolution for Docker Swarm
+echo "nameserver 127.0.0.11" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
 # Create default config if not exists
 CONFIG_PATH="/app/config.json"
@@ -12,13 +17,12 @@ if [ ! -f "$CONFIG_PATH" ]; then
     echo "Created default config file at $CONFIG_PATH"
 fi
 
-# Ensure proper DNS resolution for Docker Swarm
-echo "nameserver 127.0.0.11" | tee /etc/resolv.conf
-echo "nameserver 8.8.8.8" | tee -a /etc/resolv.conf
-echo "nameserver 1.1.1.1" | tee -a /etc/resolv.conf
-
-# Additional debugging for DNS
-cat /etc/resolv.conf
-
-# Execute the main application
-exec /app/pingora-proxy-server
+# Select and execute the correct binary based on architecture
+if [ "$(uname -m)" = "x86_64" ]; then
+    exec /app/pingora-proxy-server.x86_64 "$@"
+elif [ "$(uname -m)" = "aarch64" ]; then
+    exec /app/pingora-proxy-server.arm64 "$@"
+else
+    echo "Unsupported architecture: $(uname -m)"
+    exit 1
+fi
