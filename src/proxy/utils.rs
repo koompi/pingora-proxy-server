@@ -32,65 +32,56 @@ pub fn clean_backend_address(address: &str) -> String {
 }
 
 
+
+
+/// Enum to represent different resolution strategies
+enum ResolutionStrategy {
+    DirectName,
+    WithDefaultPort(u16),
+    TasksPrefix,
+    TasksPrefixWithPort(u16),
+    IngressDomain(u16),
+}
+
+impl ResolutionStrategy {
+    /// Attempt to resolve the service name using the specified strategy
+    fn resolve(&self, service_name: &str) -> Result<SocketAddr, std::io::Error> {
+        let addr_str = match self {
+            ResolutionStrategy::DirectName => service_name.to_string(),
+            ResolutionStrategy::WithDefaultPort(port) => 
+                format!("{}:{}", service_name, port),
+            ResolutionStrategy::TasksPrefix => 
+                format!("tasks.{}", service_name),
+            ResolutionStrategy::TasksPrefixWithPort(port) => 
+                format!("tasks.{}:{}", service_name, port),
+            ResolutionStrategy::IngressDomain(port) => 
+                format!("{}.ingress:{}", service_name, port),
+        };
+
+        addr_str.to_socket_addrs()
+            .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound, 
+                "No addresses found"
+            )))
+    }
+}
+
 pub async fn resolve_swarm_service(service_name: &str, default_port: u16) -> Result<SocketAddr, std::io::Error> {
     // Log the resolution attempt
     println!("Attempting to resolve Swarm service: {}", service_name);
 
-    // Define resolution strategies as a vector of functions
-    let resolution_strategies: Vec<Box<dyn Fn() -> Result<std::net::SocketAddr, std::io::Error>>> = vec![
-        // Strategy 1: Direct service name resolution
-        Box::new(|| {
-            service_name.to_socket_addrs()
-                .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound, 
-                    "No addresses found"
-                )))
-        }),
-        
-        // Strategy 2: Append default port
-        Box::new(|| {
-            format!("{}:{}", service_name, default_port)
-                .to_socket_addrs()
-                .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound, 
-                    "No addresses found"
-                )))
-        }),
-        
-        // Strategy 3: Try with Docker Swarm's task prefix
-        Box::new(|| {
-            format!("tasks.{}", service_name)
-                .to_socket_addrs()
-                .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound, 
-                    "No addresses found"
-                )))
-        }),
-        
-        // Strategy 4: Try with Docker Swarm's task prefix and port
-        Box::new(|| {
-            format!("tasks.{}:{}", service_name, default_port)
-                .to_socket_addrs()
-                .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound, 
-                    "No addresses found"
-                )))
-        }),
-        
-        // Strategy 5: Final fallback with .ingress domain
-        Box::new(|| {
-            format!("{}.ingress:{}", service_name, default_port)
-                .to_socket_addrs()
-                .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound, 
-                    "No addresses found"
-                )))
-        }),
+    // Define resolution strategies
+    let resolution_strategies = [
+        ResolutionStrategy::DirectName,
+        ResolutionStrategy::WithDefaultPort(default_port),
+        ResolutionStrategy::TasksPrefix,
+        ResolutionStrategy::TasksPrefixWithPort(default_port),
+        ResolutionStrategy::IngressDomain(default_port),
     ];
 
     // Try each resolution strategy
-    for strategy in resolution_strategies {
-        match strategy() {
+    for strategy in &resolution_strategies {
+        match strategy.resolve(service_name) {
             Ok(addr) => {
                 // Validate the address with a quick TCP connection attempt
                 match validate_address(&addr).await {
@@ -130,6 +121,7 @@ async fn validate_address(addr: &SocketAddr) -> Result<(), std::io::Error> {
         ))
     }
 }
+
 
 
 /// Utility function to parse Swarm service target
