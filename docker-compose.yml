@@ -16,8 +16,8 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - certbot:/certbot
-      - acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
@@ -55,10 +55,6 @@ services:
       - no-new-privileges=true
       - userns=host
     read_only: true
-
-volumes:
-  certbot:
-  acme-challenge:
 
 networks:
   proxy-network:
