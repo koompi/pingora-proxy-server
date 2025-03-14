@@ -80,35 +80,37 @@ impl ProxyHttp for HttpProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-
+    
         match self.servers.lock() {
             Ok(servers) => match servers.get(&hostname) {
                 Some(to) => {
                     println!("Routing HTTP request to backend: {}", to);
-
-                    // Parse swarm target if needed
-                    let (target, use_tls, org_header) = if to.contains(".") && to.contains(":") {
-                        // Likely a swarm DNS name
+    
+                    // Determine if this is an IP address or a Swarm DNS name
+                    if to.contains(".") && to.contains(":") && 
+                       !to.chars().nth(0).unwrap_or(' ').is_digit(10) {
+                        // Likely a Swarm DNS name (starts with letter, not a digit)
                         let (host, port, org_id) = parse_swarm_target(to);
-                        (format!("{}:{}", host, port), false, org_id)
+                        let target = format!("{}:{}", host, port);
+                        println!("Using Swarm DNS target: {}", target);
+                        
+                        let mut peer = HttpPeer::new(target, false, hostname.to_string());
+                        
+                        // Add organization header if present
+                        if let Some(org) = org_id {
+                            peer.options.extra_proxy_headers.insert(
+                                "X-Organization-ID".to_string(),
+                                org.to_string().into_bytes(),
+                            );
+                        }
+                        
+                        Ok(Box::new(peer))
                     } else {
-                        // Standard target
-                        (to.to_owned(), false, None)
-                    };
-
-                    // Create HTTP peer
-                    let mut peer = HttpPeer::new(target, use_tls, hostname.to_string());
-
-                    // Add organization header if present
-                    if let Some(org) = org_header {
-                        // Access the correct location for extra headers in PeerOptions
-                        peer.options.extra_proxy_headers.insert(
-                            "X-Organization-ID".to_string(),
-                            org.to_string().into_bytes(),
-                        );
+                        // Standard IP:port target - use directly
+                        println!("Using direct target: {}", to);
+                        let peer = HttpPeer::new(to.to_owned(), false, hostname.to_string());
+                        Ok(Box::new(peer))
                     }
-
-                    Ok(Box::new(peer))
                 }
                 None => {
                     // Default backend when no matching host is found

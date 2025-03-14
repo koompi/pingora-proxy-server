@@ -104,14 +104,14 @@ impl ManagerProxy {
     // Extract clean domain and backend from path segments
     fn extract_domain_and_backend(&self, path_segments: &[String]) -> (String, String) {
         let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-
+        
         let to = path_segments
             .get(2)
             .unwrap_or(&String::new())
             .clone()
             .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
             .to_string();
-
+        
         (from, to)
     }
 
