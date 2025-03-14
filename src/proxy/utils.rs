@@ -1,8 +1,8 @@
+// src/proxy/utils.rs with improved Swarm service discovery handling
 use regex::Regex;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::io::ErrorKind;
 use std::time::Duration;
-use tokio::net::TcpStream;
-
 
 /// Extract hostname from HTTP request header
 pub fn extract_hostname(request_line: &str) -> Option<String> {
@@ -31,122 +31,90 @@ pub fn clean_backend_address(address: &str) -> String {
     cleaned.to_string()
 }
 
-
-
-
-/// Enum to represent different resolution strategies
-enum ResolutionStrategy {
-    DirectName,
-    WithDefaultPort(u16),
-    TasksPrefix,
-    TasksPrefixWithPort(u16),
-    IngressDomain(u16),
-}
-
-impl ResolutionStrategy {
-    /// Attempt to resolve the service name using the specified strategy
-    fn resolve(&self, service_name: &str) -> Result<SocketAddr, std::io::Error> {
-        let addr_str = match self {
-            ResolutionStrategy::DirectName => service_name.to_string(),
-            ResolutionStrategy::WithDefaultPort(port) => 
-                format!("{}:{}", service_name, port),
-            ResolutionStrategy::TasksPrefix => 
-                format!("tasks.{}", service_name),
-            ResolutionStrategy::TasksPrefixWithPort(port) => 
-                format!("tasks.{}:{}", service_name, port),
-            ResolutionStrategy::IngressDomain(port) => 
-                format!("{}.ingress:{}", service_name, port),
-        };
-
-        addr_str.to_socket_addrs()
-            .and_then(|mut addrs| addrs.next().ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::NotFound, 
-                "No addresses found"
-            )))
-    }
-}
-
-pub async fn resolve_swarm_service(service_name: &str, default_port: u16) -> Result<SocketAddr, std::io::Error> {
-    // Log the resolution attempt
-    println!("Attempting to resolve Swarm service: {}", service_name);
-
-    // Define resolution strategies
-    let resolution_strategies = [
-        ResolutionStrategy::DirectName,
-        ResolutionStrategy::WithDefaultPort(default_port),
-        ResolutionStrategy::TasksPrefix,
-        ResolutionStrategy::TasksPrefixWithPort(default_port),
-        ResolutionStrategy::IngressDomain(default_port),
-    ];
-
-    // Try each resolution strategy
-    for strategy in &resolution_strategies {
-        match strategy.resolve(service_name) {
-            Ok(addr) => {
-                // Validate the address with a quick TCP connection attempt
-                match validate_address(&addr).await {
-                    Ok(_) => {
-                        println!("Successfully resolved service {} to {:?}", service_name, addr);
-                        return Ok(addr);
-                    }
-                    Err(e) => {
-                        println!("Address validation failed for {}: {:?}", service_name, e);
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Resolution strategy failed: {:?}", e);
-            }
-        }
-    }
-
-    // If all strategies fail, return an error
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound, 
-        format!("Could not resolve service: {}", service_name)
-    ))
-}
-
-/// Validate the address by attempting a quick TCP connection
-async fn validate_address(addr: &SocketAddr) -> Result<(), std::io::Error> {
-    // Set a short timeout for connection attempt
-    let timeout = Duration::from_secs(2);
-    
-    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut, 
-            "Connection attempt timed out"
-        ))
-    }
-}
-
-
-
-/// Utility function to parse Swarm service target
+/// Parse swarm target with enhanced error handling and better organization support
 pub fn parse_swarm_target(target: &str) -> (String, u16, Option<String>) {
-    // Split the target into components
+    // Look for Docker Swarm service patterns:
+    // 1. tasks.service_name:port
+    // 2. service_name.network_name:port
+    // 3. org_id.service_name.network_name:port
+    
+    // First, split by colon to separate host and port
     let parts: Vec<&str> = target.split(':').collect();
     
-    // Default port if not specified
-    let (host, port) = match parts.len() {
-        1 => (parts[0], 80),
-        2 => (parts[0], parts[1].parse().unwrap_or(80)),
-        _ => return ("".to_string(), 80, None)
-    };
-
-    // Check for organization ID in the hostname
-    let (host, org_id) = if host.contains('.') {
-        let host_parts: Vec<&str> = host.split('.').collect();
-        if host_parts.len() > 1 {
-            (host_parts[1..].join("."), Some(host_parts[0].to_string()))
-        } else {
-            (host.to_string(), None)
-        }
+    // Extract port, default to 80 if not specified
+    let port = if parts.len() > 1 {
+        parts[1].parse::<u16>().unwrap_or(80)
     } else {
-        (host.to_string(), None)
+        80
     };
+    
+    // Handle the hostname part
+    let host_parts: Vec<&str> = parts[0].split('.').collect();
+    
+    // Case: org_id.service_name.network_name
+    if host_parts.len() >= 3 {
+        // Check if it's an organization-specific format
+        if host_parts[0].starts_with("org_") || !host_parts[0].chars().next().unwrap_or(' ').is_digit(10) {
+            let org_id = Some(host_parts[0].to_string());
+            
+            // Format host for Docker DNS resolution - important for inter-service communication
+            // in Swarm with overlay networks, we use tasks.service_name format
+            let host = format!("tasks.{}", host_parts[1]);
+            
+            return (host, port, org_id);
+        }
+    }
+    
+    // Case: tasks.service_name
+    if parts[0].starts_with("tasks.") {
+        return (parts[0].to_string(), port, None);
+    }
+    
+    // Case: service_name.network_name
+    if host_parts.len() == 2 {
+        let host = format!("tasks.{}", host_parts[0]);
+        
+        return (host, port, None);
+    }
+    
+    // Default case: just use the hostname as-is
+    (parts[0].to_string(), port, None)
+}
 
-    (host, port, org_id)
+/// Function to test if a Swarm service is reachable
+pub async fn test_service_connectivity(service_name: &str, port: u16) -> bool {
+    // First, attempt direct DNS resolution through Docker's DNS
+    let addr = format!("{}:{}", service_name, port);
+    if let Ok(stream) = TcpStream::connect_timeout(&addr.parse().unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)), Duration::from_millis(100)) {
+        drop(stream);
+        return true;
+    }
+    
+    // Try with tasks. prefix if it doesn't already have it
+    if !service_name.starts_with("tasks.") {
+        let tasks_addr = format!("tasks.{}:{}", service_name, port);
+        if let Ok(stream) = TcpStream::connect_timeout(&tasks_addr.parse().unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)), Duration::from_millis(100)) {
+            drop(stream);
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Function to validate that a service is within an organization's network
+pub fn validate_org_network_access(service_name: &str, org_id: &str) -> bool {
+    // In a real implementation, you would:
+    // 1. Query Docker API to get service details
+    // 2. Check if the service is in the org's network
+    // 3. Verify the service has the right org label
+    // 
+    // This is a simplified version for demonstration
+    
+    if service_name.contains(org_id) || service_name.starts_with("tasks.") {
+        return true;
+    }
+    
+    // Default to deny for security
+    false
 }

@@ -1,0 +1,46 @@
+{
+    "network_policies": {
+      "default": "deny", 
+      "org_networks": {
+        "isolation_mode": "strict",
+        "allow_internal_communication": true,
+        "allow_external_communication": false,
+        "exceptions": [
+          {
+            "service_pattern": "*",
+            "port": 80,
+            "protocol": "tcp",
+            "direction": "inbound",
+            "source": "proxy-network"
+          },
+          {
+            "service_pattern": "*",
+            "port": 443,
+            "protocol": "tcp",
+            "direction": "inbound",
+            "source": "proxy-network"
+          }
+        ]
+      }
+    },
+    "container_policies": {
+      "memory_limit": "512M",
+      "cpu_limit": "0.5",
+      "capabilities": {
+        "drop_all": true,
+        "allow": ["NET_BIND_SERVICE"]
+      },
+      "security_options": {
+        "no_new_privileges": true,
+        "read_only_filesystem": true,
+        "user_namespace_mode": "host"
+      },
+      "tmpfs_mounts": [
+        {
+          "destination": "/tmp",
+          "size": "64M",
+          "mode": "1777"
+        }
+      ]
+    }
+  }
