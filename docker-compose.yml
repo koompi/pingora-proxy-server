@@ -17,10 +17,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - certbot:/certbot
       - acme-challenge:/var/www/html/.well-known/acme-challenge
+      - ./config.json:/app/config.json # Mount config file
+      - ./entrypoint.sh:/app/entrypoint.sh # Mount entrypoint script
+    entrypoint: ["/bin/bash", "/app/entrypoint.sh"] # Use custom entrypoint
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
-      - LOG_LEVEL=info
+      - LOG_LEVEL=debug # Increased log level for debugging
+      - RUST_BACKTRACE=1 # Enable full backtrace
     deploy:
       mode: global
       placement:

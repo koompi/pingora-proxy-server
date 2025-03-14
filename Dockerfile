@@ -25,6 +25,10 @@ else \n\
   exit 1 \n\
 fi' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
+# Environment for service discovery
+ENV SWARM_MODE=true
+ENV SWARM_NETWORKS=ingress,proxy-network
+
 EXPOSE 80 443
 
 ENTRYPOINT ["/app/entrypoint.sh"]
