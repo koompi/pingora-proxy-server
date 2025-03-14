@@ -94,11 +94,11 @@ impl SwarmDiscoveryService {
             // Create target using Docker Swarm DNS-based service discovery
             // Format: service_name.network_name:port
             let target = if let Some(org) = org_id {
-                // Use organization-specific format
-                format!("{}.{}.{}:{}", org, service_name, self.networks[0], port)
+                // Use organization-specific network naming
+                format!("tasks.{}:{}", service_name, port)
             } else {
-                // Use standard format
-                format!("{}.{}:{}", service_name, self.networks[0], port)
+                // Use standard Swarm DNS name
+                format!("tasks.{}:{}", service_name, port)
             };
 
             println!("Discovered service mapping: {} -> {}", domain, target);
