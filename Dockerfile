@@ -4,8 +4,14 @@ FROM --platform=$TARGETPLATFORM ubuntu:24.04
 # Add ARG for platform detection
 ARG TARGETPLATFORM
 
-# Install dependencies
-RUN apt-get update && apt-get install -y ca-certificates && apt-get clean
+# Install dependencies with key verification fix
+RUN apt-get update -y || true && \
+    apt-get install -y --no-install-recommends ca-certificates gnupg && \
+    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
