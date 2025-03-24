@@ -71,16 +71,16 @@ The proxy integrates with Let's Encrypt to automatically obtain and renew TLS ce
 
 ## 🛠️ API Reference
 
-The management API is available on port 81 (HTTP) and port 8443 (HTTPS if certificates are available).
+The management API is available on port 81 (HTTP) and port 443 (HTTPS if certificates are available).
 
 ### Domain Mapping Management
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `GET /` | GET | List all domain mappings |
-| `PUT /{domain}/{backend}` | PUT | Update an existing mapping |
-| `POST /{domain}/{backend}` | POST | Add a new mapping |
-| `DELETE /{domain}` | DELETE | Remove a mapping |
+| Endpoint                   | Method | Description                |
+| -------------------------- | ------ | -------------------------- |
+| `GET /`                    | GET    | List all domain mappings   |
+| `PUT /{domain}/{backend}`  | PUT    | Update an existing mapping |
+| `POST /{domain}/{backend}` | POST   | Add a new mapping          |
+| `DELETE /{domain}`         | DELETE | Remove a mapping           |
 
 #### Example: Add a new mapping
 
@@ -90,10 +90,10 @@ curl -X POST "http://localhost:81/example.com/192.168.1.100:8080"
 
 ### Certificate Management
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `POST /certificates` | POST | Request a new certificate |
-| `GET /certificates/{domain}` | GET | Check certificate status |
+| Endpoint                     | Method | Description               |
+| ---------------------------- | ------ | ------------------------- |
+| `POST /certificates`         | POST   | Request a new certificate |
+| `GET /certificates/{domain}` | GET    | Check certificate status  |
 
 #### Example: Request a new certificate
 
@@ -121,7 +121,7 @@ The proxy includes automatic service discovery for Docker Swarm deployments. It 
 ### Example Docker Service Configuration
 
 ```yaml
-version: '3.7'
+version: "3.7"
 services:
   web:
     image: nginx
@@ -199,18 +199,19 @@ RUST_LOG=info ./target/release/pingora-proxy-server
 ```
 
 ### Build and push new docker image
+
 ```
 docker buildx build --platform linux/amd64,linux/arm64 -t localhost:5000/library/pingora-proxy-server:latest --push .
 ```
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DOCKER_ENDPOINT` | Docker API endpoint | `unix:///var/run/docker.sock` |
-| `SWARM_MODE` | Enable Docker Swarm discovery | `false` |
-| `SWARM_NETWORKS` | Networks to check for services | `ingress` |
-| `LOG_LEVEL` | Logging verbosity | `info` |
+| Variable          | Description                    | Default                       |
+| ----------------- | ------------------------------ | ----------------------------- |
+| `DOCKER_ENDPOINT` | Docker API endpoint            | `unix:///var/run/docker.sock` |
+| `SWARM_MODE`      | Enable Docker Swarm discovery  | `false`                       |
+| `SWARM_NETWORKS`  | Networks to check for services | `ingress`                     |
+| `LOG_LEVEL`       | Logging verbosity              | `info`                        |
 
 ## 📝 License
 
