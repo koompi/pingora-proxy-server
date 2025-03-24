@@ -81,15 +81,15 @@ fn main() {
         // Use the first certificate for the manager interface
         let mgr_cert = &certs[0];
         println!(
-            "Also setting up TLS for manager on port 443: {}",
+            "Also setting up TLS for manager on port 8443: {}",
             mgr_cert.domain
         );
 
         match TlsSettings::intermediate(&mgr_cert.cert_path, &mgr_cert.key_path) {
             Ok(tls_settings) => {
-                // Use a different port (443) for HTTPS manager access
-                manager_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
-                println!("Manager TLS configured successfully on port 443");
+                // Use a different port (8443) for HTTPS manager access
+                manager_service.add_tls_with_settings("0.0.0.0:8443", None, tls_settings);
+                println!("Manager TLS configured successfully on port 8443");
             }
             Err(e) => {
                 println!("Error setting up TLS for manager: {}", e);
