@@ -3,7 +3,7 @@ version: "3.7"
 
 services:
   proxy:
-    image: 192.168.1.101:5000/library/pingora-proxy-server:latest
+    image: image.koompi.org/library/pingora-proxy-server:latest
     dns:
       - 127.0.0.11
       - 8.8.8.8
@@ -16,8 +16,8 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot
-      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /mnt/gluster/certbot:/certbot:rw
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge:rw
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
@@ -54,6 +54,10 @@ services:
       - no-new-privileges=true
       - userns=host
     read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache
+      - /certbot
 
 networks:
   proxy-network:
