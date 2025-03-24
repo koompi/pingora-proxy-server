@@ -104,14 +104,14 @@ impl ManagerProxy {
     // Extract clean domain and backend from path segments
     fn extract_domain_and_backend(&self, path_segments: &[String]) -> (String, String) {
         let from = path_segments.get(1).unwrap_or(&String::new()).clone();
-        
+
         let to = path_segments
             .get(2)
             .unwrap_or(&String::new())
             .clone()
             .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
             .to_string();
-        
+
         (from, to)
     }
 
@@ -161,7 +161,7 @@ impl ManagerProxy {
                 };
 
                 // Process the certificate request
-                let issuer = match CertificateIssuer::new("certbot/letsencrypt", "certs") {
+                let issuer = match CertificateIssuer::new("/var/lib/certbot/letsencrypt", "certs") {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
@@ -226,7 +226,7 @@ impl ManagerProxy {
                 }
 
                 let domain = &path_segments[2];
-                let issuer = match CertificateIssuer::new("certbot/letsencrypt", "certs") {
+                let issuer = match CertificateIssuer::new("/var/lib/certbot/letsencrypt", "certs") {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
