@@ -21,6 +21,46 @@ pub struct HttpsProxy {
 }
 
 #[async_trait::async_trait]
+/// Implementation of the HTTPS proxy functionality.
+///
+/// This implementation handles HTTPS requests by routing them to appropriate backend servers
+/// based on hostname, with support for Docker Swarm service discovery and organization-level
+/// network isolation.
+///
+/// # Security Features
+/// - Organization network isolation
+/// - Strict network boundary enforcement
+/// - Service connectivity validation
+/// - Organization access validation
+///
+/// # Implementation Details
+/// Implements four main methods:
+/// - `new_ctx`: Creates a new empty context
+/// - `request_filter`: Processes incoming HTTPS requests
+/// - `upstream_peer`: Routes requests to appropriate backend servers
+/// - `logging`: Provides detailed logging of HTTPS requests
+///
+/// # Examples
+/// The proxy supports two types of backend targets:
+/// 1. Direct IP:port targets
+/// 2. Docker Swarm service discovery (using DNS-based routing)
+///
+/// For Swarm services, additional security headers are added:
+/// - X-Organization-ID
+/// - X-Network-Isolation
+/// - X-Organization-Boundary
+/// - X-Forwarded-Proto
+/// - X-Proxy-Source
+///
+/// # Error Handling
+/// - Provides fallback to default backend (127.0.0.1:5500) when target resolution fails
+/// - Includes comprehensive error logging
+/// - Maintains mutex safety for concurrent access
+///
+/// # Note
+/// This implementation assumes the existence of supporting functions like
+/// `extract_hostname`, `parse_swarm_target`, `test_service_connectivity`,
+/// and `validate_org_network_access`.
 impl ProxyHttp for HttpsProxy {
     type CTX = ();
 

@@ -55,6 +55,57 @@ pub struct CertificateIssuer {
     pub public_ip: String,
 }
 
+/// A certificate issuer that manages SSL/TLS certificates using Certbot.
+///
+/// This struct provides functionality to:
+/// - Issue new SSL/TLS certificates
+/// - Validate domains
+/// - Check existing certificates
+/// - Handle both standard and wildcard certificates
+/// - Manage Cloudflare DNS integration for wildcard certificates
+///
+/// # Examples
+///
+/// ```
+/// use your_crate::CertificateIssuer;
+///
+/// let issuer = CertificateIssuer::new("/etc/certbot", "/etc/certs")?;
+/// let request = CertificateRequest {
+///     domain: "example.com".to_string(),
+///     email: "admin@example.com".to_string(),
+///     wildcard: Some(false),
+///     staging: Some(true),
+///     force_renew: Some(false),
+///     dns_provider: None,
+///     dns_credentials: None,
+/// };
+///
+/// let status = issuer.process_request(request).await;
+/// ```
+///
+/// # Features
+///
+/// - HTTP-01 challenge support for standard certificates
+/// - DNS-01 challenge support for wildcard certificates (Cloudflare only)
+/// - Automatic certificate renewal checks
+/// - Certificate expiry monitoring
+/// - Public IP detection
+///
+/// # Security
+///
+/// This implementation:
+/// - Uses secure file permissions for credential storage
+/// - Validates domain ownership
+/// - Supports staging environments for testing
+/// - Handles sensitive Cloudflare credentials securely
+///
+/// # Requirements
+///
+/// - Certbot must be installed on the system
+/// - OpenSSL for certificate validation
+/// - curl for public IP detection
+/// - Write access to specified directories
+/// - Optional: Cloudflare credentials for wildcard certificates
 impl CertificateIssuer {
     pub fn new(certbot_dir: &str, output_dir: &str) -> Result<Self> {
         // Ensure directories exist

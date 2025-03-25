@@ -26,6 +26,31 @@ pub struct HttpProxy {
 }
 
 #[async_trait::async_trait]
+/// Implementation of the `ProxyHttp` trait for `HttpProxy` that handles HTTP traffic.
+///
+/// This implementation serves two main purposes:
+/// 1. Handles ACME challenges from Let's Encrypt for domain verification
+/// 2. Redirects all other HTTP traffic to HTTPS
+///
+/// # Type Parameters
+/// * `CTX` - Empty context type as no context is needed for this implementation
+///
+/// # Methods
+/// * `new_ctx()` - Creates a new empty context
+/// * `request_filter()` - Processes incoming HTTP requests:
+///   - Handles ACME challenges by serving validation tokens
+///   - Redirects all other traffic to HTTPS with a 308 Permanent Redirect
+/// * `upstream_peer()` - Not used as all requests are handled by request_filter
+///
+/// # Error Handling
+/// Returns appropriate HTTP status codes:
+/// * 404 for invalid or missing ACME challenges
+/// * 308 for redirecting to HTTPS
+///
+/// # Example
+/// When receiving an HTTP request to `http://example.com/path`:
+/// * If it's an ACME challenge, serves the validation token
+/// * Otherwise, redirects to `https://example.com/path`
 impl ProxyHttp for HttpProxy {
     type CTX = ();
 

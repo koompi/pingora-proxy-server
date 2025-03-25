@@ -41,6 +41,41 @@ pub struct ManagerProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
 }
 
+/// Manager for handling proxy configuration and certificate operations.
+///
+/// This implementation provides methods for:
+/// - Managing domain-to-backend mappings (add, update, delete, list)
+/// - Handling SSL certificate requests and status checks
+/// - Processing JSON responses for API endpoints
+///
+/// # Methods
+///
+/// ## Certificate Management
+/// - `handle_certificate_request`: Processes certificate-related operations (POST/GET)
+///   - POST: Request new certificates (including wildcard certificates)
+///   - GET: Check certificate status for a domain
+///
+/// ## Domain Mapping Management
+/// - `handle_add_update_mapping`: Adds or updates domain-to-backend mappings
+/// - `handle_delete_mapping`: Removes domain mappings
+/// - `handle_list_mappings`: Lists all current domain mappings
+///
+/// ## Helper Methods
+/// - `send_json_response`: Formats and sends JSON responses
+/// - `success_response`: Creates a success response object
+/// - `error_response`: Creates an error response object
+/// - `extract_domain_and_backend`: Parses domain and backend from URL path segments
+///
+/// # Features
+/// - Supports both regular and wildcard SSL certificates
+/// - Cloudflare DNS provider integration for wildcard certificates
+/// - Persistent configuration storage
+/// - Thread-safe server configuration management
+/// - Support for manual and SwarmDiscovery-based mappings
+///
+/// # Note
+/// Configuration changes are persisted to disk and managed through thread-safe
+/// concurrent access using mutex locks.
 impl ManagerProxy {
     // Helper method to send JSON responses
     async fn send_json_response(

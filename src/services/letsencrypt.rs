@@ -25,6 +25,65 @@ pub struct LetsEncryptService {
     cloudflare_api_email: Option<String>,
 }
 
+/// A service that manages Let's Encrypt SSL certificates with optional Cloudflare DNS integration.
+///
+/// This service handles the automated issuance and renewal of SSL certificates through Let's Encrypt,
+/// supporting both standard and wildcard certificates. For wildcard certificates, Cloudflare DNS
+/// credentials are required for DNS-01 challenge verification.
+///
+/// # Configuration
+///
+/// The service can be configured with:
+/// - Certificate storage directory
+/// - Let's Encrypt account email
+/// - Certificate check interval
+/// - Optional Cloudflare credentials
+///
+/// Cloudflare credentials can be provided either through environment variables:
+/// - `CLOUDFLARE_API_TOKEN`
+/// - `CLOUDFLARE_API_KEY`
+/// - `CLOUDFLARE_API_EMAIL`
+///
+/// Or programmatically using the `with_cloudflare_credentials` method.
+///
+/// # Examples
+///
+/// ```rust
+/// let service = LetsEncryptService::new(
+///     config_store,
+///     PathBuf::from("/etc/letsencrypt"),
+///     "admin@example.com".to_string(),
+///     3600,
+/// );
+/// ```
+///
+/// With explicit Cloudflare credentials:
+/// ```rust
+/// let service = LetsEncryptService::new(/* ... */)
+///     .with_cloudflare_credentials(
+///         Some("api_token".to_string()),
+///         None,
+///         None,
+///     );
+/// ```
+///
+/// # Methods
+///
+/// - `new`: Creates a new instance of the service
+/// - `with_cloudflare_credentials`: Configures Cloudflare credentials for DNS validation
+/// - `issue_certificate_for_domain`: Issues a certificate for a specific domain
+/// - `is_wildcard_cert`: Detects if a certificate is for a wildcard domain
+/// - `check_and_issue_certificates`: Checks and issues certificates for all configured domains
+/// - `should_use_wildcard`: Determines if a wildcard certificate should be used for a domain
+///
+/// # Features
+///
+/// - Automatic certificate issuance and renewal
+/// - Support for both standard and wildcard certificates
+/// - Cloudflare DNS integration for DNS-01 challenges
+/// - IP address filtering
+/// - Configurable check intervals
+/// - Certificate type detection (wildcard vs standard)
 impl LetsEncryptService {
     pub fn new(
         config_store: Arc<std::sync::Mutex<ConfigStore>>,

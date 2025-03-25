@@ -28,6 +28,75 @@ pub struct SwarmDiscoveryService {
     pub org_networks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
+/// Service that discovers and manages Docker Swarm services for proxy configuration.
+///
+/// This service monitors Docker Swarm services with specific labels and updates the proxy
+/// configuration accordingly. It also manages isolated networks for different organizations.
+///
+/// # Fields
+/// - `config_store`: Thread-safe storage for service configurations
+/// - `docker_client`: Client for Docker API interactions
+/// - `networks`: List of networks to monitor
+/// - `check_interval`: Duration between discovery checks
+/// - `org_networks`: Thread-safe mapping of organization IDs to their services
+///
+/// # Label Requirements
+/// Services must have the following labels to be discovered:
+/// - `com.koompi.proxy=true`: Indicates the service should be proxied
+/// - `com.koompi.proxy.domain`: The domain name to route to this service
+///
+/// # Optional Labels
+/// - `com.koompi.proxy.port`: Port number (defaults to 80)
+/// - `com.koompi.org.id`: Organization ID for network isolation
+///
+/// Creates a new SwarmDiscoveryService instance.
+///
+/// # Arguments
+/// * `config_store` - Thread-safe storage for service configurations
+/// * `endpoint` - Docker daemon endpoint (unix:// or http://)
+/// * `networks` - List of networks to monitor
+/// * `check_interval` - Interval in seconds between discovery checks
+///
+/// # Returns
+/// * `Result<Self>` - New instance or error if connection fails
+///
+/// # Examples
+/// ```
+/// let service = SwarmDiscoveryService::new(
+///     config_store,
+///     "unix:///var/run/docker.sock",
+///     vec!["overlay".to_string()],
+///     60
+/// )?;
+/// ```
+
+/// Discovers and updates service configurations from Docker Swarm.
+///
+/// Fetches services with required labels and updates the config store with their
+/// routing information. Also tracks organization-specific services for network isolation.
+///
+/// # Returns
+/// * `Result<()>` - Success or error during discovery
+///
+/// # Effects
+/// - Updates config_store with new service mappings
+/// - Updates org_networks with organization service mappings
+
+/// Ensures that required overlay networks exist for each organization.
+///
+/// Creates isolated overlay networks for organizations if they don't already exist.
+/// Networks are created with encryption and internal-only access.
+///
+/// # Returns
+/// * `Result<()>` - Success or error during network creation
+///
+/// # Network Properties
+/// - Name format: `org_{org_id}_overlay`
+/// - Driver: overlay
+/// - Encrypted: true
+/// - Internal: true
+/// - Attachable: true
+
 impl SwarmDiscoveryService {
     pub fn new(
         config_store: Arc<Mutex<ConfigStore>>,
