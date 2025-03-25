@@ -22,7 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use pingora::{Result, http, prelude::HttpPeer};
+use pingora::{http, prelude::HttpPeer, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,7 @@ impl ManagerProxy {
     }
 
     // Handle certificate requests
+    // Handle certificate requests
     async fn handle_certificate_request(
         &self,
         session: &mut Session,
@@ -177,10 +178,55 @@ impl ManagerProxy {
                     }
                 };
 
-                println!(
-                    "Processing certificate request for domain: {}",
-                    request.domain
-                );
+                // Log wildcard information if applicable
+                if request.wildcard.unwrap_or(false) {
+                    println!(
+                        "Processing WILDCARD certificate request for domain: {}",
+                        request.domain
+                    );
+
+                    // Check DNS provider for wildcard certificates
+                    if request.dns_provider.is_none() {
+                        return self
+                            .send_json_response(
+                                session,
+                                http::StatusCode::BAD_REQUEST,
+                                Self::error_response(
+                                    "Wildcard certificates require a DNS provider",
+                                ),
+                            )
+                            .await;
+                    }
+
+                    // Verify we have credentials for the DNS provider
+                    if request.dns_credentials.is_none() {
+                        return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::BAD_REQUEST,
+                            Self::error_response("DNS provider credentials are required for wildcard certificates"),
+                        )
+                        .await;
+                    }
+
+                    // Currently we only support Cloudflare
+                    if request.dns_provider.as_deref() != Some("cloudflare") {
+                        return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::BAD_REQUEST,
+                            Self::error_response("Only Cloudflare is supported for wildcard certificates at this time"),
+                        )
+                        .await;
+                    }
+                } else {
+                    println!(
+                        "Processing certificate request for domain: {}",
+                        request.domain
+                    );
+                }
+
+                // Process the request
                 let status = issuer.process_request(request).await;
 
                 // Serialize the status directly
@@ -242,7 +288,7 @@ impl ManagerProxy {
                     }
                 };
 
-                let status = match issuer.check_certificate(domain) {
+                let mut status = match issuer.check_certificate(domain) {
                     Some(status) => status,
                     None => CertificateStatus {
                         domain: domain.clone(),
@@ -251,8 +297,17 @@ impl ManagerProxy {
                         key_path: None,
                         expiry: None,
                         error: None,
+                        is_wildcard: None,
                     },
                 };
+
+                // Check if the domain appears to be a wildcard certificate
+                // This is a heuristic since we don't store this information
+                if status.cert_path.is_some()
+                    && (domain.starts_with("*.") || domain.contains("wildcard"))
+                {
+                    status.is_wildcard = Some(true);
+                }
 
                 // Send certificate status
                 let json = serde_json::to_string(&status).unwrap_or_default();

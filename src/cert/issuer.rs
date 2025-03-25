@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 static ACTIVE_CHALLENGES: Lazy<Mutex<std::collections::HashMap<String, (String, String)>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-// Certificate request data structure
+// Certificate request data structure with wildcard support
 #[derive(Debug, Deserialize)]
 pub struct CertificateRequest {
     pub domain: String,
@@ -21,6 +21,19 @@ pub struct CertificateRequest {
     // Optional fields
     pub staging: Option<bool>,
     pub force_renew: Option<bool>,
+    pub wildcard: Option<bool>,
+    pub dns_provider: Option<String>,         // e.g., "cloudflare"
+    pub dns_credentials: Option<Credentials>, // Provider-specific credentials
+}
+
+// DNS provider credentials
+#[derive(Debug, Deserialize, Clone)]
+pub struct Credentials {
+    pub api_key: Option<String>,     // Used by most providers
+    pub api_token: Option<String>,   // Used by Cloudflare and some others
+    pub api_email: Option<String>,   // Used by Cloudflare
+    pub api_secret: Option<String>,  // Used by some providers
+    pub config_path: Option<String>, // Path to credentials file
 }
 
 // Certificate status response
@@ -32,6 +45,7 @@ pub struct CertificateStatus {
     pub key_path: Option<String>,
     pub expiry: Option<String>,
     pub error: Option<String>,
+    pub is_wildcard: Option<bool>,
 }
 
 // Structure to manage the certificate issuing process
@@ -74,23 +88,31 @@ impl CertificateIssuer {
 
     // Process a certificate request
     pub async fn process_request(&self, request: CertificateRequest) -> CertificateStatus {
-        // 1. Validate domain points to our server
-        let validation_result = self.validate_domain(&request.domain).await;
-        if let Err(e) = validation_result {
-            return CertificateStatus {
-                domain: request.domain,
-                status: "failed".to_string(),
-                cert_path: None,
-                key_path: None,
-                expiry: None,
-                error: Some(format!("Domain validation failed: {}", e)),
-            };
+        let is_wildcard = request.wildcard.unwrap_or(false);
+
+        // For wildcard certificates, skip domain validation as it uses DNS challenge
+        if !is_wildcard {
+            // 1. Validate domain points to our server (only for HTTP-01 challenges)
+            let validation_result = self.validate_domain(&request.domain).await;
+            if let Err(e) = validation_result {
+                return CertificateStatus {
+                    domain: request.domain,
+                    status: "failed".to_string(),
+                    cert_path: None,
+                    key_path: None,
+                    expiry: None,
+                    error: Some(format!("Domain validation failed: {}", e)),
+                    is_wildcard: Some(is_wildcard),
+                };
+            }
         }
 
         // 2. Check if certificate already exists and is valid
         let force_renew = request.force_renew.unwrap_or(false);
         if !force_renew {
-            if let Some(status) = self.check_certificate(&request.domain) {
+            if let Some(mut status) = self.check_certificate(&request.domain) {
+                // Add wildcard flag to the status
+                status.is_wildcard = Some(is_wildcard);
                 return status;
             }
         }
@@ -105,6 +127,7 @@ impl CertificateIssuer {
                 key_path: None,
                 expiry: None,
                 error: Some(format!("Certificate issuance failed: {}", e)),
+                is_wildcard: Some(is_wildcard),
             },
         }
     }
@@ -151,7 +174,7 @@ impl CertificateIssuer {
         Ok(())
     }
 
-    // Check if a valid certificate already exists - make this public
+    // Check if a valid certificate already exists
     pub fn check_certificate(&self, domain: &str) -> Option<CertificateStatus> {
         let live_dir = self.certbot_dir.join("live").join(domain);
         let cert_path = live_dir.join("fullchain.pem");
@@ -173,6 +196,7 @@ impl CertificateIssuer {
                             key_path: Some(key_path.to_string_lossy().to_string()),
                             expiry: Some(format!("{:?}", expiry)),
                             error: None,
+                            is_wildcard: None, // Will be set by the caller
                         });
                     }
 
@@ -184,6 +208,7 @@ impl CertificateIssuer {
                         key_path: Some(key_path.to_string_lossy().to_string()),
                         expiry: Some(format!("{:?}", expiry)),
                         error: None,
+                        is_wildcard: None, // Will be set by the caller
                     });
                 }
                 Err(_) => {
@@ -195,6 +220,7 @@ impl CertificateIssuer {
                         key_path: Some(key_path.to_string_lossy().to_string()),
                         expiry: None,
                         error: Some("Could not determine certificate expiry".to_string()),
+                        is_wildcard: None, // Will be set by the caller
                     });
                 }
             }
@@ -208,6 +234,7 @@ impl CertificateIssuer {
         let domain = &request.domain;
         let email = &request.email;
         let staging = request.staging.unwrap_or(false);
+        let is_wildcard = request.wildcard.unwrap_or(false);
 
         println!("Issuing certificate for: {}", domain);
 
@@ -216,7 +243,7 @@ impl CertificateIssuer {
         let validation = format!("{}.{}", token, "valid-response-for-acme-challenge");
 
         // Store the challenge token and validation for the HTTP server to use
-        {
+        if !is_wildcard {
             let mut challenges = ACTIVE_CHALLENGES.lock().await;
             challenges.insert(domain.to_string(), (token.clone(), validation.clone()));
         }
@@ -224,20 +251,61 @@ impl CertificateIssuer {
         // Build certbot command
         let mut cmd = Command::new("certbot");
         cmd.arg("certonly")
-            .arg("--webroot")
-            .arg("-w")
-            .arg("/var/www/html") // Webroot path - adjust to your HTTP challenge path
             .arg("--email")
             .arg(email)
             .arg("--agree-tos")
             .arg("--no-eff-email")
-            .arg("-d")
-            .arg(domain)
             .arg("--config-dir")
             .arg(&self.certbot_dir);
 
         if staging {
             cmd.arg("--staging");
+        }
+
+        // Handle different challenge types
+        if is_wildcard {
+            // For wildcard certificates, use DNS challenge with Cloudflare
+            if let Some(dns_provider) = &request.dns_provider {
+                if dns_provider == "cloudflare" {
+                    if let Some(credentials) = &request.dns_credentials {
+                        // Create Cloudflare credentials file
+                        let cf_credentials_path =
+                            self.create_cloudflare_credentials(credentials)?;
+
+                        cmd.arg("--authenticator")
+                            .arg("dns-cloudflare")
+                            .arg("--dns-cloudflare-credentials")
+                            .arg(&cf_credentials_path);
+                    } else {
+                        return Err(anyhow!(
+                            "Cloudflare credentials required for wildcard certificates"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "Only Cloudflare is supported for wildcard certificates"
+                    ));
+                }
+            } else {
+                return Err(anyhow!("DNS provider required for wildcard certificates"));
+            }
+
+            // Add domain and wildcard domain
+            cmd.arg("-d")
+                .arg(domain)
+                .arg("-d")
+                .arg(format!("*.{}", domain));
+
+            println!("Using DNS-01 challenge for wildcard certificate");
+        } else {
+            // For regular certificates, use HTTP-01 challenge
+            cmd.arg("--webroot")
+                .arg("-w")
+                .arg("/var/www/html") // Webroot path
+                .arg("-d")
+                .arg(domain);
+
+            println!("Using HTTP-01 challenge for standard certificate");
         }
 
         // Execute certbot command
@@ -250,7 +318,7 @@ impl CertificateIssuer {
         }
 
         // Clean up the challenge after it's been used
-        {
+        if !is_wildcard {
             let mut challenges = ACTIVE_CHALLENGES.lock().await;
             challenges.remove(domain);
         }
@@ -285,7 +353,50 @@ impl CertificateIssuer {
             key_path: Some(key_path.to_string_lossy().to_string()),
             expiry,
             error: None,
+            is_wildcard: Some(is_wildcard),
         })
+    }
+
+    // Create a Cloudflare credentials file for certbot dns-cloudflare plugin
+    fn create_cloudflare_credentials(&self, credentials: &Credentials) -> Result<String> {
+        // Create directory for credentials if needed
+        let credentials_dir = self.certbot_dir.join("cloudflare");
+        fs::create_dir_all(&credentials_dir)?;
+
+        // Create unique filename
+        let credentials_file =
+            credentials_dir.join(format!("cloudflare-{}.ini", uuid::Uuid::new_v4()));
+
+        // Write credentials to file
+        let mut content = String::new();
+
+        // Prefer API token (newer API) if available
+        if let Some(api_token) = &credentials.api_token {
+            content.push_str(&format!("dns_cloudflare_api_token = {}\n", api_token));
+        } else if let (Some(api_key), Some(api_email)) =
+            (&credentials.api_key, &credentials.api_email)
+        {
+            // Fall back to API key (older API)
+            content.push_str(&format!("dns_cloudflare_api_key = {}\n", api_key));
+            content.push_str(&format!("dns_cloudflare_email = {}\n", api_email));
+        } else {
+            return Err(anyhow!(
+                "Either API token or both API key and email are required for Cloudflare"
+            ));
+        }
+
+        // Write the file with strict permissions
+        fs::write(&credentials_file, content)?;
+
+        // Set permissions to read-only for owner (600)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&credentials_file, perms)?;
+        }
+
+        Ok(credentials_file.to_string_lossy().to_string())
     }
 
     // Get certificate expiry date

@@ -1,4 +1,4 @@
-# docker-compose.yml with security features removed for testing
+# docker-compose.yml with Cloudflare credentials for wildcard certificates
 version: "3.7"
 
 services:
@@ -24,7 +24,10 @@ services:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
-      # Removed ENFORCE_NETWORK_ISOLATION
+      # Let's Encrypt configuration
+      - LETS_ENCRYPT_EMAIL=honghangsia@gmail.com
+      # Cloudflare credentials for wildcard certificates
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
     deploy:
       mode: global
       placement:
@@ -39,18 +42,11 @@ services:
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
-        mode: 0644 # Changed from 0440 to more permissive
-    # Removed all security configurations
-    # Removed cap_drop
-    # Removed cap_add
-    # Removed security_opt
-    # Removed read_only
-    # tmpfs has been converted to regular volumes above
+        mode: 0644
 
 networks:
   proxy-network:
     external: true
-    # Removed encryption for testing
 
 configs:
   proxy-security-policy:

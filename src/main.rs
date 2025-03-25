@@ -104,14 +104,45 @@ fn main() {
         println!("Warning: No TLS certificates found. HTTPS service will not be available.");
     }
 
-    // Create Let's Encrypt service
+    // Create Let's Encrypt service with Cloudflare support for wildcard certificates
     let certbot_dir = PathBuf::from("/certbot/letsencrypt");
-    let lets_encrypt_service = LetsEncryptService::new(
-        config_store.clone(),
-        certbot_dir,
-        "your-email@example.com".to_string(), // Replace with a real email
-        3600,                                 // Check for certificate renewals every hour
-    );
+    let email = std::env::var("LETS_ENCRYPT_EMAIL")
+        .unwrap_or_else(|_| "your-email@example.com".to_string());
+
+    // Load Cloudflare credentials from environment
+    let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
+    let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
+    let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
+
+    // Check if we have valid Cloudflare credentials
+    let has_cloudflare_credentials = cloudflare_api_token.is_some()
+        || (cloudflare_api_key.is_some() && cloudflare_api_email.is_some());
+
+    // Create service with credentials if available
+    let lets_encrypt_service = if has_cloudflare_credentials {
+        println!(
+            "Creating Let's Encrypt service with Cloudflare credentials for wildcard certificates"
+        );
+        LetsEncryptService::new(
+            config_store.clone(),
+            certbot_dir,
+            email,
+            3600, // Check for certificate renewals every hour
+        )
+        .with_cloudflare_credentials(
+            cloudflare_api_token,
+            cloudflare_api_key,
+            cloudflare_api_email,
+        )
+    } else {
+        println!("Creating Let's Encrypt service (wildcard certificates disabled)");
+        LetsEncryptService::new(
+            config_store.clone(),
+            certbot_dir,
+            email,
+            3600, // Check for certificate renewals every hour
+        )
+    };
 
     // Add all services to the server
     server.add_service(http_service);
