@@ -1,4 +1,4 @@
-# docker-compose.yml with enhanced security features
+# docker-compose.yml with security features removed for testing
 version: "3.7"
 
 services:
@@ -22,9 +22,7 @@ services:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
-      - ENFORCE_NETWORK_ISOLATION=true
-      # - DEFAULT_MEMORY_LIMIT=512M
-      # - DEFAULT_CPU_LIMIT=0.5
+      # Removed ENFORCE_NETWORK_ISOLATION
     deploy:
       mode: global
       placement:
@@ -36,35 +34,24 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      # resources:
-      #   limits:
-      #     cpus: "0.5"
-      #     memory: 512M
-    # Config needs to be at the service level, not under deploy
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
-        mode: 0440
-    # Add security configurations
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges=true
-      - userns=host
-    read_only: true
-    tmpfs:
-      - /tmp
-      - /var/cache
-      - /certbot
+        mode: 0644  # Changed from 0440 to more permissive
+    # Removed all security configurations
+    # Removed cap_drop
+    # Removed cap_add
+    # Removed security_opt
+    # Removed read_only
+    # Changed tmpfs to regular volumes for better permissions
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /tmp:/tmp
+      - /var/cache:/var/cache
 
 networks:
   proxy-network:
     external: true
-    driver_opts:
-      encrypted: "true"
-
-configs:
-  proxy-security-policy:
-    file: ./security-policy.json
+    # Removed encryption for testing
