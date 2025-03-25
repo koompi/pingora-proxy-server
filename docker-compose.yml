@@ -16,8 +16,10 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot:rw
-      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge:rw
+      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /tmp:/tmp
+      - /var/cache:/var/cache
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
@@ -37,21 +39,19 @@ services:
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
-        mode: 0644  # Changed from 0440 to more permissive
+        mode: 0644 # Changed from 0440 to more permissive
     # Removed all security configurations
     # Removed cap_drop
     # Removed cap_add
     # Removed security_opt
     # Removed read_only
-    # Changed tmpfs to regular volumes for better permissions
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot
-      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
-      - /tmp:/tmp
-      - /var/cache:/var/cache
+    # tmpfs has been converted to regular volumes above
 
 networks:
   proxy-network:
     external: true
     # Removed encryption for testing
+
+configs:
+  proxy-security-policy:
+    file: ./security-policy.json
