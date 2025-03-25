@@ -5,8 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+static ACTIVE_CHALLENGES: Lazy<Mutex<std::collections::HashMap<String, (String, String)>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 // Certificate request data structure
 #[derive(Debug, Deserialize)]
@@ -206,39 +211,14 @@ impl CertificateIssuer {
 
         println!("Issuing certificate for: {}", domain);
 
-        // For local testing, create dummy certificate files
-        let dummy_testing = true; // Set to false for production
+        // Generate a token and validation string for the HTTP-01 challenge
+        let token = format!("{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        let validation = format!("{}.{}", token, "valid-response-for-acme-challenge");
 
-        if dummy_testing {
-            println!("Creating dummy certificate files for testing");
-
-            // Create directories
-            let live_dir = self.certbot_dir.join("live").join(domain);
-            fs::create_dir_all(&live_dir)?;
-
-            let cert_path = live_dir.join("fullchain.pem");
-            let key_path = live_dir.join("privkey.pem");
-
-            // Create dummy certificate files
-            fs::write(&cert_path, "DUMMY CERTIFICATE FOR TESTING\n")?;
-            fs::write(&key_path, "DUMMY PRIVATE KEY FOR TESTING\n")?;
-
-            // Also copy to output directory
-            fs::create_dir_all(self.output_dir.join(domain))?;
-            fs::copy(
-                &cert_path,
-                self.output_dir.join(domain).join("fullchain.pem"),
-            )?;
-            fs::copy(&key_path, self.output_dir.join(domain).join("privkey.pem"))?;
-
-            return Ok(CertificateStatus {
-                domain: domain.to_string(),
-                status: "issued".to_string(),
-                cert_path: Some(cert_path.to_string_lossy().to_string()),
-                key_path: Some(key_path.to_string_lossy().to_string()),
-                expiry: Some("2099-12-31T23:59:59Z".to_string()),
-                error: None,
-            });
+        // Store the challenge token and validation for the HTTP server to use
+        {
+            let mut challenges = ACTIVE_CHALLENGES.lock().await;
+            challenges.insert(domain.to_string(), (token.clone(), validation.clone()));
         }
 
         // Build certbot command
@@ -267,6 +247,12 @@ impl CertificateIssuer {
             let error = String::from_utf8_lossy(&output.stderr);
             println!("Certbot error: {}", error);
             return Err(anyhow!("Certbot failed: {}", error));
+        }
+
+        // Clean up the challenge after it's been used
+        {
+            let mut challenges = ACTIVE_CHALLENGES.lock().await;
+            challenges.remove(domain);
         }
 
         // Check if certificate was created
@@ -330,5 +316,11 @@ impl CertificateIssuer {
         let expiry = SystemTime::now() + Duration::from_secs(90 * 24 * 60 * 60);
 
         Ok(expiry)
+    }
+
+    // Helper method to get active challenges - useful for the HTTP server
+    pub async fn get_challenge(domain: &str) -> Option<(String, String)> {
+        let challenges = ACTIVE_CHALLENGES.lock().await;
+        challenges.get(domain).cloned()
     }
 }

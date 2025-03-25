@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use config::utils::fix_config_file;
+use config::file_manager::get_config;
 use pingora::{listeners::tls::TlsSettings, server::Server};
 
 mod cert;
@@ -9,8 +10,8 @@ mod proxy;
 mod services;
 
 use crate::services::docker_swarm::SwarmDiscoveryService;
+use crate::services::letsencrypt::LetsEncryptService;
 use cert::certbot::find_certbot_certs;
-use config::file_manager::get_config;
 use proxy::http::HttpProxy;
 use proxy::https::HttpsProxy;
 use proxy::manager::ManagerProxy;
@@ -21,7 +22,7 @@ fn main() {
     env_logger::init();
 
     // Fix the configuration file first
-    fix_config_file();
+    config::utils::fix_config_file();
 
     // Load configuration
     let config_store = Arc::new(Mutex::new(get_config()));
@@ -47,7 +48,7 @@ fn main() {
     // Find certificates for domains
     let certs = find_certbot_certs(&domains);
 
-    // Create HTTP proxy service
+    // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         HttpProxy {
@@ -76,28 +77,7 @@ fn main() {
     manager_service.add_tcp("0.0.0.0:81");
     println!("Manager service (HTTP) configured on port 81");
 
-    // Additionally, set up HTTPS on a different port if certificates are available
-    if !certs.is_empty() {
-        // Use the first certificate for the manager interface
-        let mgr_cert = &certs[0];
-        println!(
-            "Also setting up TLS for manager on port 8443: {}",
-            mgr_cert.domain
-        );
-
-        match TlsSettings::intermediate(&mgr_cert.cert_path, &mgr_cert.key_path) {
-            Ok(tls_settings) => {
-                // Use a different port (8443) for HTTPS manager access
-                manager_service.add_tls_with_settings("0.0.0.0:8443", None, tls_settings);
-                println!("Manager TLS configured successfully on port 8443");
-            }
-            Err(e) => {
-                println!("Error setting up TLS for manager: {}", e);
-            }
-        };
-    }
-
-    // Configure HTTPS with domain-specific certificates
+    // Configure TLS settings for HTTPS service
     if !certs.is_empty() {
         for cert in &certs {
             println!("Setting up TLS for domain: {}", cert.domain);
@@ -118,6 +98,15 @@ fn main() {
         println!("Warning: No TLS certificates found. HTTPS service will not be available.");
     }
 
+    // Create Let's Encrypt service
+    let certbot_dir = PathBuf::from("/certbot/letsencrypt");
+    let lets_encrypt_service = LetsEncryptService::new(
+        config_store.clone(),
+        certbot_dir,
+        "your-email@example.com".to_string(), // Replace with a real email
+        3600,                                 // Check for certificate renewals every hour
+    );
+
     // Add all services to the server
     server.add_service(http_service);
 
@@ -127,7 +116,9 @@ fn main() {
     }
 
     server.add_service(manager_service);
+    server.add_service(lets_encrypt_service);
 
+    // Set up Swarm discovery if enabled
     let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
         .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
 
@@ -150,7 +141,7 @@ fn main() {
         ) {
             Ok(swarm_service) => {
                 println!("Adding Docker Swarm discovery service");
-                server.add_service(swarm_service); // Remove the Box::new() wrapper
+                server.add_service(swarm_service);
             }
             Err(e) => {
                 println!("Failed to initialize Docker Swarm discovery: {}", e);
