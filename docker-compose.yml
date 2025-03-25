@@ -1,4 +1,4 @@
-# docker-compose.yml with Cloudflare credentials for wildcard certificates
+# docker-compose.yml with persistent configuration and Cloudflare credentials
 version: "3.7"
 
 services:
@@ -18,12 +18,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /mnt/gluster/proxy-config:/app/config # Persistent configuration directory
       - /tmp:/tmp
       - /var/cache:/var/cache
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
+      - CONFIG_PATH=/app/config/config.json # Point to the new location
       # Let's Encrypt configuration
       - LETS_ENCRYPT_EMAIL=honghangsia@gmail.com
       # Cloudflare credentials for wildcard certificates

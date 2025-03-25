@@ -1,4 +1,4 @@
-// src/proxy/http.rs
+// src/proxy/http.rs (Updated for MappingOrigin)
 use std::{
     collections::HashMap,
     fs,
@@ -11,9 +11,10 @@ use pingora::{prelude::HttpPeer, Result};
 use pingora_http::{RequestHeader, ResponseHeader, StatusCode};
 use pingora_proxy::{ProxyHttp, Session};
 
-use crate::cert::issuer::CertificateIssuer;
-use crate::proxy::utils::{
-    parse_swarm_target, test_service_connectivity, validate_org_network_access,
+use crate::{
+    cert::issuer::CertificateIssuer,
+    config::model::ConfigStore,
+    proxy::utils::{parse_swarm_target, test_service_connectivity, validate_org_network_access},
 };
 
 use super::utils::extract_hostname;
@@ -21,7 +22,7 @@ use super::utils::extract_hostname;
 /// HTTP Proxy implementation
 #[derive(Clone)]
 pub struct HttpProxy {
-    pub servers: Arc<Mutex<HashMap<String, String>>>,
+    pub servers: Arc<Mutex<ConfigStore>>,
 }
 
 #[async_trait::async_trait]

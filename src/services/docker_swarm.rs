@@ -1,4 +1,4 @@
-// Fixed src/services/docker_swarm.rs with proper Send safety
+// Updated src/services/docker_swarm.rs with MappingOrigin support
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -7,17 +7,20 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use bollard::{API_DEFAULT_VERSION, Docker, service::ListServicesOptions};
+use bollard::{service::ListServicesOptions, Docker, API_DEFAULT_VERSION};
 use pingora::{
     server::{ListenFds, ShutdownWatch},
     services::Service,
 };
 use tokio::time;
 
-use crate::{config::file_manager::update_config, config::model::ServerMapping};
+use crate::{
+    config::file_manager::{create_mappings_from_store, update_config},
+    config::model::{ConfigStore, MappingOrigin, ServerMapping},
+};
 
 pub struct SwarmDiscoveryService {
-    pub config_store: Arc<Mutex<HashMap<String, String>>>,
+    pub config_store: Arc<Mutex<ConfigStore>>,
     pub docker_client: Docker,
     pub networks: Vec<String>,
     pub check_interval: Duration,
@@ -27,7 +30,7 @@ pub struct SwarmDiscoveryService {
 
 impl SwarmDiscoveryService {
     pub fn new(
-        config_store: Arc<Mutex<HashMap<String, String>>>,
+        config_store: Arc<Mutex<ConfigStore>>,
         endpoint: &str,
         networks: Vec<String>,
         check_interval: u64,
@@ -98,6 +101,12 @@ impl SwarmDiscoveryService {
             // Create target using Docker Swarm DNS-based service discovery
             // Format depends on the context:
             let target = if let Some(org) = org_id.clone() {
+                // Track services for this organization
+                org_services
+                    .entry(org.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(service_name.clone());
+
                 // Use just the service name - the proxy will handle the DNS resolution
                 format!("tasks.{}:{}", service_name, port)
             } else {
@@ -121,28 +130,29 @@ impl SwarmDiscoveryService {
         if !new_mappings.is_empty() {
             let server_mappings = {
                 if let Ok(mut store) = self.config_store.lock() {
-                    // Merge new mappings with existing ones
+                    // Merge new mappings with existing ones, preserving manual mappings
                     for (domain, target) in new_mappings {
-                        store.insert(domain, target);
+                        // Only update if the mapping doesn't exist or was created by Swarm
+                        if !store.contains_key(&domain)
+                            || store.get(&domain).map_or(false, |(_, origin)| {
+                                *origin == MappingOrigin::SwarmDiscovery
+                            })
+                        {
+                            store.insert(domain, (target, MappingOrigin::SwarmDiscovery));
+                        }
                     }
-                    
+
                     // Create a vector of mappings while we have the lock
-                    store
-                        .iter()
-                        .map(|(from, to)| ServerMapping {
-                            from: from.clone(),
-                            to: to.clone(),
-                        })
-                        .collect()
+                    create_mappings_from_store(&store)
                 } else {
                     // Failed to get lock, return empty vec
                     Vec::new()
                 }
             };
-            
+
             // Only update config if we got mappings
             if !server_mappings.is_empty() {
-                update_config(server_mappings);
+                update_config(server_mappings).ok();
             }
         }
 
@@ -160,42 +170,44 @@ impl SwarmDiscoveryService {
                     return Ok(());
                 }
             };
-            
+
             // Clone the org IDs so we don't hold the lock
             org_networks_lock.keys().cloned().collect::<Vec<_>>()
         };
-        
+
         // Process outside the lock to avoid Send issues
         for org_id in orgs {
             let network_name = format!("org_{}_overlay", org_id);
-            
+
             // Check if network exists
             let networks = self.docker_client.list_networks::<String>(None).await?;
-            let exists = networks.iter().any(|n| n.name.as_ref().map_or(false, |name| name == &network_name));
-            
+            let exists = networks
+                .iter()
+                .any(|n| n.name.as_ref().map_or(false, |name| name == &network_name));
+
             if !exists {
                 println!("Creating isolated network for organization: {}", org_id);
-                
+
                 // Network options for isolation
                 let mut options = HashMap::new();
                 options.insert("encrypted".to_string(), "true".to_string());
                 options.insert("internal".to_string(), "true".to_string());
-                
+
                 // Create network
-                self.docker_client.create_network(
-                    bollard::network::CreateNetworkOptions {
+                self.docker_client
+                    .create_network(bollard::network::CreateNetworkOptions {
                         name: network_name.clone(),
                         driver: "overlay".to_string(),
                         attachable: true,
                         internal: true,
                         options: options,
                         ..Default::default()
-                    }
-                ).await?;
+                    })
+                    .await?;
                 println!("Created network: {}", network_name);
             }
         }
-        
+
         Ok(())
     }
 }
@@ -214,7 +226,7 @@ impl Service for SwarmDiscoveryService {
             if let Err(e) = self.discover_services().await {
                 println!("Error in service discovery: {}", e);
             }
-            
+
             // Then ensure networks exist
             if let Err(e) = self.ensure_org_networks().await {
                 println!("Error ensuring organization networks: {}", e);

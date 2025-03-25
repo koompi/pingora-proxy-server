@@ -1,21 +1,4 @@
-// src/proxy/manager.rs
-/*
-This file defines a "ManagerProxy" for a web service that manages domain routing.
-
-What it does:
-- Creates, updates, and deletes mappings between domains and backend servers
-- Handles certificate requests for domains
-- Serves as an admin interface through HTTP endpoints
-
-Main features:
-- GET: Lists all domain mappings
-- POST/PUT: Adds or updates where a domain points to
-- DELETE: Removes a domain mapping
-- Certificate management: Request and check status of SSL certificates
-
-It's part of a reverse proxy system that routes traffic based on domain names,
-allowing you to change where domains point without restarting the server.
-*/
+// src/proxy/manager.rs (Fixed for MappingOrigin support)
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -29,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cert::issuer::{CertificateIssuer, CertificateRequest, CertificateStatus};
 use crate::config::file_manager::{create_mappings_from_store, update_config};
+use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
 
 // Response structure for API endpoints
 #[derive(Serialize)]
@@ -47,12 +31,14 @@ struct ApiResponse {
 struct DomainMapping {
     from: String,
     to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 /// Manager Proxy for configuration endpoints
 #[derive(Clone)]
 pub struct ManagerProxy {
-    pub servers: Arc<Mutex<HashMap<String, String>>>,
+    pub servers: Arc<Mutex<ConfigStore>>,
 }
 
 impl ManagerProxy {
@@ -115,7 +101,6 @@ impl ManagerProxy {
         (from, to)
     }
 
-    // Handle certificate requests
     // Handle certificate requests
     async fn handle_certificate_request(
         &self,
@@ -357,13 +342,14 @@ impl ManagerProxy {
 
         match self.servers.lock() {
             Ok(mut servers) => {
-                servers.insert(from.clone(), to.clone());
+                // Mark this mapping as manually added
+                servers.insert(from.clone(), (to.clone(), MappingOrigin::Manual));
                 let updates = create_mappings_from_store(&servers);
 
                 match update_config(updates) {
                     Ok(_) => {
                         println!(
-                            "{} mapping: {} -> {}",
+                            "{} mapping: {} -> {} (Manual)",
                             if method == "POST" { "Added" } else { "Updated" },
                             from,
                             &to
@@ -482,9 +468,17 @@ impl ManagerProxy {
             Ok(servers) => {
                 let mappings = servers
                     .iter()
-                    .map(|(domain, backend)| DomainMapping {
-                        from: domain.clone(),
-                        to: backend.clone(),
+                    .map(|(domain, (backend, origin))| {
+                        let origin_str = match origin {
+                            MappingOrigin::Manual => "Manual",
+                            MappingOrigin::SwarmDiscovery => "SwarmDiscovery",
+                        };
+
+                        DomainMapping {
+                            from: domain.clone(),
+                            to: backend.clone(),
+                            origin: Some(origin_str.to_string()),
+                        }
                     })
                     .collect();
 
