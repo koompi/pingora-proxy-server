@@ -9,7 +9,7 @@ pub struct DomainCert {
 }
 
 /// Constant for the certbot directory
-const CERTBOT_LIVE_DIR: &str = "/var/lib/certbot/letsencrypt/live";
+const CERTBOT_LIVE_DIR: &str = "/certbot/letsencrypt/live";
 
 /// Function to check for certbot certificates for given domains
 pub fn find_certbot_certs(domains: &[String]) -> Vec<DomainCert> {

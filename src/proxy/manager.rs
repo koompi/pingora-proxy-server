@@ -161,7 +161,7 @@ impl ManagerProxy {
                 };
 
                 // Process the certificate request
-                let issuer = match CertificateIssuer::new("/var/lib/certbot/letsencrypt", "certs") {
+                let issuer = match CertificateIssuer::new("/certbot/letsencrypt", "certs") {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
@@ -226,7 +226,7 @@ impl ManagerProxy {
                 }
 
                 let domain = &path_segments[2];
-                let issuer = match CertificateIssuer::new("/var/lib/certbot/letsencrypt", "certs") {
+                let issuer = match CertificateIssuer::new("/certbot/letsencrypt", "certs") {
                     Ok(issuer) => issuer,
                     Err(e) => {
                         return self
