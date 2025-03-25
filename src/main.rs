@@ -16,10 +16,16 @@ use proxy::http::HttpProxy;
 use proxy::https::HttpsProxy;
 use proxy::manager::ManagerProxy;
 use proxy::utils::clean_backend_address;
+use rustls::crypto::ring::default_provider;
 
 fn main() {
     // Initialize logging
     env_logger::init();
+    // IMPORTANT: Install the default CryptoProvider before anything else
+    // This is required for Rustls to work properly
+    default_provider()
+        .install_default()
+        .expect("Failed to install CryptoProvider");
 
     // Fix the configuration file first
     config::utils::fix_config_file();
