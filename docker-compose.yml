@@ -22,7 +22,7 @@ services:
       - target: 81
         published: 81
         protocol: tcp
-        mode: host
+        mode: ingress
     networks:
       - proxy-network
     volumes:
