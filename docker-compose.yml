@@ -19,6 +19,7 @@ services:
       - /mnt/gluster/certbot:/certbot
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
       - /mnt/gluster/proxy-config:/app/config # Persistent configuration directory
+      - /mnt/gluster/pingora-proxy/locks:/etc/pingora-proxy/locks # Shared lock directory
       - /tmp:/tmp
       - /var/cache:/var/cache
     environment:

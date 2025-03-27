@@ -118,6 +118,21 @@ impl FileLock {
             }
         }
 
+        // Add cleanup for very old locks (e.g., 5x TTL)
+        if self.lock_path.exists() {
+            let metadata = fs::metadata(&self.lock_path)?;
+            if let Ok(modified) = metadata.modified() {
+                if SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default()
+                    > self.ttl * 5
+                {
+                    println!("Found very old lock, removing: {:?}", self.lock_path);
+                    fs::remove_file(&self.lock_path)?;
+                }
+            }
+        }
+
         // No valid lock exists, try to create it
         match self.write_lock_file() {
             Ok(_) => Ok(true),
@@ -175,5 +190,31 @@ impl FileLock {
         }
 
         Ok(())
+    }
+    // Add a method to try to become the leader
+    pub async fn try_become_leader(&self) -> Result<bool, IoError> {
+        self.acquire(1, Duration::from_millis(0)).await
+    }
+
+    // Add a method to refresh leadership
+    pub async fn refresh_leadership(&self) -> Result<bool, IoError> {
+        if !self.lock_path.exists() {
+            return self.try_become_leader().await;
+        }
+
+        // Check if we own the lock
+        let mut lock_file = File::open(&self.lock_path)?;
+        let mut contents = String::new();
+        lock_file.read_to_string(&mut contents)?;
+
+        let parts: Vec<&str> = contents.trim().split(':').collect();
+        if parts.len() >= 1 && parts[0] == self.node_id {
+            // Update the timestamp to extend our leadership
+            self.write_lock_file()?;
+            Ok(true)
+        } else {
+            // Someone else is the leader
+            Ok(false)
+        }
     }
 }

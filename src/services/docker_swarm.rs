@@ -1,6 +1,7 @@
 // Updated src/services/docker_swarm.rs with MappingOrigin support
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -19,6 +20,8 @@ use crate::{
     config::model::{ConfigStore, MappingOrigin, ServerMapping},
 };
 
+use super::lock::FileLock;
+
 pub struct SwarmDiscoveryService {
     pub config_store: Arc<Mutex<ConfigStore>>,
     pub docker_client: Docker,
@@ -26,6 +29,8 @@ pub struct SwarmDiscoveryService {
     pub check_interval: Duration,
     // Track organization networks
     pub org_networks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    leader_lock: FileLock,
+    is_leader: Arc<Mutex<bool>>,
 }
 
 /// Service that discovers and manages Docker Swarm services for proxy configuration.
@@ -110,13 +115,66 @@ impl SwarmDiscoveryService {
             Docker::connect_with_http(endpoint, 120, API_DEFAULT_VERSION)?
         };
 
+        // Create a lock for leader election
+        let lock_dir = PathBuf::from("/etc/pingora-proxy/locks");
+        std::fs::create_dir_all(&lock_dir).ok();
+
+        let node_id = uuid::Uuid::new_v4().to_string();
+        let leader_lock = FileLock::new(lock_dir, "config_writer", &node_id, 30); // 30-second TTL
+
         Ok(Self {
             config_store,
             docker_client,
             networks,
             check_interval: Duration::from_secs(check_interval),
             org_networks: Arc::new(Mutex::new(HashMap::new())),
+            leader_lock,
+            is_leader: Arc::new(Mutex::new(false)),
         })
+    }
+    async fn check_leadership(&self) -> Result<bool> {
+        match self.leader_lock.refresh_leadership().await {
+            Ok(true) => {
+                // We are the leader
+                if let Ok(mut is_leader) = self.is_leader.lock() {
+                    if !*is_leader {
+                        println!("Node became the configuration leader");
+                    }
+                    *is_leader = true;
+                }
+                Ok(true)
+            }
+            Ok(false) => {
+                // We are not the leader, try to become one if no one else is
+                match self.leader_lock.try_become_leader().await {
+                    Ok(true) => {
+                        println!("Node became the configuration leader");
+                        if let Ok(mut is_leader) = self.is_leader.lock() {
+                            *is_leader = true;
+                        }
+                        Ok(true)
+                    }
+                    Ok(false) => {
+                        // Someone else is the leader
+                        if let Ok(mut is_leader) = self.is_leader.lock() {
+                            if *is_leader {
+                                println!("Node is no longer the configuration leader");
+                            }
+                            *is_leader = false;
+                        }
+                        Ok(false)
+                    }
+                    Err(e) => {
+                        println!("Error in leader election: {}", e);
+                        Ok(false)
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Error refreshing leadership: {}", e);
+                Ok(false)
+            }
+        }
     }
 
     async fn discover_services(&self) -> Result<()> {
@@ -137,6 +195,7 @@ impl SwarmDiscoveryService {
         let mut new_mappings = HashMap::new();
         let mut org_services = HashMap::new();
 
+        // Discover and collect services
         for service in services {
             let service_spec = match service.spec {
                 Some(spec) => spec,
@@ -168,7 +227,6 @@ impl SwarmDiscoveryService {
             let service_name = service_spec.name.unwrap_or_default();
 
             // Create target using Docker Swarm DNS-based service discovery
-            // Format depends on the context:
             let target = if let Some(org) = org_id.clone() {
                 // Track services for this organization
                 org_services
@@ -189,40 +247,54 @@ impl SwarmDiscoveryService {
         // Update the organization services tracking - carefully scope the mutex lock
         {
             if let Ok(mut org_networks) = self.org_networks.lock() {
-                for (org, services) in org_services {
+                for (org, services) in org_services.clone() {
                     org_networks.insert(org, services);
                 }
             }
         }
 
-        // Update config store with new mappings - carefully scope the mutex lock
-        if !new_mappings.is_empty() {
-            let server_mappings = {
-                if let Ok(mut store) = self.config_store.lock() {
-                    // Merge new mappings with existing ones, preserving manual mappings
-                    for (domain, target) in new_mappings {
-                        // Only update if the mapping doesn't exist or was created by Swarm
-                        if !store.contains_key(&domain)
-                            || store.get(&domain).map_or(false, |(_, origin)| {
-                                *origin == MappingOrigin::SwarmDiscovery
-                            })
-                        {
-                            store.insert(domain, (target, MappingOrigin::SwarmDiscovery));
-                        }
-                    }
+        // Check if we're the leader before updating config file
+        let is_leader = self.check_leadership().await.unwrap_or(false);
 
-                    // Create a vector of mappings while we have the lock
+        // Always update in-memory configuration first
+        let server_mappings = {
+            if let Ok(mut store) = self.config_store.lock() {
+                // Merge new mappings with existing ones, preserving manual mappings
+                for (domain, target) in new_mappings.iter() {
+                    // Only update if the mapping doesn't exist or was created by Swarm
+                    if !store.contains_key(domain)
+                        || store.get(domain).map_or(false, |(_, origin)| {
+                            *origin == MappingOrigin::SwarmDiscovery
+                        })
+                    {
+                        store.insert(
+                            domain.clone(),
+                            (target.clone(), MappingOrigin::SwarmDiscovery),
+                        );
+                    }
+                }
+
+                // Create a vector of mappings while we have the lock
+                if is_leader {
                     create_mappings_from_store(&store)
                 } else {
-                    // Failed to get lock, return empty vec
-                    Vec::new()
+                    Vec::new() // Don't need mappings if not leader
                 }
-            };
-
-            // Only update config if we got mappings
-            if !server_mappings.is_empty() {
-                update_config(server_mappings).ok();
+            } else {
+                // Failed to get lock, return empty vec
+                Vec::new()
             }
+        };
+
+        // Only the leader node updates the config file
+        if is_leader && !server_mappings.is_empty() {
+            println!("Node is the leader - updating configuration file");
+            match update_config(server_mappings) {
+                Ok(_) => println!("Config updated successfully"),
+                Err(e) => println!("Error updating config file: {}", e),
+            }
+        } else if !is_leader {
+            println!("Node is not the leader - skipping config file update");
         }
 
         Ok(())

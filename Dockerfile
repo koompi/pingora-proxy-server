@@ -36,7 +36,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Create required directories
-RUN mkdir -p /certbot/letsencrypt /var/www/html/.well-known/acme-challenge /app/config
+RUN mkdir -p /etc/pingora-proxy /certbot/letsencrypt /var/www/html/.well-known/acme-challenge /app/config
 
 # Environment for service discovery
 ENV SWARM_MODE=true
