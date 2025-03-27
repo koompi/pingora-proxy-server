@@ -115,12 +115,21 @@ impl SwarmDiscoveryService {
             Docker::connect_with_http(endpoint, 120, API_DEFAULT_VERSION)?
         };
 
-        // Create a lock for leader election
+        // Change this path to use the shared GlusterFS volume
         let lock_dir = PathBuf::from("/etc/pingora-proxy/locks");
         std::fs::create_dir_all(&lock_dir).ok();
 
-        let node_id = uuid::Uuid::new_v4().to_string();
-        let leader_lock = FileLock::new(lock_dir, "config_writer", &node_id, 30); // 30-second TTL
+        // Generate a stable node ID using hostname instead of random UUID
+        let hostname = std::process::Command::new("hostname")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+        let node_id = hostname;
+        println!("Using node ID for locking: {}", node_id);
+
+        // Increase the TTL to 60 seconds for better stability
+        let leader_lock = FileLock::new(lock_dir, "config_writer", &node_id, 60);
 
         Ok(Self {
             config_store,
@@ -133,7 +142,12 @@ impl SwarmDiscoveryService {
         })
     }
     async fn check_leadership(&self) -> Result<bool> {
-        match self.leader_lock.refresh_leadership().await {
+        // Try to refresh first with multiple attempts
+        match self
+            .leader_lock
+            .acquire(3, Duration::from_millis(500))
+            .await
+        {
             Ok(true) => {
                 // We are the leader
                 if let Ok(mut is_leader) = self.is_leader.lock() {
@@ -145,33 +159,21 @@ impl SwarmDiscoveryService {
                 Ok(true)
             }
             Ok(false) => {
-                // We are not the leader, try to become one if no one else is
-                match self.leader_lock.try_become_leader().await {
-                    Ok(true) => {
-                        println!("Node became the configuration leader");
-                        if let Ok(mut is_leader) = self.is_leader.lock() {
-                            *is_leader = true;
-                        }
-                        Ok(true)
+                // We are not the leader
+                if let Ok(mut is_leader) = self.is_leader.lock() {
+                    if *is_leader {
+                        println!("Node is no longer the configuration leader");
                     }
-                    Ok(false) => {
-                        // Someone else is the leader
-                        if let Ok(mut is_leader) = self.is_leader.lock() {
-                            if *is_leader {
-                                println!("Node is no longer the configuration leader");
-                            }
-                            *is_leader = false;
-                        }
-                        Ok(false)
-                    }
-                    Err(e) => {
-                        println!("Error in leader election: {}", e);
-                        Ok(false)
-                    }
+                    *is_leader = false;
                 }
+                Ok(false)
             }
             Err(e) => {
-                println!("Error refreshing leadership: {}", e);
+                println!("Error in leader election: {}", e);
+                // Default to non-leader on error
+                if let Ok(mut is_leader) = self.is_leader.lock() {
+                    *is_leader = false;
+                }
                 Ok(false)
             }
         }

@@ -147,8 +147,40 @@ impl FileLock {
         }
     }
 
+    pub fn debug_lock_status(&self) -> Result<String, IoError> {
+        if !self.lock_path.exists() {
+            return Ok(format!("Lock {:?} does not exist", self.lock_path));
+        }
+
+        let mut lock_file = File::open(&self.lock_path)?;
+        let mut contents = String::new();
+        lock_file.read_to_string(&mut contents)?;
+
+        Ok(format!("Lock {:?} contents: {}", self.lock_path, contents))
+    }
+
     /// Write the lock file with our node ID and current time
     fn write_lock_file(&self) -> Result<(), IoError> {
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = self.lock_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Make sure we can write to the directory
+        if let Some(parent) = self.lock_path.parent() {
+            let temp_file_path = parent.join(".write_test_tmp");
+            let write_test = fs::File::create(&temp_file_path);
+            if let Err(e) = write_test {
+                return Err(IoError::new(
+                    ErrorKind::PermissionDenied,
+                    format!("Cannot write to lock directory: {}", e),
+                ));
+            }
+            fs::remove_file(temp_file_path).ok();
+        }
+
         // Create lock file with exclusive access
         let mut file = OpenOptions::new()
             .write(true)
@@ -168,7 +200,6 @@ impl FileLock {
 
         Ok(())
     }
-
     /// Release the lock
     pub async fn release(&self) -> Result<(), IoError> {
         // Only remove the lock if it's ours
