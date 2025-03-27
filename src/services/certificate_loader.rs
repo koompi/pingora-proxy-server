@@ -214,37 +214,14 @@ impl Service for CertificateLoaderService {
 }
 
 // Public function for initial creation of HTTPS service at startup
-pub fn create_https_service_if_needed(
+// In src/services/certificate_loader.rs
+pub fn create_https_service(
     config_store: Arc<Mutex<ConfigStore>>,
     server_configuration: &Arc<pingora::server::configuration::ServerConf>,
 ) -> Option<pingora::services::listening::Service<pingora_proxy::HttpProxy<HttpsProxy>>> {
-    println!("Checking for SSL certificates for HTTPS service...");
+    println!("Creating HTTPS service...");
 
-    let domains = {
-        match config_store.lock() {
-            Ok(store) => {
-                let domains = store.keys().cloned().collect::<Vec<String>>();
-                println!("Found {} domains in config store", domains.len());
-                domains
-            }
-            Err(e) => {
-                println!("Failed to lock config store: {:?}", e);
-                return None;
-            }
-        }
-    };
-
-    println!("Looking for certificates for domains: {:?}", domains);
-    let certs = find_certbot_certs(&domains);
-
-    if certs.is_empty() {
-        println!("No certificates found, HTTPS service cannot be created");
-        return None;
-    }
-
-    println!("Found {} certificates", certs.len());
-
-    // Create a new HTTPS service
+    // Create the service first without any certificates
     let mut https_service = pingora_proxy::http_proxy_service(
         server_configuration,
         HttpsProxy {
@@ -252,60 +229,74 @@ pub fn create_https_service_if_needed(
         },
     );
 
-    let mut successful_certs = 0;
-    for cert in &certs {
-        println!("Loading certificate for domain: {}", cert.domain);
-        println!("  Cert path: {}", cert.cert_path);
-        println!("  Key path: {}", cert.key_path);
+    // Try to bind to port 443 FIRST before loading any certificates
+    // This ensures we can actually use the port before doing certificate work
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        https_service.add_tcp("0.0.0.0:443");
+    })) {
+        Ok(_) => {
+            println!("Successfully bound to port 443");
 
-        // Check file existence and permissions
-        let cert_exists = Path::new(&cert.cert_path).exists();
-        let key_exists = Path::new(&cert.key_path).exists();
+            // Only after binding, try to load certificates
+            let domains = {
+                match config_store.lock() {
+                    Ok(store) => store.keys().cloned().collect::<Vec<String>>(),
+                    Err(e) => {
+                        println!("Failed to lock config store: {:?}", e);
+                        return Some(https_service); // Return service without TLS
+                    }
+                }
+            };
 
-        println!("  Cert file exists: {}", cert_exists);
-        println!("  Key file exists: {}", key_exists);
-
-        if !cert_exists || !key_exists {
-            println!("  ERROR: Certificate files missing for {}", cert.domain);
-            continue;
-        }
-
-        // Try to read the files to verify permissions
-        match std::fs::read_to_string(&cert.cert_path) {
-            Ok(_) => println!("  Cert file is readable"),
-            Err(e) => println!("  ERROR: Cannot read cert file: {}", e),
-        }
-
-        match std::fs::read_to_string(&cert.key_path) {
-            Ok(_) => println!("  Key file is readable"),
-            Err(e) => println!("  ERROR: Cannot read key file: {}", e),
-        }
-
-        match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
-            Ok(tls_settings) => {
-                println!("  Successfully created TLS settings for {}", cert.domain);
-                // Add domain to SNI configuration but DON'T create TCP binding here
-                https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
-                successful_certs += 1;
+            // Find certificates
+            let certs = find_certbot_certs(&domains);
+            if certs.is_empty() {
+                println!(
+                    "Warning: No valid certificates found, HTTPS service will run without TLS"
+                );
+                return Some(https_service);
             }
-            Err(e) => {
-                println!("  ERROR creating TLS settings for {}: {}", cert.domain, e);
-            }
-        }
-    }
 
-    if successful_certs > 0 {
-        println!(
-            "Successfully created HTTPS service with {} certificates",
-            successful_certs
-        );
-        Some(https_service)
-    } else {
-        println!("Failed to create HTTPS service: no valid certificates could be loaded");
-        None
+            // Apply TLS settings
+            let mut successful_certs = 0;
+            for cert in &certs {
+                if !Path::new(&cert.cert_path).exists() || !Path::new(&cert.key_path).exists() {
+                    continue;
+                }
+
+                match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
+                    Ok(tls_settings) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // Use the domain name as SNI
+                            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+                        })) {
+                            Ok(_) => {
+                                println!("Added TLS certificate for {}", cert.domain);
+                                successful_certs += 1;
+                            }
+                            Err(_) => {
+                                println!("Error adding TLS certificate for {}", cert.domain);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Error creating TLS settings for {}: {}", cert.domain, e);
+                    }
+                }
+            }
+
+            println!(
+                "HTTPS service initialized with {} certificates",
+                successful_certs
+            );
+            Some(https_service)
+        }
+        Err(_) => {
+            println!("Failed to bind to port 443, HTTPS service will not be started");
+            None
+        }
     }
 }
-
 // Check for certificate changes based on flag file
 pub fn check_for_certificate_changes() -> bool {
     let flag_path = PathBuf::from("/pingora-proxy/cert_change_flag");

@@ -9,7 +9,6 @@ mod config;
 mod proxy;
 mod services;
 
-use crate::services::certificate_loader::create_https_service_if_needed;
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
@@ -91,27 +90,14 @@ fn main() {
     // Replace the HTTPS service section with this code:
 
     if !disable_ssl {
-        if let Some(mut https_service) =
-            create_https_service_if_needed(config_store.clone(), &server.configuration)
-        {
-            println!("Attempting to bind HTTPS service to port 443...");
-            // One binding for all domains - let TLS SNI do its job
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                https_service.add_tcp("0.0.0.0:443");
-                true
-            })) {
-                Ok(true) => {
-                    println!("HTTPS service successfully bound to port 443");
-                    server.add_service(https_service);
-                }
-                _ => {
-                    println!(
-                        "Failed to bind HTTPS service to port 443. Running in HTTP-only mode."
-                    );
-                }
-            }
+        if let Some(https_service) = services::certificate_loader::create_https_service(
+            config_store.clone(),
+            &server.configuration,
+        ) {
+            server.add_service(https_service);
+            println!("HTTPS service added to server");
         } else {
-            println!("No valid certificates found, HTTPS service not started");
+            println!("HTTPS service could not be initialized");
         }
     } else {
         println!("SSL disabled by configuration");
