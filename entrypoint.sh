@@ -23,24 +23,21 @@ fi
 # Make environment variable available to the application
 export CONFIG_PATH
 
-# Add this at the top to properly pass the variable
+# Set the SSL disable flag
 DISABLE_SSL=${DISABLE_SSL:-false}
 export DISABLE_SSL
 
-# Handle SIGHUP for certificate reloading
-trap 'echo "Received SIGHUP, reloading certificates..."; kill -TERM $child; exit 0' SIGHUP
+# Print some useful information
+echo "Starting Pingora Proxy Server"
+echo "Configuration path: $CONFIG_PATH"
+echo "SSL disabled: $DISABLE_SSL"
 
-# Select and execute the correct binary based on architecture
+# Select the correct binary based on architecture
 if [ "$(uname -m)" = "x86_64" ]; then
-    echo "Starting Pingora Proxy Server (x86_64)..."
-    /app/pingora-proxy-server.x86_64 "$@" &
+    exec /app/pingora-proxy-server.x86_64 "$@"
 elif [ "$(uname -m)" = "aarch64" ]; then
-    echo "Starting Pingora Proxy Server (arm64)..."
-    /app/pingora-proxy-server.arm64 "$@" &
+    exec /app/pingora-proxy-server.arm64 "$@"
 else
     echo "Unsupported architecture: $(uname -m)"
     exit 1
 fi
-
-child=$!
-wait $child

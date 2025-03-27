@@ -1,21 +1,18 @@
+// src/main.rs - Fixed to avoid runtime nesting
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use config::file_manager::get_config;
 use pingora::server::Server;
-use std::thread;
 
 mod cert;
 mod config;
 mod proxy;
 mod services;
 
-use crate::services::certificate_loader::{
-    check_for_certificate_changes, create_https_service_if_needed, CertificateLoaderService,
-};
+use crate::services::certificate_loader::create_https_service_if_needed;
 use crate::services::docker_swarm::SwarmDiscoveryService;
-use crate::services::letsencrypt::LetsEncryptService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
@@ -32,50 +29,20 @@ fn main() {
     // Fix the configuration file first
     config::utils::fix_config_file();
 
-    // Set up a completely separate thread for certificate monitoring
-    // This runs in a separate thread with its own runtime
-    thread::spawn(|| {
-        // Create a monitor that checks for certificate change flag files
-        println!("Starting certificate change monitor in separate process");
-
-        loop {
-            // Sleep for 30 seconds between checks
-            thread::sleep(Duration::from_secs(30));
-
-            // Check for certificate changes
-            if check_for_certificate_changes() {
-                println!("Certificate change detected by monitor, restarting server");
-                // Start a new process
-                match std::process::Command::new("/app/entrypoint.sh").spawn() {
-                    Ok(_) => {
-                        println!("Started new server process, exiting current process");
-                        // Sleep briefly to let the new process start
-                        thread::sleep(Duration::from_secs(2));
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        println!("Failed to start new server process: {}", e);
-                    }
-                }
-            }
-        }
-    });
-
-    // The rest of the code runs in the main thread
-    let main_result = tokio::runtime::Builder::new_multi_thread()
+    // Create a new runtime for our application
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap()
-        .block_on(async_main());
+        .expect("Failed to create runtime");
 
-    if let Err(e) = main_result {
-        eprintln!("Error in main application: {}", e);
+    // Run our async main in the runtime
+    if let Err(e) = runtime.block_on(async_main()) {
+        eprintln!("Error in application: {}", e);
         std::process::exit(1);
     }
 }
 
-// Main async logic separated into its own function
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config_store = Arc::new(Mutex::new(get_config()));
@@ -130,60 +97,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     server.add_service(http_service);
     server.add_service(manager_service);
 
-    // Create Let's Encrypt service with Cloudflare support (only if SSL is not disabled)
+    // Initial check for existing certificates
     if !disable_ssl {
-        let certbot_dir = PathBuf::from("/certbot/letsencrypt");
-        let email = std::env::var("LETS_ENCRYPT_EMAIL")
-            .unwrap_or_else(|_| "your-email@example.com".to_string());
-
-        // Load Cloudflare credentials from environment
-        let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
-        let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
-        let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
-
-        // Check if we have valid Cloudflare credentials
-        let has_cloudflare_credentials = cloudflare_api_token.is_some()
-            || (cloudflare_api_key.is_some() && cloudflare_api_email.is_some());
-
-        // Create service with credentials if available
-        let lets_encrypt_service = if has_cloudflare_credentials {
-            println!(
-                "Creating Let's Encrypt service with Cloudflare credentials for wildcard certificates"
-            );
-            LetsEncryptService::new(
-                config_store.clone(),
-                certbot_dir.clone(),
-                email,
-                3600, // Check for certificate renewals every hour
-            )
-            .with_cloudflare_credentials(
-                cloudflare_api_token,
-                cloudflare_api_key,
-                cloudflare_api_email,
-            )
-        } else {
-            println!("Creating Let's Encrypt service (wildcard certificates disabled)");
-            LetsEncryptService::new(
-                config_store.clone(),
-                certbot_dir.clone(),
-                email,
-                3600, // Check for certificate renewals every hour
-            )
-        };
-
-        server.add_service(lets_encrypt_service);
-
-        // Add Certificate Loader service
-        let certificate_loader = CertificateLoaderService::new(
-            config_store.clone(),
-            certbot_dir.clone(),
-            300, // Check every 5 minutes
-        );
-
-        server.add_service(certificate_loader);
-        println!("Certificate Loader service added");
-
-        // Initial check for existing certificates
         if let Some(https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
@@ -224,7 +139,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start the server with run_forever
-    // This is a blocking call that will run until the server exits
     println!("Starting server with configured services");
     server.run_forever();
 

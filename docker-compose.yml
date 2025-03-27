@@ -1,4 +1,4 @@
-# docker-compose.yml with persistent configuration and Cloudflare credentials
+# docker-compose.yml with simplified configuration
 version: "3.7"
 
 services:
@@ -26,12 +26,9 @@ services:
       - SWARM_MODE=false
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
-      - CONFIG_PATH=/app/config/config.json # Point to the new location
-      # Let's Encrypt configuration
-      - LETS_ENCRYPT_EMAIL=honghangsia@gmail.com
-      # Cloudflare credentials for wildcard certificates
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
+      - PROXY_SERVICE_NAME=proxy_proxy
     deploy:
       mode: replicated
       replicas: 1
@@ -44,10 +41,44 @@ services:
       restart_policy:
         condition: any
         delay: 5s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:81/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
         mode: 0644
+
+  # Optional: Dedicated certificate manager service
+  certbot:
+    image: image.koompi.org/library/pingora-proxy-server:latest
+    networks:
+      - proxy-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+    entrypoint:
+      [
+        "bash",
+        "-c",
+        "while true; do /app/certbot-wrapper.sh renew; sleep 43200; done",
+      ]
+    environment:
+      - PROXY_SERVICE_NAME=proxy_proxy
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
 
 networks:
   proxy-network:
