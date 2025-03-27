@@ -19,7 +19,7 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot:ro
+      - /mnt/gluster/certbot:/certbot
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
       - /mnt/gluster/proxy-config:/app/config
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
