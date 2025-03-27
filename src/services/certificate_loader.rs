@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pingora::{
     listeners::tls::TlsSettings,
-    server::{configuration::ServerConf, ListenFds, ShutdownWatch},
+    server::{ListenFds, ShutdownWatch},
     services::Service,
 };
 use tokio::time;
@@ -17,12 +17,18 @@ use crate::cert::certbot::find_certbot_certs;
 use crate::config::model::ConfigStore;
 use crate::proxy::https::HttpsProxy;
 
+// Simple struct to hold certificate change notification
+pub struct CertChangeNotifier {
+    pub changed: bool,
+}
+
 pub struct CertificateLoaderService {
     config_store: Arc<Mutex<ConfigStore>>,
     certbot_dir: PathBuf,
     check_interval: Duration,
     last_loaded: Arc<Mutex<HashMap<String, String>>>, // domain -> cert checksum
-    certificate_change_notifier: Arc<Mutex<bool>>,    // Signal for certificate changes
+    // Use file-based notification instead of in-memory flag
+    change_file_path: PathBuf,
 }
 
 impl CertificateLoaderService {
@@ -36,13 +42,9 @@ impl CertificateLoaderService {
             certbot_dir,
             check_interval: Duration::from_secs(check_interval_secs),
             last_loaded: Arc::new(Mutex::new(HashMap::new())),
-            certificate_change_notifier: Arc::new(Mutex::new(false)),
+            // Use a file in a shared location for notification
+            change_file_path: PathBuf::from("/pingora-proxy/cert_change_flag"),
         }
-    }
-
-    // Get notifier for certificate changes that main can monitor
-    pub fn get_certificate_change_notifier(&self) -> Arc<Mutex<bool>> {
-        self.certificate_change_notifier.clone()
     }
 
     // Get checksum for a certificate file to detect changes
@@ -136,6 +138,34 @@ impl CertificateLoaderService {
 
         Ok(valid_certs)
     }
+
+    // Signal certificate changes by creating a flag file
+    fn signal_certificate_change(&self) -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = self.change_file_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Write current timestamp to the file
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut file = File::create(&self.change_file_path)?;
+        write!(file, "{}", timestamp)?;
+
+        println!(
+            "Created certificate change flag file at {:?}",
+            self.change_file_path
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -151,13 +181,11 @@ impl Service for CertificateLoaderService {
                     match self.check_certificates().await {
                         Ok(certs) => {
                             if !certs.is_empty() {
-                                println!("Detected {} valid certificates", certs.len());
+                                println!("Detected {} valid certificates - signaling reload", certs.len());
 
-                                // Set flag to notify main thread of certificate changes
-                                // without trying to create service here
-                                if let Ok(mut notifier) = self.certificate_change_notifier.lock() {
-                                    *notifier = true;
-                                    println!("Set certificate change notification flag");
+                                // Signal certificate change using file
+                                if let Err(e) = self.signal_certificate_change() {
+                                    println!("Error creating certificate change flag file: {}", e);
                                 }
                             }
                         },
@@ -188,7 +216,7 @@ impl Service for CertificateLoaderService {
 // Public function for initial creation of HTTPS service at startup
 pub fn create_https_service_if_needed(
     config_store: Arc<Mutex<ConfigStore>>,
-    server_configuration: &Arc<ServerConf>,
+    server_configuration: &Arc<pingora::server::configuration::ServerConf>,
 ) -> Option<pingora::services::listening::Service<pingora_proxy::HttpProxy<HttpsProxy>>> {
     let domains = {
         match config_store.lock() {
@@ -233,4 +261,31 @@ pub fn create_https_service_if_needed(
     } else {
         None
     }
+}
+
+// Check for certificate changes based on flag file
+pub fn check_for_certificate_changes() -> bool {
+    let flag_path = PathBuf::from("/pingora-proxy/cert_change_flag");
+
+    if !flag_path.exists() {
+        return false;
+    }
+
+    // Check if the file was created/modified recently (within last minute)
+    if let Ok(metadata) = std::fs::metadata(&flag_path) {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = std::time::SystemTime::now().duration_since(modified) {
+                // If the file is older than 60 seconds, ignore it
+                if duration.as_secs() > 60 {
+                    return false;
+                }
+
+                // Delete the flag file after detecting it
+                let _ = std::fs::remove_file(&flag_path);
+                return true;
+            }
+        }
+    }
+
+    false
 }
