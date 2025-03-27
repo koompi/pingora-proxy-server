@@ -116,7 +116,7 @@ impl SwarmDiscoveryService {
         };
 
         // Change this path to use the shared GlusterFS volume
-        let lock_dir = PathBuf::from("/etc/pingora-proxy/locks");
+        let lock_dir = PathBuf::from("/pingora-proxy/locks");
         std::fs::create_dir_all(&lock_dir).ok();
 
         // Generate a stable node ID using hostname instead of random UUID

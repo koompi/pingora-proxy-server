@@ -161,10 +161,15 @@ impl FileLock {
 
     /// Write the lock file with our node ID and current time
     fn write_lock_file(&self) -> Result<(), IoError> {
+        // Handle stale file handle by removing the file first if it exists
+        if self.lock_path.exists() {
+            Self::retry_file_operation(|| fs::remove_file(&self.lock_path)).ok();
+        }
+
         // Create parent directory if it doesn't exist
         if let Some(parent) = self.lock_path.parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent)?;
+                Self::retry_file_operation(|| fs::create_dir_all(parent))?;
             }
         }
 
@@ -247,5 +252,27 @@ impl FileLock {
             // Someone else is the leader
             Ok(false)
         }
+    }
+    fn retry_file_operation<F, T>(operation: F) -> Result<T, IoError>
+    where
+        F: Fn() -> Result<T, IoError>,
+    {
+        let mut backoff = 10; // Start with 10ms
+        let max_attempts = 5;
+
+        for attempt in 1..=max_attempts {
+            match operation() {
+                Ok(result) => return Ok(result),
+                Err(err) if attempt < max_attempts => {
+                    println!("File operation failed (attempt {}): {}", attempt, err);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    backoff *= 2; // Exponential backoff
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        // This should never be reached due to the loop structure
+        Err(IoError::new(ErrorKind::Other, "Retry mechanism failed"))
     }
 }
