@@ -213,14 +213,13 @@ impl Service for CertificateLoaderService {
     }
 }
 
-// Public function for initial creation of HTTPS service at startup
 pub fn create_https_service(
     config_store: Arc<Mutex<ConfigStore>>,
     server_configuration: &Arc<pingora::server::configuration::ServerConf>,
 ) -> Option<pingora::services::listening::Service<pingora_proxy::HttpProxy<HttpsProxy>>> {
     println!("Creating HTTPS service...");
 
-    // Create the service without any ports initially
+    // Create the service without binding to any port initially
     let mut https_service = pingora_proxy::http_proxy_service(
         server_configuration,
         HttpsProxy {
@@ -234,9 +233,7 @@ pub fn create_https_service(
             Ok(store) => store.keys().cloned().collect::<Vec<String>>(),
             Err(e) => {
                 println!("Failed to lock config store: {:?}", e);
-                // Fallback: bind to port without TLS if we can't get domains
-                https_service.add_tcp("0.0.0.0:8443");
-                return Some(https_service);
+                return None;
             }
         }
     };
@@ -244,25 +241,25 @@ pub fn create_https_service(
     // Find certificates
     let certs = find_certbot_certs(&domains);
     if certs.is_empty() {
-        println!("Warning: No valid certificates found, HTTPS service will run without TLS");
-        // No certs? Use plain TCP
-        https_service.add_tcp("0.0.0.0:8443");
-        return Some(https_service);
+        println!("Warning: No valid certificates found, HTTPS service will not be available");
+        return None;
     }
 
-    // Apply TLS settings
+    // Apply individual TLS settings for each certificate
     let mut successful_certs = 0;
     for cert in &certs {
         if !Path::new(&cert.cert_path).exists() || !Path::new(&cert.key_path).exists() {
+            println!("Certificate files missing for domain: {}", cert.domain);
             continue;
         }
 
         match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
             Ok(tls_settings) => {
+                // Note: Using port 443 directly as in your original code
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     https_service.add_tls_with_settings(
-                        "0.0.0.0:8443",
-                        None, // TCP socket options
+                        "0.0.0.0:443", // Port changed to 443
+                        None,          // TCP socket options
                         tls_settings,
                     );
                 })) {
@@ -270,8 +267,8 @@ pub fn create_https_service(
                         println!("Added TLS certificate for {}", cert.domain);
                         successful_certs += 1;
                     }
-                    Err(_) => {
-                        println!("Error adding TLS certificate for {}", cert.domain);
+                    Err(e) => {
+                        println!("Error adding TLS certificate for {}: {:?}", cert.domain, e);
                     }
                 }
             }
@@ -281,9 +278,10 @@ pub fn create_https_service(
         }
     }
 
-    // If no successful certs, fallback to plain TCP
+    // If no certificates were successfully added, return None
     if successful_certs == 0 {
-        https_service.add_tcp("0.0.0.0:8443");
+        println!("No certificates could be added, HTTPS service will not be available");
+        return None;
     }
 
     println!(
