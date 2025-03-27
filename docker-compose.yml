@@ -1,5 +1,5 @@
 # docker-compose.yml with simplified configuration
-version: "3.7"
+version: "3.9"
 
 services:
   proxy:
@@ -9,9 +9,18 @@ services:
       - 8.8.8.8
       - 1.1.1.1
     ports:
-      - "80:80"
-      - "443:443"
-      - "81:81"
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 81
+        published: 81
+        protocol: tcp
+        mode: host
     networks:
       - proxy-network
     volumes:
@@ -23,8 +32,8 @@ services:
       - /tmp:/tmp
       - /var/cache:/var/cache
     environment:
-      - SWARM_MODE=false
-      - SWARM_NETWORKS=ingress
+      - SWARM_MODE=true
+      - SWARM_NETWORKS=ingress,proxy-network
       - LOG_LEVEL=info
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
@@ -33,10 +42,7 @@ services:
       mode: global
       update_config:
         order: start-first
-        failure_action: rollback
-      rollback_config:
-        parallelism: 1
-        order: start-first
+      endpoint_mode: dnsrr
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:81/health"]
       interval: 30s

@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     http_service.add_tcp("0.0.0.0:80");
+    println!("HTTP service configured on port 80");
 
     // Create manager service for configuration management
     let mut manager_service = pingora_proxy::http_proxy_service(
