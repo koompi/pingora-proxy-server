@@ -1,4 +1,4 @@
-# docker-compose.yml with simplified configuration
+# docker-compose.yml with simplified load balancing across replicas
 version: "3.9"
 
 services:
@@ -10,27 +10,20 @@ services:
       - 1.1.1.1
     cap_add:
       - NET_BIND_SERVICE
+    # Simplified port mapping
     ports:
-      - target: 80
-        published: 80
-        protocol: tcp
-        mode: host
-      - target: 443
-        published: 443
-        protocol: tcp
-        mode: host
-      - target: 81
-        published: 81
-        protocol: tcp
-        mode: host
+      - "80:80"
+      - "443:443"
+      - "81:81"
     networks:
       - proxy-network
+      - ingress # Explicitly include the ingress network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot:ro
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
-      - /mnt/gluster/proxy-config:/app/config # Persistent configuration directory
-      - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks # Shared lock directory
+      - /mnt/gluster/proxy-config:/app/config
+      - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
       - /tmp:/tmp
       - /var/cache:/var/cache
     environment:
@@ -40,30 +33,28 @@ services:
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
-      # Add these for debugging
       - RUST_LOG=debug
       - RUST_BACKTRACE=1
     deploy:
       mode: replicated
-      replicas: 1
+      replicas: 3 # Adjust the number of replicas as needed
       update_config:
+        parallelism: 1
+        delay: 10s
         order: start-first
-      endpoint_mode: dnsrr
+        failure_action: rollback
+      restart_policy:
+        condition: any
+        delay: 5s
+      endpoint_mode: vip # This is key - Virtual IP for load balancing
       placement:
-        constraints:
-          - node.role == manager
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:81/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+        max_replicas_per_node: 1 # At most one replica per node for better distribution
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
         mode: 0644
 
-  # Optional: Dedicated certificate manager service
+  # Certificate manager service
   certbot:
     image: image.koompi.org/library/pingora-proxy-server:latest
     networks:
@@ -101,6 +92,8 @@ services:
 
 networks:
   proxy-network:
+    external: true
+  ingress:
     external: true
 
 configs:
