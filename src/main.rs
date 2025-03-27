@@ -1,4 +1,3 @@
-// src/main.rs - Fixed to avoid runtime nesting
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +16,8 @@ use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init();
 
@@ -29,49 +29,15 @@ fn main() {
     // Fix the configuration file first
     config::utils::fix_config_file();
 
-    // Create a new runtime for our application
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("Failed to create runtime");
-
-    // Run our async main in the runtime
-    if let Err(e) = runtime.block_on(async_main()) {
-        eprintln!("Error in application: {}", e);
-        std::process::exit(1);
-    }
-}
-
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load configuration
-    let config_store = Arc::new(Mutex::new(get_config()));
-
-    // Extract domain names for certificate lookup
-    let domains: Vec<String> = match config_store.lock() {
-        Ok(store) => store.keys().cloned().collect(),
-        Err(e) => {
-            println!(
-                "Error locking config store when extracting domains: {:?}",
-                e
-            );
-            Vec::new()
-        }
-    };
-    println!("Configured domains: {:?}", domains);
-
-    // Check if SSL is disabled
-    let disable_ssl = std::env::var("DISABLE_SSL")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-
-    if disable_ssl {
-        println!("SSL handling disabled via DISABLE_SSL environment variable");
-    }
-
     // Initialize server
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
+
+    // Get configuration
+    let config_store = get_config().await;
+    let disable_ssl = std::env::var("DISABLE_SSL")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
 
     // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
