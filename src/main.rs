@@ -94,23 +94,23 @@ fn main() {
         if let Some(mut https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
-            // Use a safer binding approach
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Try to bind to port 443
-                https_service.add_tcp("0.0.0.0:443");
-                true
-            }));
+            let binding_successful =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Attempt to bind to port 443
+                    https_service.add_tcp("0.0.0.0:443");
+                    true
+                })) {
+                    Ok(true) => true,
+                    _ => false,
+                };
 
-            match result {
-                Ok(true) => {
-                    println!("HTTPS service successfully bound to port 443");
-                    // Important: Only add the service to the server if binding succeeded
-                    server.add_service(https_service);
-                }
-                _ => {
-                    println!("Could not bind HTTPS service to port 443, possibly already in use");
-                    // Don't add the service to the server if binding failed
-                }
+            if binding_successful {
+                println!("HTTPS service successfully bound to port 443");
+                // Only add the service if binding was successful
+                server.add_service(https_service);
+            } else {
+                println!("Failed to bind HTTPS service to port 443. Running in HTTP-only mode.");
+                // Don't add the service to avoid crashes
             }
         } else {
             println!("No valid certificates found, HTTPS service not started");
