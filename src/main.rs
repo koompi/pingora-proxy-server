@@ -92,54 +92,21 @@ fn main() {
         if let Some(mut https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
-            // Try to bind to HTTPS port with retries
-            let max_retries = 5;
-            let mut retry_count = 0;
-            let mut bound = false;
-
-            // Use a simpler retry approach that doesn't rely on catch_unwind
-            'retry_loop: for attempt in 1..=max_retries {
-                // Use a separate scope to handle potential panics
-                let result = match std::thread::spawn(move || {
-                    // We're moving a copy of https_service into this thread
-                    // If it panics, the original won't be affected
-                    false
-                })
-                .join()
-                {
-                    Ok(_) => {
-                        // In a real implementation, you would clone the service before
-                        // adding TCP, then use the original if successful
-                        // This is a simplified version that avoids the UnwindSafe issues
-                        https_service.add_tcp("0.0.0.0:443");
-                        true
-                    }
-                    Err(_) => false,
-                };
-
-                if result {
+            // Try to bind to 443 with better error handling
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                https_service.add_tcp("0.0.0.0:443");
+            })) {
+                Ok(_) => {
                     println!("HTTPS service successfully bound to port 443");
                     server.add_service(https_service);
-                    bound = true;
-                    break 'retry_loop;
-                } else {
-                    println!(
-                        "Failed to bind HTTPS service to port 443 (attempt {}/{})",
-                        attempt, max_retries
-                    );
-                    if attempt == max_retries {
-                        println!(
-                            "Failed to bind to HTTPS port after {} attempts",
-                            max_retries
-                        );
-                        break 'retry_loop;
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
                 }
-            }
-
-            if !bound {
-                println!("Warning: HTTPS service could not be started");
+                Err(e) => {
+                    // Don't panic if another container already bound the port
+                    println!("Could not bind HTTPS service to port 443, possibly already in use");
+                    if let Some(err) = e.downcast_ref::<&str>() {
+                        println!("Error details: {}", err);
+                    }
+                }
             }
         } else {
             println!("No valid certificates found, HTTPS service not started");

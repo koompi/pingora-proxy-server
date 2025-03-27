@@ -44,10 +44,14 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=1
     deploy:
-      mode: global
+      mode: replicated
+      replicas: 1
       update_config:
         order: start-first
       endpoint_mode: dnsrr
+      placement:
+        constraints:
+          - node.role == manager
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:81/health"]
       interval: 30s
