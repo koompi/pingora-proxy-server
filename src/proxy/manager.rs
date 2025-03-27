@@ -10,9 +10,12 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::{Deserialize, Serialize};
 
-use crate::cert::issuer::{CertificateIssuer, CertificateRequest, CertificateStatus};
 use crate::config::file_manager::{create_mappings_from_store, update_config};
 use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
+use crate::{
+    cert::issuer::{CertificateIssuer, CertificateRequest, CertificateStatus},
+    config::model::Configuration,
+};
 
 // Response structure for API endpoints
 #[derive(Serialize)]
@@ -379,29 +382,70 @@ impl ManagerProxy {
             Ok(mut servers) => {
                 // Mark this mapping as manually added
                 servers.insert(from.clone(), (to.clone(), MappingOrigin::Manual));
-                let updates = create_mappings_from_store(&servers);
 
-                match update_config(updates) {
-                    Ok(_) => {
-                        println!(
-                            "{} mapping: {} -> {} (Manual)",
-                            if method == "POST" { "Added" } else { "Updated" },
-                            from,
-                            &to
-                        );
-                        (http::StatusCode::OK, Self::success_response())
+                // Important: Only create mappings for THIS manual addition
+                // Don't use create_mappings_from_store here as it will overwrite everything
+
+                // Instead, properly merge with existing config
+                let config_path =
+                    std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.json".to_string());
+                let mut current_config = match std::fs::read_to_string(&config_path) {
+                    Ok(content) => match serde_json::from_str::<Configuration>(&content) {
+                        Ok(cfg) => cfg,
+                        Err(_) => Configuration::new(),
+                    },
+                    Err(_) => Configuration::new(),
+                };
+
+                // Check if this domain already exists in the config
+                let domain_exists = current_config.servers.iter().position(|s| s.from == from);
+
+                if let Some(index) = domain_exists {
+                    // Update existing entry
+                    current_config.servers[index].to = to.clone();
+                    current_config.servers[index].origin = MappingOrigin::Manual;
+                } else {
+                    // Add new entry
+                    current_config.servers.push(ServerMapping {
+                        from: from.clone(),
+                        to: to.clone(),
+                        origin: MappingOrigin::Manual,
+                    });
+                }
+
+                // Write updated config back to file
+                match serde_json::to_string_pretty(&current_config) {
+                    Ok(data) => {
+                        if let Err(e) = std::fs::write(&config_path, data) {
+                            println!("Error writing config: {}", e);
+                            return (
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Self::error_response(&format!(
+                                    "Failed to persist configuration: {}",
+                                    e
+                                )),
+                            );
+                        }
                     }
                     Err(e) => {
-                        println!("Error updating config: {}", e);
-                        (
+                        println!("Error serializing config: {}", e);
+                        return (
                             http::StatusCode::INTERNAL_SERVER_ERROR,
                             Self::error_response(&format!(
-                                "Failed to persist configuration: {}",
+                                "Failed to serialize configuration: {}",
                                 e
                             )),
-                        )
+                        );
                     }
                 }
+
+                println!(
+                    "{} mapping: {} -> {} (Manual)",
+                    if method == "POST" { "Added" } else { "Updated" },
+                    from,
+                    &to
+                );
+                (http::StatusCode::OK, Self::success_response())
             }
             Err(e) => {
                 println!("Error locking servers mutex: {}", e);
