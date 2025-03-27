@@ -16,6 +16,7 @@ RUN apt-get update -y || true && \
     python3-certbot \
     openssl \
     iptables \
+    supervisor \
     && python3 -m venv /opt/certbot-venv \
     && /opt/certbot-venv/bin/pip install --no-cache-dir certbot-dns-cloudflare \
     && apt-get clean \
@@ -31,12 +32,16 @@ WORKDIR /app
 COPY bin/x86_64/pingora-proxy-server /app/pingora-proxy-server.x86_64
 COPY bin/arm64/pingora-proxy-server /app/pingora-proxy-server.arm64
 
-# Copy entrypoint script
+# Copy entrypoint script and certificate manager
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY cert-manager.sh /app/cert-manager.sh
+RUN chmod +x /app/entrypoint.sh /app/cert-manager.sh
 
 # Create required directories
-RUN mkdir -p /pingora-proxy/locks /certbot/letsencrypt /var/www/html/.well-known/acme-challenge /app/config
+RUN mkdir -p /pingora-proxy/locks /certbot/letsencrypt /var/www/html/.well-known/acme-challenge /app/config /pingora-proxy/cert_requests
+
+# Set up supervisor configuration
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # Environment for service discovery
 ENV SWARM_MODE=true
@@ -45,4 +50,5 @@ ENV CONFIG_PATH=/app/config/config.json
 
 EXPOSE 80 443 81
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Use supervisor as the entrypoint to manage both processes
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

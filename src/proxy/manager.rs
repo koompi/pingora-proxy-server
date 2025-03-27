@@ -140,6 +140,105 @@ impl ManagerProxy {
         (from, to)
     }
 
+    async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
+        println!("Received certificate reload request");
+
+        // Implementation approaches:
+        // 1. Create a file that triggers the monitor to reload certs
+        std::fs::write("/pingora-proxy/reload_certs", "reload").ok();
+
+        // 2. For immediate reload, you could directly call a reload function here
+        // but careful not to create nested runtime issues
+
+        // Return success response
+        let response = ApiResponse {
+            status: "success".to_string(),
+            error: None,
+            message: Some("Certificate reload triggered".to_string()),
+            mappings: None,
+        };
+
+        self.send_json_response(session, http::StatusCode::OK, response)
+            .await
+    }
+
+    async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {
+        // Read the request body
+        let mut body = Vec::new();
+        loop {
+            match session.downstream_session.read_request_body().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::BAD_REQUEST,
+                            Self::error_response(&format!("Failed to read request body: {}", e)),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Parse certificate request
+        let request: CertificateRequest = match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                return self
+                    .send_json_response(
+                        session,
+                        http::StatusCode::BAD_REQUEST,
+                        Self::error_response(&format!("Invalid request format: {}", e)),
+                    )
+                    .await;
+            }
+        };
+
+        // Create a request file for the external certificate manager
+        let request_dir = "/pingora-proxy/cert_requests";
+        std::fs::create_dir_all(request_dir).ok();
+
+        let filename = format!(
+            "{}/{}_{}.req",
+            request_dir,
+            request.domain.replace(".", "_"),
+            chrono::Utc::now().timestamp()
+        );
+
+        let request_content = format!(
+            "domain={}\nemail={}\nwildcard={}\n",
+            request.domain,
+            request.email,
+            request.wildcard.unwrap_or(false)
+        );
+
+        match std::fs::write(&filename, request_content) {
+            Ok(_) => {
+                let response = ApiResponse {
+                    status: "success".to_string(),
+                    error: None,
+                    message: Some(format!(
+                        "Certificate request for {} submitted",
+                        request.domain
+                    )),
+                    mappings: None,
+                };
+
+                self.send_json_response(session, http::StatusCode::OK, response)
+                    .await
+            }
+            Err(e) => {
+                self.send_json_response(
+                    session,
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Self::error_response(&format!("Failed to submit request: {}", e)),
+                )
+                .await
+            }
+        }
+    }
+
     // Handle certificate requests
     async fn handle_certificate_request(
         &self,
@@ -150,6 +249,15 @@ impl ManagerProxy {
         match method {
             // Request a new certificate
             "POST" => {
+                // Check if this is a certificate reload request
+                if path_segments.len() >= 2
+                    && path_segments[1] == "admin"
+                    && path_segments.len() >= 3
+                    && path_segments[2] == "reload_certs"
+                {
+                    return self.handle_reload_certificates(session).await;
+                }
+
                 // Read the request body
                 let mut body = Vec::new();
                 loop {
