@@ -23,7 +23,7 @@ services:
       - /tmp:/tmp
       - /var/cache:/var/cache
     environment:
-      - SWARM_MODE=true
+      - SWARM_MODE=false
       - SWARM_NETWORKS=ingress
       - LOG_LEVEL=info
       - CONFIG_PATH=/app/config/config.json # Point to the new location
@@ -31,9 +31,10 @@ services:
       - LETS_ENCRYPT_EMAIL=honghangsia@gmail.com
       # Cloudflare credentials for wildcard certificates
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
-      - DISABLE_SSL=true
+      - DISABLE_SSL=false
     deploy:
-      mode: global
+      mode: replicated
+      replicas: 1
       placement:
         constraints:
           - node.role == manager
