@@ -30,23 +30,19 @@ services:
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
     deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
+      mode: global
       update_config:
+        order: start-first
+        failure_action: rollback
+      rollback_config:
         parallelism: 1
-        delay: 10s
-      restart_policy:
-        condition: any
-        delay: 5s
+        order: start-first
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:81/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 40s
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
@@ -76,9 +72,17 @@ services:
       placement:
         constraints:
           - node.role == manager
+      resources:
+        limits:
+          memory: 256M
       restart_policy:
         condition: any
         delay: 5s
+    healthcheck:
+      test: ["CMD", "test", "-f", "/certbot/live"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
 
 networks:
   proxy-network:
