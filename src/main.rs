@@ -68,7 +68,7 @@ fn main() {
     );
 
     // Add TCP binding - this will panic internally if it fails
-    http_service.add_tcp("192.168.1.101:80");
+    http_service.add_tcp("0.0.0.0:80");
     println!("HTTP service configured on port 80");
 
     // Create manager service for configuration management
@@ -80,7 +80,7 @@ fn main() {
     );
 
     // Add TCP binding - this will panic internally if it fails
-    manager_service.add_tcp("192.168.1.101:81");
+    manager_service.add_tcp("0.0.0.0:81");
     println!("Manager service (HTTP) configured on port 81");
 
     // Add the HTTP and manager services to the server
@@ -97,7 +97,7 @@ fn main() {
             let binding_successful =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Attempt to bind to port 443
-                    https_service.add_tcp("192.168.1.101:443");
+                    https_service.add_tcp("0.0.0.0:443");
                     true
                 })) {
                     Ok(true) => true,
