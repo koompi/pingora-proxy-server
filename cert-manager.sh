@@ -7,24 +7,38 @@ exec >>"$LOGFILE" 2>&1
 
 echo "Starting certificate manager process at $(date)"
 
+# Function to signal certificate reload
+signal_cert_reload() {
+  echo "Signaling certificate reload at $(date)"
+  
+  # Create the reload signal file that supervisord will detect
+  echo "$(date +%s)" > /pingora-proxy/cert_renewed
+  
+  # Try to directly signal the pingora-proxy process if possible
+  if command -v supervisorctl >/dev/null 2>&1; then
+    echo "Using supervisorctl to signal reload"
+    supervisorctl signal HUP pingora-proxy
+  else
+    echo "supervisorctl not available, relying on file-based signaling"
+  fi
+  
+  # Alternative: Use curl to hit the admin API
+  if command -v curl >/dev/null 2>&1; then
+    echo "Sending reload signal via API"
+    curl -s -X POST "http://localhost:81/admin/reload_certs" || echo "Failed to trigger reload via API"
+  fi
+}
+
 # Function to check for new certificates
 check_certificates() {
   # Use certbot directly to check for expiring certificates and renew them
-  echo "Checking for certificates due for renewal"
+  echo "Checking for certificates due for renewal at $(date)"
   certbot renew --non-interactive
-
-  # Create a simple reload signal if any certs were renewed
+  
+  # Check if any certs were renewed
   if [ $? -eq 0 ]; then
-    echo "Certificates were renewed, signaling proxy for reload"
-    echo "$(date +%s)" > /pingora-proxy/cert_renewed
-    # Send a reload signal to the main proxy using Docker
-    if [ -n "$PROXY_SERVICE_NAME" ]; then
-      # Send SIGHUP to the proxy container
-      docker kill --signal=HUP "$PROXY_SERVICE_NAME" 2>/dev/null || echo "Failed to send reload signal"
-    else
-      # For local development, we can use curl to trigger a reload via the admin API
-      curl -s -X POST "http://localhost:81/admin/reload_certs" || echo "Failed to trigger reload via API"
-    fi
+    echo "Certificates were renewed"
+    signal_cert_reload
   else
     echo "No certificates were renewed"
   fi
@@ -75,7 +89,7 @@ request_certificate() {
   
   if [ $result -eq 0 ]; then
     echo "Successfully obtained certificate for $domain"
-    echo "$(date +%s)" > /pingora-proxy/cert_renewed
+    signal_cert_reload
     return 0
   else
     echo "Failed to obtain certificate for $domain"
@@ -91,6 +105,9 @@ monitor_requests() {
   
   while true; do
     for request_file in "$REQUEST_DIR"/*.req; do
+      # Use nullglob to handle no matches
+      [ -e "$request_file" ] || continue
+      
       if [ -f "$request_file" ]; then
         echo "Processing certificate request: $request_file"
         
@@ -128,6 +145,10 @@ monitor_requests() {
 
 # Start the request monitor in the background
 monitor_requests &
+monitor_pid=$!
+
+# Set up signal handling
+trap 'kill $monitor_pid; exit 0' SIGTERM SIGINT
 
 # Main certificate renewal loop
 while true; do

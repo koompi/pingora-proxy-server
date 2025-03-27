@@ -14,9 +14,11 @@ RUN apt-get update -y || true && \
     certbot \
     python3-venv \
     python3-certbot \
+    python3 \
     openssl \
     iptables \
     supervisor \
+    curl \
     && python3 -m venv /opt/certbot-venv \
     && /opt/certbot-venv/bin/pip install --no-cache-dir certbot-dns-cloudflare \
     && apt-get clean \
