@@ -23,6 +23,10 @@ fi
 # Make environment variable available to the application
 export CONFIG_PATH
 
+# Add this at the top to properly pass the variable
+DISABLE_SSL=${DISABLE_SSL:-false}
+export DISABLE_SSL
+
 # Select and execute the correct binary based on architecture
 if [ "$(uname -m)" = "x86_64" ]; then
     exec /app/pingora-proxy-server.x86_64 "$@"

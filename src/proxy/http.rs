@@ -23,6 +23,7 @@ use super::utils::extract_hostname;
 #[derive(Clone)]
 pub struct HttpProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
+    pub disable_ssl: bool,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +101,12 @@ impl ProxyHttp for HttpProxy {
 
             // If we couldn't find the challenge or token doesn't match, return 404
             return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+        }
+
+        // Skip HTTPS redirect if SSL is disabled
+        if self.disable_ssl {
+            // Proceed with normal HTTP handling if SSL is disabled
+            return Ok(false);
         }
 
         // For all other requests, redirect to HTTPS

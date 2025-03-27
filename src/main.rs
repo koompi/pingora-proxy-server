@@ -51,40 +51,55 @@ fn main() {
     };
     println!("Configured domains: {:?}", domains);
 
-    // Find certificates for domains
-    let certs = find_certbot_certs(&domains);
+    // Check if SSL is disabled
+    let disable_ssl = std::env::var("DISABLE_SSL")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if disable_ssl {
+        println!("SSL handling disabled via DISABLE_SSL environment variable");
+    }
+
+    // Find certificates for domains (only if SSL is not disabled)
+    let certs = if !disable_ssl {
+        find_certbot_certs(&domains)
+    } else {
+        Vec::new()
+    };
 
     // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         HttpProxy {
             servers: config_store.clone(),
+            disable_ssl,
         },
     );
     http_service.add_tcp("0.0.0.0:80");
 
-    // Create HTTPS proxy service
-    let mut https_service = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        HttpsProxy {
-            servers: config_store.clone(),
-        },
-    );
-
-    // Create manager service
+    // Create manager service for configuration management
     let mut manager_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         ManagerProxy {
             servers: config_store.clone(),
         },
     );
-
-    // Always configure the manager service on HTTP port 81
     manager_service.add_tcp("0.0.0.0:81");
     println!("Manager service (HTTP) configured on port 81");
 
-    // Configure TLS settings for HTTPS service
-    if !certs.is_empty() {
+    // Add the HTTP service to the server
+    server.add_service(http_service);
+    server.add_service(manager_service);
+
+    // Only setup HTTPS service if SSL is not disabled and certificates exist
+    if !disable_ssl && !certs.is_empty() {
+        let mut https_service = pingora_proxy::http_proxy_service(
+            &server.configuration,
+            HttpsProxy {
+                servers: config_store.clone(),
+            },
+        );
+
         for cert in &certs {
             println!("Setting up TLS for domain: {}", cert.domain);
 
@@ -100,60 +115,57 @@ fn main() {
             // Add TLS endpoint
             https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
         }
-    } else {
-        println!("Warning: No TLS certificates found. HTTPS service will not be available.");
-    }
 
-    // Create Let's Encrypt service with Cloudflare support for wildcard certificates
-    let certbot_dir = PathBuf::from("/certbot/letsencrypt");
-    let email = std::env::var("LETS_ENCRYPT_EMAIL")
-        .unwrap_or_else(|_| "your-email@example.com".to_string());
-
-    // Load Cloudflare credentials from environment
-    let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
-    let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
-    let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
-
-    // Check if we have valid Cloudflare credentials
-    let has_cloudflare_credentials = cloudflare_api_token.is_some()
-        || (cloudflare_api_key.is_some() && cloudflare_api_email.is_some());
-
-    // Create service with credentials if available
-    let lets_encrypt_service = if has_cloudflare_credentials {
-        println!(
-            "Creating Let's Encrypt service with Cloudflare credentials for wildcard certificates"
-        );
-        LetsEncryptService::new(
-            config_store.clone(),
-            certbot_dir,
-            email,
-            3600, // Check for certificate renewals every hour
-        )
-        .with_cloudflare_credentials(
-            cloudflare_api_token,
-            cloudflare_api_key,
-            cloudflare_api_email,
-        )
-    } else {
-        println!("Creating Let's Encrypt service (wildcard certificates disabled)");
-        LetsEncryptService::new(
-            config_store.clone(),
-            certbot_dir,
-            email,
-            3600, // Check for certificate renewals every hour
-        )
-    };
-
-    // Add all services to the server
-    server.add_service(http_service);
-
-    // Only add HTTPS service if we have certificates
-    if !certs.is_empty() {
+        // Add HTTPS service to the server
         server.add_service(https_service);
+        println!("HTTPS service added with TLS support");
+    } else if !disable_ssl {
+        println!("No TLS certificates found. HTTPS service will not be available.");
     }
 
-    server.add_service(manager_service);
-    server.add_service(lets_encrypt_service);
+    // Create Let's Encrypt service with Cloudflare support (only if SSL is not disabled)
+    if !disable_ssl {
+        let certbot_dir = PathBuf::from("/certbot/letsencrypt");
+        let email = std::env::var("LETS_ENCRYPT_EMAIL")
+            .unwrap_or_else(|_| "your-email@example.com".to_string());
+
+        // Load Cloudflare credentials from environment
+        let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
+        let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
+        let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
+
+        // Check if we have valid Cloudflare credentials
+        let has_cloudflare_credentials = cloudflare_api_token.is_some()
+            || (cloudflare_api_key.is_some() && cloudflare_api_email.is_some());
+
+        // Create service with credentials if available
+        let lets_encrypt_service = if has_cloudflare_credentials {
+            println!(
+                "Creating Let's Encrypt service with Cloudflare credentials for wildcard certificates"
+            );
+            LetsEncryptService::new(
+                config_store.clone(),
+                certbot_dir,
+                email,
+                3600, // Check for certificate renewals every hour
+            )
+            .with_cloudflare_credentials(
+                cloudflare_api_token,
+                cloudflare_api_key,
+                cloudflare_api_email,
+            )
+        } else {
+            println!("Creating Let's Encrypt service (wildcard certificates disabled)");
+            LetsEncryptService::new(
+                config_store.clone(),
+                certbot_dir,
+                email,
+                3600, // Check for certificate renewals every hour
+            )
+        };
+
+        server.add_service(lets_encrypt_service);
+    }
 
     // Set up Swarm discovery if enabled
     let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
