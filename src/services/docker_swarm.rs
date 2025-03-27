@@ -187,8 +187,7 @@ impl SwarmDiscoveryService {
         filters.insert("label", vec!["com.koompi.proxy=true"]);
 
         // Load recently deleted domains to avoid auto-readding them
-        let recently_deleted_file =
-            PathBuf::from("/mnt/gluster/pingora-proxy/locks/recently_deleted.json");
+        let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
