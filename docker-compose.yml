@@ -30,7 +30,7 @@ services:
       - LETS_ENCRYPT_EMAIL=honghangsia@gmail.com
       # Cloudflare credentials for wildcard certificates
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
-      - DISABLE_SSL=false
+      - DISABLE_SSL=true
     deploy:
       mode: global
       placement:
