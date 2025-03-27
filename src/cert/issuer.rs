@@ -193,8 +193,8 @@ impl CertificateIssuer {
         // For testing purposes, consider any local IP as valid
         // You can remove or modify this for production
         let valid_ips = vec![
-            "127.0.0.1".to_string(),
-            "localhost".to_string(),
+            // "127.0.0.1".to_string(),
+            // "localhost".to_string(),
             self.public_ip.clone(),
         ];
 
@@ -204,7 +204,12 @@ impl CertificateIssuer {
             println!("Resolved IP for {}: {}", domain, ip);
 
             // In testing mode, consider localhost as valid
-            if valid_ips.contains(&ip) || ip.starts_with("192.168.") || ip.starts_with("10.") {
+            // if valid_ips.contains(&ip) || ip.starts_with("192.168.") || ip.starts_with("10.") {
+            //     found_matching_ip = true;
+            //     println!("IP match found for domain validation");
+            //     break;
+            // }
+            if valid_ips.contains(&ip) {
                 found_matching_ip = true;
                 println!("IP match found for domain validation");
                 break;
