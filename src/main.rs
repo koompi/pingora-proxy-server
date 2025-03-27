@@ -1,11 +1,11 @@
-// Modifications to your main.rs file
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use config::file_manager::get_config;
-use pingora::{listeners::tls::TlsSettings, server::Server};
+use pingora::server::Server;
+use std::thread;
+use tokio::sync::mpsc;
 use tokio::time;
 
 mod cert;
@@ -18,11 +18,8 @@ use crate::services::certificate_loader::{
 };
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::letsencrypt::LetsEncryptService;
-use cert::certbot::find_certbot_certs;
 use proxy::http::HttpProxy;
-use proxy::https::HttpsProxy;
 use proxy::manager::ManagerProxy;
-use proxy::utils::clean_backend_address;
 use rustls::crypto::ring::default_provider;
 
 #[tokio::main]
@@ -31,7 +28,6 @@ async fn main() {
     env_logger::init();
 
     // IMPORTANT: Install the default CryptoProvider before anything else
-    // This is required for Rustls to work properly
     default_provider()
         .install_default()
         .expect("Failed to install CryptoProvider");
@@ -41,10 +37,6 @@ async fn main() {
 
     // Load configuration
     let config_store = Arc::new(Mutex::new(get_config()));
-
-    // Initialize server
-    let mut server = Server::new(None).unwrap();
-    server.bootstrap();
 
     // Extract domain names for certificate lookup
     let domains: Vec<String> = match config_store.lock() {
@@ -67,6 +59,10 @@ async fn main() {
     if disable_ssl {
         println!("SSL handling disabled via DISABLE_SSL environment variable");
     }
+
+    // Initialize server
+    let mut server = Server::new(None).unwrap();
+    server.bootstrap();
 
     // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
@@ -142,8 +138,11 @@ async fn main() {
             300, // Check every 5 minutes
         );
 
+        // Get notifier before moving the certificate loader
+        let cert_change_notifier = certificate_loader.get_certificate_change_notifier();
+
         server.add_service(certificate_loader);
-        println!("Certificate Loader service added with hot-reload capability");
+        println!("Certificate Loader service added");
 
         // Initial check for existing certificates
         if let Some(https_service) =
@@ -153,29 +152,51 @@ async fn main() {
             println!("Initial HTTPS service created with existing certificates");
         }
 
-        // Spawn a background task to periodically check for new certificates
-        let config_store_clone = config_store.clone();
-        let server_config = server.configuration.clone();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(60)); // Check every minute
-            loop {
-                interval.tick().await;
+        // Create a separate thread to monitor certificate changes
+        // This avoids the nested tokio runtime issue
+        thread::spawn(move || {
+            // Create a new runtime for this thread
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
-                // Check if we have certificates and create HTTPS service if needed
-                if let Some(https_service) =
-                    create_https_service_if_needed(config_store_clone.clone(), &server_config)
-                {
-                    // We can't add the service here because we don't have access to the server
-                    // Instead, we'll reload the entire application
-                    println!("New certificates detected, reloading server...");
-                    std::process::Command::new("/app/entrypoint.sh")
-                        .spawn()
-                        .expect("Failed to reload server");
+            rt.block_on(async {
+                let mut interval = time::interval(Duration::from_secs(30));
 
-                    // Exit the current process after spawning the new one
-                    std::process::exit(0);
+                loop {
+                    interval.tick().await;
+
+                    // Check if certificate change flag is set
+                    let should_reload = {
+                        if let Ok(notifier) = cert_change_notifier.lock() {
+                            *notifier
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_reload {
+                        println!("Certificate change detected, starting new process");
+
+                        // Reset the flag
+                        if let Ok(mut notifier) = cert_change_notifier.lock() {
+                            *notifier = false;
+                        }
+
+                        // Start a new process without waiting for this one to exit
+                        // This avoids runtime interactions between processes
+                        match std::process::Command::new("/app/entrypoint.sh").spawn() {
+                            Ok(_) => {
+                                println!("New server process started, exiting current process");
+                                // Give the new process time to start
+                                thread::sleep(Duration::from_secs(2));
+                                std::process::exit(0);
+                            }
+                            Err(e) => {
+                                println!("Failed to start new server process: {}", e);
+                            }
+                        }
+                    }
                 }
-            }
+            });
         });
     }
 
@@ -210,7 +231,8 @@ async fn main() {
         }
     }
 
-    // Start the server
+    // Start the server with run_forever
+    // This is a blocking call that will run until the server exits
     println!("Starting server with configured services");
     server.run_forever();
 }

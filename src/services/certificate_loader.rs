@@ -8,14 +8,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pingora::{
     listeners::tls::TlsSettings,
-    server::{ListenFds, ShutdownWatch},
+    server::{configuration::ServerConf, ListenFds, ShutdownWatch},
     services::Service,
 };
 use tokio::time;
 
 use crate::cert::certbot::find_certbot_certs;
-use crate::config::model::{ConfigStore, Configuration};
-use crate::proxy::http::HttpProxy;
+use crate::config::model::ConfigStore;
 use crate::proxy::https::HttpsProxy;
 
 pub struct CertificateLoaderService {
@@ -23,7 +22,7 @@ pub struct CertificateLoaderService {
     certbot_dir: PathBuf,
     check_interval: Duration,
     last_loaded: Arc<Mutex<HashMap<String, String>>>, // domain -> cert checksum
-    https_service_added: Arc<Mutex<bool>>,
+    certificate_change_notifier: Arc<Mutex<bool>>,    // Signal for certificate changes
 }
 
 impl CertificateLoaderService {
@@ -37,8 +36,13 @@ impl CertificateLoaderService {
             certbot_dir,
             check_interval: Duration::from_secs(check_interval_secs),
             last_loaded: Arc::new(Mutex::new(HashMap::new())),
-            https_service_added: Arc::new(Mutex::new(false)),
+            certificate_change_notifier: Arc::new(Mutex::new(false)),
         }
+    }
+
+    // Get notifier for certificate changes that main can monitor
+    pub fn get_certificate_change_notifier(&self) -> Arc<Mutex<bool>> {
+        self.certificate_change_notifier.clone()
     }
 
     // Get checksum for a certificate file to detect changes
@@ -136,10 +140,8 @@ impl CertificateLoaderService {
 
 #[async_trait]
 impl Service for CertificateLoaderService {
-    // The start_service method now creates and returns the HTTPS service
-    // instead of trying to modify the server directly
     async fn start_service(&mut self, _fds: Option<ListenFds>, mut shutdown: ShutdownWatch) {
-        println!("Starting Certificate Loader service with hot-reload capability");
+        println!("Starting Certificate Loader service");
 
         let mut interval = time::interval(self.check_interval);
 
@@ -151,14 +153,12 @@ impl Service for CertificateLoaderService {
                             if !certs.is_empty() {
                                 println!("Detected {} valid certificates", certs.len());
 
-                                // Signal that we have valid certificates, main app will reload
-                                if let Ok(mut added) = self.https_service_added.lock() {
-                                    *added = true;
+                                // Set flag to notify main thread of certificate changes
+                                // without trying to create service here
+                                if let Ok(mut notifier) = self.certificate_change_notifier.lock() {
+                                    *notifier = true;
+                                    println!("Set certificate change notification flag");
                                 }
-
-                                // This is where we would create the HTTPS service
-                                // But we can't directly add it to the server here
-                                // Instead, we'll use a shared flag to signal the main app
                             }
                         },
                         Err(e) => {
@@ -185,11 +185,10 @@ impl Service for CertificateLoaderService {
     }
 }
 
-// Public function that the main app can call to check if we have certificates
-// and create an HTTPS service if needed
+// Public function for initial creation of HTTPS service at startup
 pub fn create_https_service_if_needed(
     config_store: Arc<Mutex<ConfigStore>>,
-    server_configuration: &Arc<pingora::server::configuration::ServerConf>,
+    server_configuration: &Arc<ServerConf>,
 ) -> Option<pingora::services::listening::Service<pingora_proxy::HttpProxy<HttpsProxy>>> {
     let domains = {
         match config_store.lock() {
@@ -203,9 +202,9 @@ pub fn create_https_service_if_needed(
         return None;
     }
 
-    // Use the http_proxy_service helper function that's also used in main.rs
+    // Create a new HTTPS service
     let mut https_service = pingora_proxy::http_proxy_service(
-        server_configuration, // This now correctly takes &Arc<ServerConf>
+        server_configuration,
         HttpsProxy {
             servers: config_store.clone(),
         },
