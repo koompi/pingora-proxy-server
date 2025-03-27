@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut http_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         HttpProxy {
-            servers: config_store.clone(),
+            servers: Arc::new(Mutex::new(config_store.clone())),
             disable_ssl,
         },
     );
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         ManagerProxy {
-            servers: config_store.clone(),
+            servers: Arc::new(Mutex::new(config_store.clone())),
         },
     );
     manager_service.add_tcp("0.0.0.0:81");
@@ -65,9 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial check for existing certificates
     if !disable_ssl {
-        if let Some(https_service) =
-            create_https_service_if_needed(config_store.clone(), &server.configuration)
-        {
+        if let Some(https_service) = create_https_service_if_needed(
+            Arc::new(Mutex::new(config_store.clone())),
+            &server.configuration,
+        ) {
             server.add_service(https_service);
             println!("Initial HTTPS service created with existing certificates");
         }
@@ -89,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Setup swarm discovery service
         match SwarmDiscoveryService::new(
-            config_store.clone(),
+            Arc::new(Mutex::new(config_store.clone())),
             &docker_endpoint,
             networks,
             30, // Check every 30 seconds

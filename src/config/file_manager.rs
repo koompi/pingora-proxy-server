@@ -24,7 +24,7 @@ fn ensure_config_dir(config_path: &str) -> std::io::Result<()> {
 }
 
 /// Load configuration from file
-pub fn get_config() -> ConfigStore {
+pub async fn get_config() -> ConfigStore {
     let config_path = get_config_path();
     println!("Using config path: {}", config_path);
 
