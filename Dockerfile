@@ -16,9 +16,10 @@ RUN apt-get update -y || true && \
     python3-certbot \
     openssl \
     iptables \
-    && pip3 install certbot-dns-cloudflare \
+    && pip3 install --break-system-packages certbot-dns-cloudflare \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Create app directory
 WORKDIR /app
