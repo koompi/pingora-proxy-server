@@ -137,10 +137,41 @@ impl ProxyHttp for HttpProxy {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // This should not be called because request_filter should handle everything
-        Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
+        if self.disable_ssl {
+            // When SSL is disabled, we need to handle HTTP forwarding here
+            let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+
+            let target = {
+                let servers_lock = match self.servers.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        println!("Error locking servers mutex in HttpProxy: {:?}", e);
+                        return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+                    }
+                };
+
+                servers_lock
+                    .get(&hostname)
+                    .map(|(target, _)| target.clone())
+            };
+
+            match target {
+                Some(to) => {
+                    println!("Routing HTTP request to backend: {}", to);
+                    let peer = HttpPeer::new(to, false, hostname.clone());
+                    Ok(Box::new(peer))
+                }
+                None => {
+                    println!("No backend found for host: {}", hostname);
+                    Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
+                }
+            }
+        } else {
+            // This should not be called because request_filter should handle everything
+            Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
+        }
     }
 }
