@@ -12,14 +12,17 @@ RUN apt-get update -y || true && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     certbot \
-    python3-pip \
+    python3-venv \
     python3-certbot \
     openssl \
     iptables \
-    && pip3 install --break-system-packages certbot-dns-cloudflare \
+    && python3 -m venv /opt/certbot-venv \
+    && /opt/certbot-venv/bin/pip install --no-cache-dir certbot-dns-cloudflare \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Add the venv bin directory to PATH so certbot can find the plugin
+ENV PATH="/opt/certbot-venv/bin:$PATH"
 
 # Create app directory
 WORKDIR /app
