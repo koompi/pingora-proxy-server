@@ -1,14 +1,21 @@
+// Modifications to your main.rs file
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use config::file_manager::get_config;
 use pingora::{listeners::tls::TlsSettings, server::Server};
+use tokio::time;
 
 mod cert;
 mod config;
 mod proxy;
 mod services;
 
+use crate::services::certificate_loader::{
+    create_https_service_if_needed, CertificateLoaderService,
+};
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::letsencrypt::LetsEncryptService;
 use cert::certbot::find_certbot_certs;
@@ -18,9 +25,11 @@ use proxy::manager::ManagerProxy;
 use proxy::utils::clean_backend_address;
 use rustls::crypto::ring::default_provider;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize logging
     env_logger::init();
+
     // IMPORTANT: Install the default CryptoProvider before anything else
     // This is required for Rustls to work properly
     default_provider()
@@ -45,7 +54,6 @@ fn main() {
                 "Error locking config store when extracting domains: {:?}",
                 e
             );
-            // Provide an empty vector as fallback
             Vec::new()
         }
     };
@@ -59,13 +67,6 @@ fn main() {
     if disable_ssl {
         println!("SSL handling disabled via DISABLE_SSL environment variable");
     }
-
-    // Find certificates for domains (only if SSL is not disabled)
-    let certs = if !disable_ssl {
-        find_certbot_certs(&domains)
-    } else {
-        Vec::new()
-    };
 
     // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
@@ -87,41 +88,9 @@ fn main() {
     manager_service.add_tcp("0.0.0.0:81");
     println!("Manager service (HTTP) configured on port 81");
 
-    // Add the HTTP service to the server
+    // Add the HTTP and manager services to the server
     server.add_service(http_service);
     server.add_service(manager_service);
-
-    // Only setup HTTPS service if SSL is not disabled and certificates exist
-    if !disable_ssl && !certs.is_empty() {
-        let mut https_service = pingora_proxy::http_proxy_service(
-            &server.configuration,
-            HttpsProxy {
-                servers: config_store.clone(),
-            },
-        );
-
-        for cert in &certs {
-            println!("Setting up TLS for domain: {}", cert.domain);
-
-            // Create TLS settings
-            let tls_settings = match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
-                Ok(settings) => settings,
-                Err(e) => {
-                    println!("Error creating TLS settings for {}: {}", cert.domain, e);
-                    continue;
-                }
-            };
-
-            // Add TLS endpoint
-            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
-        }
-
-        // Add HTTPS service to the server
-        server.add_service(https_service);
-        println!("HTTPS service added with TLS support");
-    } else if !disable_ssl {
-        println!("No TLS certificates found. HTTPS service will not be available.");
-    }
 
     // Create Let's Encrypt service with Cloudflare support (only if SSL is not disabled)
     if !disable_ssl {
@@ -145,7 +114,7 @@ fn main() {
             );
             LetsEncryptService::new(
                 config_store.clone(),
-                certbot_dir,
+                certbot_dir.clone(),
                 email,
                 3600, // Check for certificate renewals every hour
             )
@@ -158,13 +127,56 @@ fn main() {
             println!("Creating Let's Encrypt service (wildcard certificates disabled)");
             LetsEncryptService::new(
                 config_store.clone(),
-                certbot_dir,
+                certbot_dir.clone(),
                 email,
                 3600, // Check for certificate renewals every hour
             )
         };
 
         server.add_service(lets_encrypt_service);
+
+        // Add Certificate Loader service
+        let certificate_loader = CertificateLoaderService::new(
+            config_store.clone(),
+            certbot_dir.clone(),
+            300, // Check every 5 minutes
+        );
+
+        server.add_service(certificate_loader);
+        println!("Certificate Loader service added with hot-reload capability");
+
+        // Initial check for existing certificates
+        if let Some(https_service) =
+            create_https_service_if_needed(config_store.clone(), &server.configuration)
+        {
+            server.add_service(https_service);
+            println!("Initial HTTPS service created with existing certificates");
+        }
+
+        // Spawn a background task to periodically check for new certificates
+        let config_store_clone = config_store.clone();
+        let server_config = server.configuration.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(60)); // Check every minute
+            loop {
+                interval.tick().await;
+
+                // Check if we have certificates and create HTTPS service if needed
+                if let Some(https_service) =
+                    create_https_service_if_needed(config_store_clone.clone(), &server_config)
+                {
+                    // We can't add the service here because we don't have access to the server
+                    // Instead, we'll reload the entire application
+                    println!("New certificates detected, reloading server...");
+                    std::process::Command::new("/app/entrypoint.sh")
+                        .spawn()
+                        .expect("Failed to reload server");
+
+                    // Exit the current process after spawning the new one
+                    std::process::exit(0);
+                }
+            }
+        });
     }
 
     // Set up Swarm discovery if enabled
