@@ -37,3 +37,5 @@ uuid = { version = "1.5", features = ["v4", "serde"] }
 openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10.8"
 chrono = "0.4.40"
+sha256 = "1.6.0"
+thiserror = "2.0.12"

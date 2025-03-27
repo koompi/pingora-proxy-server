@@ -8,19 +8,48 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use bollard::{service::ListServicesOptions, Docker, API_DEFAULT_VERSION};
+use bollard::models::Network;
+use bollard::{
+    network::{CreateNetworkOptions, ListNetworksOptions},
+    service::ListServicesOptions,
+    Docker, API_DEFAULT_VERSION,
+};
+use log::{error, info, warn};
 use pingora::{
     server::{ListenFds, ShutdownWatch},
     services::Service,
 };
+use sha256::digest;
+use thiserror::Error;
 use tokio::time;
+
+#[derive(Error, Debug)]
+pub enum SwarmError {
+    #[error("Docker API error: {0}")]
+    DockerError(#[from] bollard::errors::Error),
+
+    #[error("Network operation failed: {0}")]
+    NetworkError(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
+    #[error("System time error: {0}")]
+    TimeError(#[from] std::time::SystemTimeError),
+}
 
 use crate::{
     config::file_manager::{create_mappings_from_store, update_config},
     config::model::{ConfigStore, MappingOrigin, ServerMapping},
 };
 
-use super::lock::FileLock;
+use super::lock::DistributedLock;
+
+struct ConfigVersion {
+    version: u64,
+    timestamp: SystemTime,
+    checksum: String,
+}
 
 pub struct SwarmDiscoveryService {
     pub config_store: Arc<Mutex<ConfigStore>>,
@@ -29,7 +58,7 @@ pub struct SwarmDiscoveryService {
     pub check_interval: Duration,
     // Track organization networks
     pub org_networks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    leader_lock: FileLock,
+    distributed_lock: DistributedLock, // New distributed lock implementation
     is_leader: Arc<Mutex<bool>>,
 }
 
@@ -126,10 +155,10 @@ impl SwarmDiscoveryService {
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
         let node_id = hostname;
-        println!("Using node ID for locking: {}", node_id);
+        info!("Using node ID for locking: {}", node_id);
 
         // Increase the TTL to 60 seconds for better stability
-        let leader_lock = FileLock::new(lock_dir, "config_writer", &node_id, 60);
+        let distributed_lock = DistributedLock::new(lock_dir, "config_writer", &node_id, 60);
 
         Ok(Self {
             config_store,
@@ -137,22 +166,18 @@ impl SwarmDiscoveryService {
             networks,
             check_interval: Duration::from_secs(check_interval),
             org_networks: Arc::new(Mutex::new(HashMap::new())),
-            leader_lock,
+            distributed_lock,
             is_leader: Arc::new(Mutex::new(false)),
         })
     }
     async fn check_leadership(&self) -> Result<bool> {
         // Try to refresh first with multiple attempts
-        match self
-            .leader_lock
-            .acquire(3, Duration::from_millis(500))
-            .await
-        {
+        match self.distributed_lock.refresh_leadership().await {
             Ok(true) => {
                 // We are the leader
                 if let Ok(mut is_leader) = self.is_leader.lock() {
                     if !*is_leader {
-                        println!("Node became the configuration leader");
+                        info!("Node became the configuration leader");
                     }
                     *is_leader = true;
                 }
@@ -162,14 +187,14 @@ impl SwarmDiscoveryService {
                 // We are not the leader
                 if let Ok(mut is_leader) = self.is_leader.lock() {
                     if *is_leader {
-                        println!("Node is no longer the configuration leader");
+                        info!("Node is no longer the configuration leader");
                     }
                     *is_leader = false;
                 }
                 Ok(false)
             }
             Err(e) => {
-                println!("Error in leader election: {}", e);
+                error!("Error in leader election: {}", e);
                 // Default to non-leader on error
                 if let Ok(mut is_leader) = self.is_leader.lock() {
                     *is_leader = false;
@@ -180,11 +205,14 @@ impl SwarmDiscoveryService {
     }
 
     async fn discover_services(&self) -> Result<()> {
-        println!("Running Docker Swarm service discovery");
+        info!("Running Docker Swarm service discovery");
 
         // Filter for services with a specific label for our proxy
-        let mut filters = HashMap::new();
-        filters.insert("label", vec!["com.koompi.proxy=true"]);
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec!["com.koompi.proxy=true".to_string()],
+        );
 
         // Load recently deleted domains to avoid auto-readding them
         let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
@@ -214,7 +242,7 @@ impl SwarmDiscoveryService {
         };
 
         if !recently_deleted.is_empty() {
-            println!(
+            info!(
                 "Found {} recently deleted domains that will be excluded from discovery",
                 recently_deleted.len()
             );
@@ -252,7 +280,7 @@ impl SwarmDiscoveryService {
 
             // Skip if this domain was recently manually deleted
             if recently_deleted.contains(&domain) {
-                println!("Skipping recently deleted domain: {}", domain);
+                info!("Skipping recently deleted domain: {}", domain);
                 continue;
             }
 
@@ -282,7 +310,7 @@ impl SwarmDiscoveryService {
                 format!("tasks.{}:{}", service_name, port)
             };
 
-            println!("Discovered service mapping: {} -> {}", domain, target);
+            info!("Discovered service mapping: {} -> {}", domain, target);
             new_mappings.insert(domain, target);
         }
 
@@ -335,76 +363,240 @@ impl SwarmDiscoveryService {
 
         // Only the leader node updates the config file
         if is_leader && !server_mappings.is_empty() {
-            println!("Node is the leader - updating configuration file");
-            match update_config(server_mappings) {
-                Ok(_) => println!("Config updated successfully"),
-                Err(e) => println!("Error updating config file: {}", e),
+            info!("Node is the leader - updating configuration file");
+            match self.update_config_with_version(server_mappings).await {
+                Ok(_) => info!("Config updated successfully"),
+                Err(e) => error!("Error updating config file: {}", e),
             }
         } else if !is_leader {
-            println!("Node is not the leader - skipping config file update");
+            info!("Node is not the leader - skipping config file update");
         }
 
         Ok(())
     }
 
+    async fn network_exists(&self, network_name: &str) -> Result<bool> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("name".to_string(), vec![network_name.to_string()]);
+
+        let networks = self
+            .docker_client
+            .list_networks::<String>(Some(ListNetworksOptions { filters }))
+            .await?;
+
+        Ok(!networks.is_empty())
+    }
+
     // New method to ensure organization networks exist
     async fn ensure_org_networks(&self) -> Result<()> {
-        // Get the orgs we need to create networks for
-        let orgs = {
-            let org_networks_lock = match self.org_networks.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    println!("Failed to lock org_networks: {:?}", e);
-                    return Ok(());
-                }
-            };
+        // Try to acquire network setup lock
+        if !self
+            .distributed_lock
+            .acquire(5, Duration::from_secs(1))
+            .await?
+        {
+            info!("Another node is managing networks");
+            return Ok(());
+        }
 
-            // Clone the org IDs so we don't hold the lock
+        let orgs = {
+            let org_networks_lock = self
+                .org_networks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
             org_networks_lock.keys().cloned().collect::<Vec<_>>()
         };
 
-        // Process outside the lock to avoid Send issues
         for org_id in orgs {
             let network_name = format!("org_{}_overlay", org_id);
 
-            // Check if network exists
-            let networks = self.docker_client.list_networks::<String>(None).await?;
-            let exists = networks
-                .iter()
-                .any(|n| n.name.as_ref().map_or(false, |name| name == &network_name));
+            // Check network version
+            let current_version = self.get_network_version(&network_name).await?;
+            if !self
+                .network_needs_update(&network_name, &current_version)
+                .await?
+            {
+                continue;
+            }
 
-            if !exists {
-                println!("Creating isolated network for organization: {}", org_id);
-
-                // Network options for isolation
-                let mut options = HashMap::new();
-                options.insert("encrypted".to_string(), "true".to_string());
-                options.insert("internal".to_string(), "true".to_string());
-
-                // Create network
-                self.docker_client
-                    .create_network(bollard::network::CreateNetworkOptions {
-                        name: network_name.clone(),
-                        driver: "overlay".to_string(),
-                        attachable: true,
-                        internal: true,
-                        options: options,
-                        ..Default::default()
-                    })
-                    .await?;
-                println!("Created network: {}", network_name);
+            // Create network if needed...
+            if !self.network_exists(&network_name).await? {
+                self.create_organization_network(&org_id).await?;
             }
         }
 
+        // Release lock
+        self.distributed_lock.release().await?;
+        Ok(())
+    }
+
+    async fn get_network_version(&self, network_name: &str) -> Result<u64, SwarmError> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("name".to_string(), vec![network_name.to_string()]);
+
+        let networks = self
+            .docker_client
+            .list_networks::<String>(Some(ListNetworksOptions { filters }))
+            .await
+            .map_err(SwarmError::DockerError)?;
+
+        let version = networks
+            .first()
+            .and_then(|n| n.created.as_ref())
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                warn!(
+                    "Could not determine network version for {}, using current time",
+                    network_name
+                );
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+        Ok(version)
+    }
+
+    async fn network_needs_update(
+        &self,
+        network_name: &str,
+        version: &u64,
+    ) -> Result<bool, SwarmError> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(SwarmError::TimeError)?
+            .as_secs();
+
+        Ok(current_time - version > 24 * 60 * 60)
+    }
+
+    async fn get_config_version(&self) -> Result<ConfigVersion> {
+        let store = self
+            .config_store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lock poisoned"))?;
+        let content = serde_json::to_string(&*store)?;
+        let checksum = sha256::digest(content.as_bytes());
+
+        Ok(ConfigVersion {
+            version: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            timestamp: SystemTime::now(),
+            checksum,
+        })
+    }
+
+    async fn update_config_with_version(
+        &self,
+        mappings: Vec<ServerMapping>,
+    ) -> Result<(), SwarmError> {
+        let version = self
+            .get_config_version()
+            .await
+            .map_err(|e| SwarmError::ConfigError(format!("Failed to get config version: {}", e)))?;
+
+        update_config(mappings)
+            .map_err(|e| SwarmError::ConfigError(format!("Failed to update config: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn create_organization_network(&self, org_id: &str) -> Result<(), SwarmError> {
+        let network_name = format!("org_{}_overlay", org_id);
+        info!(
+            "Creating network {} for organization {}",
+            network_name, org_id
+        );
+
+        let mut config = HashMap::new();
+        config.insert(
+            "com.docker.network.driver.overlay.vxlanid_list".to_string(),
+            "4096".to_string(),
+        );
+        config.insert(
+            "com.docker.network.driver.encrypted".to_string(),
+            "true".to_string(),
+        );
+
+        let ipam_config = bollard::models::IpamConfig {
+            subnet: Some(format!("10.{}.0.0/16", org_id)),
+            gateway: None,
+            ip_range: None,
+            auxiliary_addresses: None,
+        };
+
+        let create_opts = CreateNetworkOptions {
+            name: network_name.clone(),
+            driver: "overlay".to_string(),
+            attachable: true,
+            internal: true,
+            labels: HashMap::new(),
+            options: config,
+            ipam: bollard::models::Ipam {
+                driver: Some("default".to_string()),
+                config: Some(vec![ipam_config]),
+                options: None,
+            },
+            ..Default::default()
+        };
+
+        self.docker_client
+            .create_network(create_opts)
+            .await
+            .map_err(|e| {
+                SwarmError::NetworkError(format!(
+                    "Failed to create network {}: {}",
+                    network_name, e
+                ))
+            })?;
+
+        info!("Successfully created network {}", network_name);
+        Ok(())
+    }
+
+    pub async fn cleanup_old_networks(&self) -> Result<(), SwarmError> {
+        let networks = self
+            .docker_client
+            .list_networks::<String>(None)
+            .await
+            .map_err(SwarmError::DockerError)?;
+
+        for network in networks {
+            if let Some(name) = network.name {
+                if name.starts_with("org_") && name.ends_with("_overlay") {
+                    if let Some(created) = network.created {
+                        let version = created.parse::<u64>().unwrap_or_default();
+                        if self.network_needs_update(&name, &version).await? {
+                            info!("Removing old network: {}", name);
+                            self.remove_network(&name).await?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove_network(&self, network_name: &str) -> Result<(), SwarmError> {
+        self.docker_client
+            .remove_network(network_name)
+            .await
+            .map_err(|e| {
+                SwarmError::NetworkError(format!(
+                    "Failed to remove network {}: {}",
+                    network_name, e
+                ))
+            })?;
+
+        info!("Successfully removed network: {}", network_name);
         Ok(())
     }
 }
 
 #[async_trait]
-#[async_trait]
 impl Service for SwarmDiscoveryService {
-    async fn start_service(&mut self, _fds: Option<ListenFds>, _shutdown: ShutdownWatch) {
-        println!("Starting Docker Swarm discovery service");
+    async fn start_service(&mut self, _fds: Option<ListenFds>, mut shutdown: ShutdownWatch) {
+        info!("Starting Docker Swarm discovery service");
 
         let mut interval = time::interval(self.check_interval);
         let mut cleanup_interval = time::interval(Duration::from_secs(300)); // Every 5 minutes
@@ -412,43 +604,14 @@ impl Service for SwarmDiscoveryService {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // First discover services
-                    if let Err(e) = self.discover_services().await {
-                        println!("Error in service discovery: {}", e);
-                    }
-
-                    // Then ensure networks exist
-                    if let Err(e) = self.ensure_org_networks().await {
-                        println!("Error ensuring organization networks: {}", e);
-                    }
+                    self.handle_discovery().await;
                 }
                 _ = cleanup_interval.tick() => {
-                    // Clean up expired recently deleted entries
-                    let recently_deleted_file = PathBuf::from("/mnt/gluster/pingora-proxy/locks/recently_deleted.json");
-                    if recently_deleted_file.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&recently_deleted_file) {
-                            if let Ok(timestamp_domains) = serde_json::from_str::<Vec<(u64, String)>>(&content) {
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-
-                                // Filter out entries older than 5 minutes
-                                let fresh_entries: Vec<(u64, String)> = timestamp_domains
-                                    .into_iter()
-                                    .filter(|(timestamp, _)| now - timestamp < 300)
-                                    .collect();
-
-                                if let Ok(json) = serde_json::to_string(&fresh_entries) {
-                                    if let Err(e) = std::fs::write(&recently_deleted_file, json) {
-                                        println!("Error writing recently deleted file during cleanup: {}", e);
-                                    } else {
-                                        println!("Cleaned up recently deleted domains list");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.handle_cleanup().await;
+                }
+                _ = shutdown.changed() => {
+                    info!("Shutdown signal received, stopping service");
+                    break;
                 }
             }
         }
@@ -460,5 +623,50 @@ impl Service for SwarmDiscoveryService {
 
     fn threads(&self) -> Option<usize> {
         Some(1)
+    }
+}
+
+impl SwarmDiscoveryService {
+    async fn handle_discovery(&self) {
+        if let Err(e) = self.discover_services().await {
+            error!("Error in service discovery: {}", e);
+        }
+
+        if let Err(e) = self.ensure_org_networks().await {
+            error!("Error ensuring organization networks: {}", e);
+        }
+    }
+
+    async fn handle_cleanup(&self) {
+        let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
+        if !recently_deleted_file.exists() {
+            return;
+        }
+
+        match tokio::fs::read_to_string(&recently_deleted_file).await {
+            Ok(content) => {
+                if let Ok(timestamp_domains) = serde_json::from_str::<Vec<(u64, String)>>(&content)
+                {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    let fresh_entries: Vec<(u64, String)> = timestamp_domains
+                        .into_iter()
+                        .filter(|(timestamp, _)| now - timestamp < 300)
+                        .collect();
+
+                    if let Ok(json) = serde_json::to_string(&fresh_entries) {
+                        if let Err(e) = tokio::fs::write(&recently_deleted_file, json).await {
+                            error!("Error writing recently deleted file during cleanup: {}", e);
+                        } else {
+                            info!("Cleaned up recently deleted domains list");
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("Error reading recently deleted file: {}", e),
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 /// A file-based distributed lock for coordinating across multiple nodes
-pub struct FileLock {
+pub struct DistributedLock {
     /// Path to the lock file
     lock_path: PathBuf,
     /// Unique ID of this node
@@ -15,8 +15,8 @@ pub struct FileLock {
     ttl: Duration,
 }
 
-impl FileLock {
-    /// Create a new FileLock
+impl DistributedLock {
+    /// Create a new DistributedLock
     pub fn new(
         lock_dir: impl AsRef<Path>,
         lock_name: &str,

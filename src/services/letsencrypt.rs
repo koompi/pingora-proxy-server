@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::cert::issuer::{CertificateIssuer, CertificateRequest, Credentials};
 use crate::config::model::ConfigStore;
-use crate::services::lock::FileLock;
+use crate::services::lock::DistributedLock;
 
 pub struct LetsEncryptService {
     config_store: Arc<std::sync::Mutex<ConfigStore>>,
@@ -182,7 +182,7 @@ impl LetsEncryptService {
                 .map_err(|e| anyhow::anyhow!("Failed to create lock directory: {}", e))?;
         }
 
-        let lock = FileLock::new(
+        let lock = DistributedLock::new(
             lock_dir,
             "certman",
             &self.node_id,
