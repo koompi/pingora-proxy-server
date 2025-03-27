@@ -1,4 +1,4 @@
-# docker-compose.yml with simplified load balancing across replicas
+# docker-compose.yml with load balancing across replicas
 version: "3.9"
 
 services:
@@ -17,7 +17,6 @@ services:
       - "81:81"
     networks:
       - proxy-network
-      - ingress # Explicitly include the ingress network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot:ro
@@ -28,7 +27,7 @@ services:
       - /var/cache:/var/cache
     environment:
       - SWARM_MODE=true
-      - SWARM_NETWORKS=ingress,proxy-network
+      - SWARM_NETWORKS=proxy-network
       - LOG_LEVEL=info
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
@@ -37,7 +36,7 @@ services:
       - RUST_BACKTRACE=1
     deploy:
       mode: replicated
-      replicas: 3 # Adjust the number of replicas as needed
+      replicas: 3
       update_config:
         parallelism: 1
         delay: 10s
@@ -46,9 +45,9 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      endpoint_mode: vip # This is key - Virtual IP for load balancing
+      endpoint_mode: vip
       placement:
-        max_replicas_per_node: 1 # At most one replica per node for better distribution
+        max_replicas_per_node: 1
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
@@ -92,8 +91,6 @@ services:
 
 networks:
   proxy-network:
-    external: true
-  ingress:
     external: true
 
 configs:
