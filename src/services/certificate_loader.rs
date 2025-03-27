@@ -267,8 +267,11 @@ pub fn create_https_service(
                 match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
                     Ok(tls_settings) => {
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // Use the domain name as SNI
-                            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+                            https_service.add_tls_with_settings(
+                                "0.0.0.0:443",
+                                None, // TCP socket options
+                                tls_settings,
+                            );
                         })) {
                             Ok(_) => {
                                 println!("Added TLS certificate for {}", cert.domain);
