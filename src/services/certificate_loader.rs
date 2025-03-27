@@ -218,17 +218,31 @@ pub fn create_https_service_if_needed(
     config_store: Arc<Mutex<ConfigStore>>,
     server_configuration: &Arc<pingora::server::configuration::ServerConf>,
 ) -> Option<pingora::services::listening::Service<pingora_proxy::HttpProxy<HttpsProxy>>> {
+    println!("Checking for SSL certificates for HTTPS service...");
+
     let domains = {
         match config_store.lock() {
-            Ok(store) => store.keys().cloned().collect::<Vec<String>>(),
-            Err(_) => return None,
+            Ok(store) => {
+                let domains = store.keys().cloned().collect::<Vec<String>>();
+                println!("Found {} domains in config store", domains.len());
+                domains
+            }
+            Err(e) => {
+                println!("Failed to lock config store: {:?}", e);
+                return None;
+            }
         }
     };
 
+    println!("Looking for certificates for domains: {:?}", domains);
     let certs = find_certbot_certs(&domains);
+
     if certs.is_empty() {
+        println!("No certificates found, HTTPS service cannot be created");
         return None;
     }
+
+    println!("Found {} certificates", certs.len());
 
     // Create a new HTTPS service
     let mut https_service = pingora_proxy::http_proxy_service(
@@ -240,25 +254,53 @@ pub fn create_https_service_if_needed(
 
     let mut successful_certs = 0;
     for cert in &certs {
+        println!("Loading certificate for domain: {}", cert.domain);
+        println!("  Cert path: {}", cert.cert_path);
+        println!("  Key path: {}", cert.key_path);
+
+        // Check file existence and permissions
+        let cert_exists = Path::new(&cert.cert_path).exists();
+        let key_exists = Path::new(&cert.key_path).exists();
+
+        println!("  Cert file exists: {}", cert_exists);
+        println!("  Key file exists: {}", key_exists);
+
+        if !cert_exists || !key_exists {
+            println!("  ERROR: Certificate files missing for {}", cert.domain);
+            continue;
+        }
+
+        // Try to read the files to verify permissions
+        match std::fs::read_to_string(&cert.cert_path) {
+            Ok(_) => println!("  Cert file is readable"),
+            Err(e) => println!("  ERROR: Cannot read cert file: {}", e),
+        }
+
+        match std::fs::read_to_string(&cert.key_path) {
+            Ok(_) => println!("  Key file is readable"),
+            Err(e) => println!("  ERROR: Cannot read key file: {}", e),
+        }
+
         match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
             Ok(tls_settings) => {
+                println!("  Successfully created TLS settings for {}", cert.domain);
                 https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
                 successful_certs += 1;
-                println!("Added certificate for: {}", cert.domain);
             }
             Err(e) => {
-                println!("Error creating TLS settings for {}: {}", cert.domain, e);
+                println!("  ERROR creating TLS settings for {}: {}", cert.domain, e);
             }
         }
     }
 
     if successful_certs > 0 {
         println!(
-            "Created HTTPS service with {} certificates",
+            "Successfully created HTTPS service with {} certificates",
             successful_certs
         );
         Some(https_service)
     } else {
+        println!("Failed to create HTTPS service: no valid certificates could be loaded");
         None
     }
 }
