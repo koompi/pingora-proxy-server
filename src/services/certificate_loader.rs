@@ -284,6 +284,7 @@ pub fn create_https_service_if_needed(
         match TlsSettings::intermediate(&cert.cert_path, &cert.key_path) {
             Ok(tls_settings) => {
                 println!("  Successfully created TLS settings for {}", cert.domain);
+                // Add domain to SNI configuration but DON'T create TCP binding here
                 https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
                 successful_certs += 1;
             }

@@ -94,23 +94,21 @@ fn main() {
         if let Some(mut https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
-            let binding_successful =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Attempt to bind to port 443
-                    https_service.add_tcp("0.0.0.0:443");
-                    true
-                })) {
-                    Ok(true) => true,
-                    _ => false,
-                };
-
-            if binding_successful {
-                println!("HTTPS service successfully bound to port 443");
-                // Only add the service if binding was successful
-                server.add_service(https_service);
-            } else {
-                println!("Failed to bind HTTPS service to port 443. Running in HTTP-only mode.");
-                // Don't add the service to avoid crashes
+            println!("Attempting to bind HTTPS service to port 443...");
+            // One binding for all domains - let TLS SNI do its job
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                https_service.add_tcp("0.0.0.0:443");
+                true
+            })) {
+                Ok(true) => {
+                    println!("HTTPS service successfully bound to port 443");
+                    server.add_service(https_service);
+                }
+                _ => {
+                    println!(
+                        "Failed to bind HTTPS service to port 443. Running in HTTP-only mode."
+                    );
+                }
             }
         } else {
             println!("No valid certificates found, HTTPS service not started");
