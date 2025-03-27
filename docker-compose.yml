@@ -13,7 +13,7 @@ services:
     # Simplified port mapping
     ports:
       - "80:80"
-      - "443:443"
+      - "443:8443"
       - "81:81"
     networks:
       - proxy-network

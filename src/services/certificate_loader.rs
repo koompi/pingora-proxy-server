@@ -232,7 +232,7 @@ pub fn create_https_service(
     // Try to bind to port 443 FIRST before loading any certificates
     // This ensures we can actually use the port before doing certificate work
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        https_service.add_tcp("0.0.0.0:443");
+        https_service.add_tcp("0.0.0.0:8443");
     })) {
         Ok(_) => {
             println!("Successfully bound to port 443");
