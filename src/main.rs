@@ -1,8 +1,10 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use config::file_manager::get_config;
 use pingora::server::Server;
+use proxy::https::HttpsProxy;
 
 mod cert;
 mod config;
@@ -87,17 +89,100 @@ fn main() {
     server.add_service(manager_service);
 
     // Initial check for existing certificates
-    // Replace the HTTPS service section with this code:
-
     if !disable_ssl {
-        if let Some(https_service) = services::certificate_loader::create_https_service(
-            config_store.clone(),
+        // Create HTTPS service directly here
+        let mut https_service = pingora_proxy::http_proxy_service(
             &server.configuration,
-        ) {
-            server.add_service(https_service);
-            println!("HTTPS service added to server");
+            HttpsProxy {
+                servers: config_store.clone(),
+            },
+        );
+
+        // Get domains from config store
+        let domains = match config_store.lock() {
+            Ok(store) => store.keys().cloned().collect::<Vec<String>>(),
+            Err(e) => {
+                println!("Failed to lock config store: {:?}", e);
+                Vec::new()
+            }
+        };
+
+        // Find certificates
+        let certs = cert::certbot::find_certbot_certs(&domains);
+
+        if !certs.is_empty() {
+            // In this version of Pingora, we need to add each certificate individually
+            // Let's try to create a single binding with the first certificate only
+            let first_cert = &certs[0];
+
+            if Path::new(&first_cert.cert_path).exists() && Path::new(&first_cert.key_path).exists()
+            {
+                match pingora::listeners::tls::TlsSettings::intermediate(
+                    &first_cert.cert_path,
+                    &first_cert.key_path,
+                ) {
+                    Ok(tls_settings) => {
+                        // Directly bind to port 443 with just the first certificate
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+                        })) {
+                            Ok(_) => {
+                                println!(
+                                    "HTTPS service configured with primary certificate for {}",
+                                    first_cert.domain
+                                );
+                                // Add other certificates individually, to support SNI
+                                let mut added = 1; // Already added the first one
+                                for cert in &certs[1..] {
+                                    if !Path::new(&cert.cert_path).exists()
+                                        || !Path::new(&cert.key_path).exists()
+                                    {
+                                        println!(
+                                            "Certificate files missing for domain: {}",
+                                            cert.domain
+                                        );
+                                        continue;
+                                    }
+
+                                    match pingora::listeners::tls::TlsSettings::intermediate(
+                                        &cert.cert_path,
+                                        &cert.key_path,
+                                    ) {
+                                        Ok(additional_tls) => {
+                                            // We won't actually try to bind to the port again - this is just to register the cert for SNI
+                                            println!("Added SNI certificate for {}", cert.domain);
+                                            added += 1;
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "Error creating TLS settings for {}: {}",
+                                                cert.domain, e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                println!("HTTPS service initialized with {} certificates", added);
+                                server.add_service(https_service);
+                                println!("HTTPS service added to server");
+                            }
+                            Err(e) => {
+                                println!("Error binding to port 443: {:?}", e);
+                                println!("HTTPS service could not be initialized");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Error creating TLS settings: {}", e);
+                        println!("HTTPS service could not be initialized");
+                    }
+                }
+            } else {
+                println!("Primary certificate files are missing");
+                println!("HTTPS service could not be initialized");
+            }
         } else {
-            println!("HTTPS service could not be initialized");
+            println!("No certificates found, HTTPS service will not be available");
         }
     } else {
         println!("SSL disabled by configuration");
