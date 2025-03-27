@@ -1,4 +1,4 @@
-// src/services/letsencrypt.rs
+// src/services/letsencrypt.rs (updated with correct shutdown handling)
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,9 +10,11 @@ use pingora::{
     services::Service,
 };
 use tokio::time;
+use uuid::Uuid;
 
 use crate::cert::issuer::{CertificateIssuer, CertificateRequest, Credentials};
 use crate::config::model::ConfigStore;
+use crate::services::lock::FileLock;
 
 pub struct LetsEncryptService {
     config_store: Arc<std::sync::Mutex<ConfigStore>>,
@@ -23,67 +25,10 @@ pub struct LetsEncryptService {
     cloudflare_api_token: Option<String>,
     cloudflare_api_key: Option<String>,
     cloudflare_api_email: Option<String>,
+    // Unique node ID for lock ownership
+    node_id: String,
 }
 
-/// A service that manages Let's Encrypt SSL certificates with optional Cloudflare DNS integration.
-///
-/// This service handles the automated issuance and renewal of SSL certificates through Let's Encrypt,
-/// supporting both standard and wildcard certificates. For wildcard certificates, Cloudflare DNS
-/// credentials are required for DNS-01 challenge verification.
-///
-/// # Configuration
-///
-/// The service can be configured with:
-/// - Certificate storage directory
-/// - Let's Encrypt account email
-/// - Certificate check interval
-/// - Optional Cloudflare credentials
-///
-/// Cloudflare credentials can be provided either through environment variables:
-/// - `CLOUDFLARE_API_TOKEN`
-/// - `CLOUDFLARE_API_KEY`
-/// - `CLOUDFLARE_API_EMAIL`
-///
-/// Or programmatically using the `with_cloudflare_credentials` method.
-///
-/// # Examples
-///
-/// ```rust
-/// let service = LetsEncryptService::new(
-///     config_store,
-///     PathBuf::from("/etc/letsencrypt"),
-///     "admin@example.com".to_string(),
-///     3600,
-/// );
-/// ```
-///
-/// With explicit Cloudflare credentials:
-/// ```rust
-/// let service = LetsEncryptService::new(/* ... */)
-///     .with_cloudflare_credentials(
-///         Some("api_token".to_string()),
-///         None,
-///         None,
-///     );
-/// ```
-///
-/// # Methods
-///
-/// - `new`: Creates a new instance of the service
-/// - `with_cloudflare_credentials`: Configures Cloudflare credentials for DNS validation
-/// - `issue_certificate_for_domain`: Issues a certificate for a specific domain
-/// - `is_wildcard_cert`: Detects if a certificate is for a wildcard domain
-/// - `check_and_issue_certificates`: Checks and issues certificates for all configured domains
-/// - `should_use_wildcard`: Determines if a wildcard certificate should be used for a domain
-///
-/// # Features
-///
-/// - Automatic certificate issuance and renewal
-/// - Support for both standard and wildcard certificates
-/// - Cloudflare DNS integration for DNS-01 challenges
-/// - IP address filtering
-/// - Configurable check intervals
-/// - Certificate type detection (wildcard vs standard)
 impl LetsEncryptService {
     pub fn new(
         config_store: Arc<std::sync::Mutex<ConfigStore>>,
@@ -96,6 +41,9 @@ impl LetsEncryptService {
         let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
         let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
 
+        // Generate a unique ID for this node
+        let node_id = format!("node-{}", Uuid::new_v4().to_string());
+
         Self {
             config_store,
             certbot_dir,
@@ -104,6 +52,7 @@ impl LetsEncryptService {
             cloudflare_api_token,
             cloudflare_api_key,
             cloudflare_api_email,
+            node_id,
         }
     }
 
@@ -225,12 +174,56 @@ impl LetsEncryptService {
         false
     }
 
-    async fn check_and_issue_certificates(&self) {
-        // Get all domains from config
+    async fn check_and_issue_certificates(&self) -> Result<(), anyhow::Error> {
+        // Create a lock in a shared directory
+        let lock_dir = PathBuf::from("/certbot/locks");
+        if !lock_dir.exists() {
+            fs::create_dir_all(&lock_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to create lock directory: {}", e))?;
+        }
+
+        let lock = FileLock::new(
+            lock_dir,
+            "certman",
+            &self.node_id,
+            300, // 5 minute TTL
+        );
+
+        // Try to acquire the lock with retries
+        let lock_acquired = lock
+            .acquire(5, Duration::from_secs(5))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to acquire lock: {}", e))?;
+
+        if !lock_acquired {
+            println!("Could not acquire certificate manager lock, skipping this run");
+            return Ok(());
+        }
+
+        // We now have the lock, proceed with certificate operations
+        println!("Lock acquired, proceeding with certificate operations");
+
+        // Get all domains from config - make sure to drop the MutexGuard before any .await points
         let domains = {
-            let store = self.config_store.lock().unwrap();
-            store.keys().cloned().collect::<Vec<String>>()
+            // Scope the mutex guard to ensure it's dropped before any await
+            let domains = {
+                let store = match self.config_store.lock() {
+                    Ok(store) => store,
+                    Err(e) => {
+                        println!("Failed to lock config store: {:?}", e);
+                        // Don't await here while holding the mutex
+                        return Err(anyhow::anyhow!("Failed to lock config store"));
+                    }
+                };
+                // Clone the keys and immediately drop the guard by ending this scope
+                store.keys().cloned().collect::<Vec<String>>()
+            };
+
+            domains // Return the collected domains
         };
+
+        // Use a result variable to track overall success
+        let mut result = Ok(());
 
         for domain in domains {
             // Skip if domain is an IP address
@@ -258,8 +251,24 @@ impl LetsEncryptService {
                 .await
             {
                 println!("Error issuing certificate for {}: {}", cert_domain, e);
+                // Store the error but continue with other domains
+                result = Err(anyhow::anyhow!("One or more certificate operations failed"));
             }
         }
+
+        // Release the lock when done (separate from the main operations to avoid MutexGuard issues)
+        match lock.release().await {
+            Ok(_) => println!("Released certificate lock successfully"),
+            Err(e) => {
+                println!("Error releasing certificate manager lock: {:?}", e);
+                // Don't override previous errors if there were any
+                if result.is_ok() {
+                    result = Err(anyhow::anyhow!("Failed to release lock"));
+                }
+            }
+        }
+
+        result
     }
 
     // Determine if we should use a wildcard certificate for this domain
@@ -286,8 +295,8 @@ impl LetsEncryptService {
 
 #[async_trait]
 impl Service for LetsEncryptService {
-    async fn start_service(&mut self, _fds: Option<ListenFds>, mut _shutdown: ShutdownWatch) {
-        println!("Starting Let's Encrypt certificate service");
+    async fn start_service(&mut self, _fds: Option<ListenFds>, mut shutdown: ShutdownWatch) {
+        println!("Starting Let's Encrypt certificate service with distributed locking");
 
         // Log Cloudflare credential status
         if self.cloudflare_api_token.is_some() {
@@ -298,11 +307,26 @@ impl Service for LetsEncryptService {
             println!("Cloudflare credentials not configured - wildcard certificates disabled");
         }
 
+        println!("Node ID for locking: {}", self.node_id);
+
         let mut interval = time::interval(self.check_interval);
 
         loop {
-            interval.tick().await;
-            self.check_and_issue_certificates().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.check_and_issue_certificates().await {
+                        println!("Error in certificate operations: {}", e);
+                    }
+                }
+                // Use changed() to wait for the shutdown signal to change value
+                Ok(_) = shutdown.changed() => {
+                    // Check if the value is true, indicating shutdown
+                    if *shutdown.borrow() {
+                        println!("Shutdown signal received, stopping Let's Encrypt service");
+                        break;
+                    }
+                }
+            }
         }
     }
 
