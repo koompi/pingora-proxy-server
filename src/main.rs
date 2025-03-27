@@ -90,34 +90,34 @@ fn main() {
     // Initial check for existing certificates
     // Replace the HTTPS service section with this code:
 
-    if !disable_ssl {
-        if let Some(mut https_service) =
-            create_https_service_if_needed(config_store.clone(), &server.configuration)
-        {
-            let binding_successful =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Attempt to bind to port 443
-                    https_service.add_tcp("192.168.1.101:443");
-                    true
-                })) {
-                    Ok(true) => true,
-                    _ => false,
-                };
+    // if !disable_ssl {
+    //     if let Some(mut https_service) =
+    //         create_https_service_if_needed(config_store.clone(), &server.configuration)
+    //     {
+    //         let binding_successful =
+    //             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    //                 // Attempt to bind to port 443
+    //                 https_service.add_tcp("192.168.1.101:443");
+    //                 true
+    //             })) {
+    //                 Ok(true) => true,
+    //                 _ => false,
+    //             };
 
-            if binding_successful {
-                println!("HTTPS service successfully bound to port 443");
-                // Only add the service if binding was successful
-                server.add_service(https_service);
-            } else {
-                println!("Failed to bind HTTPS service to port 443. Running in HTTP-only mode.");
-                // Don't add the service to avoid crashes
-            }
-        } else {
-            println!("No valid certificates found, HTTPS service not started");
-        }
-    } else {
-        println!("SSL disabled by configuration");
-    }
+    //         if binding_successful {
+    //             println!("HTTPS service successfully bound to port 443");
+    //             // Only add the service if binding was successful
+    //             server.add_service(https_service);
+    //         } else {
+    //             println!("Failed to bind HTTPS service to port 443. Running in HTTP-only mode.");
+    //             // Don't add the service to avoid crashes
+    //         }
+    //     } else {
+    //         println!("No valid certificates found, HTTPS service not started");
+    //     }
+    // } else {
+    //     println!("SSL disabled by configuration");
+    // }
 
     // Set up Swarm discovery if enabled
     let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
