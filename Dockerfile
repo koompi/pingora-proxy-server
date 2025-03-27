@@ -44,7 +44,7 @@ ENV SWARM_MODE=true
 ENV SWARM_NETWORKS=ingress,proxy-network
 ENV CONFIG_PATH=/app/config/config.json
 
-EXPOSE 80 443 81
+EXPOSE 80 443 81 8443
 
 # Default to using the entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]
