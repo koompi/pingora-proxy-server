@@ -1,6 +1,7 @@
 // src/proxy/manager.rs (Fixed for MappingOrigin support)
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -482,6 +483,61 @@ impl ManagerProxy {
             );
         }
 
+        // Add domain to recently deleted list to prevent auto-readding by discovery
+        let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
+
+        // Ensure the directory exists
+        if let Some(parent) = recently_deleted_file.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    println!("Error creating recently deleted directory: {}", e);
+                }
+            }
+        }
+
+        // Current timestamp for expiration tracking
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Load existing recently deleted domains with timestamps
+        let mut timestamp_domains: Vec<(u64, String)> = if recently_deleted_file.exists() {
+            match std::fs::read_to_string(&recently_deleted_file) {
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(domains) => domains,
+                    Err(e) => {
+                        println!("Error parsing recently deleted domains: {}", e);
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    println!("Error reading recently deleted file: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Filter out entries older than 5 minutes (300 seconds)
+        timestamp_domains.retain(|(timestamp, _)| now - *timestamp < 300);
+
+        // Add the current domain with timestamp if not already present
+        if !timestamp_domains.iter().any(|(_, domain)| domain == from) {
+            timestamp_domains.push((now, from.to_string()));
+        }
+
+        // Write back the updated list
+        if let Ok(json) = serde_json::to_string(&timestamp_domains) {
+            if let Err(e) = std::fs::write(&recently_deleted_file, json) {
+                println!("Error writing recently deleted domains: {}", e);
+            } else {
+                println!("Added {} to recently deleted domains list", from);
+            }
+        }
+
+        // Process the actual deletion
         match self.servers.lock() {
             Ok(mut servers) => {
                 // Check if domain exists
@@ -500,8 +556,10 @@ impl ManagerProxy {
                 let updates = create_mappings_from_store(&servers);
                 match update_config(updates) {
                     Ok(_) => {
-                        // Verify removal
-                        if let Ok(content) = std::fs::read_to_string("config.json") {
+                        // Verify removal using the CONFIG_PATH environment variable
+                        let config_path = std::env::var("CONFIG_PATH")
+                            .unwrap_or_else(|_| "config.json".to_string());
+                        if let Ok(content) = std::fs::read_to_string(&config_path) {
                             if let Ok(config) = serde_json::from_str::<
                                 crate::config::model::Configuration,
                             >(&content)

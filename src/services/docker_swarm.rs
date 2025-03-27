@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -186,6 +186,41 @@ impl SwarmDiscoveryService {
         let mut filters = HashMap::new();
         filters.insert("label", vec!["com.koompi.proxy=true"]);
 
+        // Load recently deleted domains to avoid auto-readding them
+        let recently_deleted_file =
+            PathBuf::from("/mnt/gluster/pingora-proxy/locks/recently_deleted.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Create a set of recently deleted domains that are still within the cooling period
+        let recently_deleted: HashSet<String> = if recently_deleted_file.exists() {
+            match std::fs::read_to_string(&recently_deleted_file) {
+                Ok(content) => match serde_json::from_str::<Vec<(u64, String)>>(&content) {
+                    Ok(timestamp_domains) => {
+                        // Only include domains deleted within the last 5 minutes
+                        timestamp_domains
+                            .into_iter()
+                            .filter(|(timestamp, _)| now - *timestamp < 300)
+                            .map(|(_, domain)| domain)
+                            .collect()
+                    }
+                    Err(_) => HashSet::new(),
+                },
+                Err(_) => HashSet::new(),
+            }
+        } else {
+            HashSet::new()
+        };
+
+        if !recently_deleted.is_empty() {
+            println!(
+                "Found {} recently deleted domains that will be excluded from discovery",
+                recently_deleted.len()
+            );
+        }
+
         let services = self
             .docker_client
             .list_services(Some(ListServicesOptions {
@@ -215,6 +250,12 @@ impl SwarmDiscoveryService {
                 Some(domain) => domain.clone(),
                 None => continue,
             };
+
+            // Skip if this domain was recently manually deleted
+            if recently_deleted.contains(&domain) {
+                println!("Skipping recently deleted domain: {}", domain);
+                continue;
+            }
 
             // Get port from label or use default
             let port = labels
@@ -263,6 +304,11 @@ impl SwarmDiscoveryService {
             if let Ok(mut store) = self.config_store.lock() {
                 // Merge new mappings with existing ones, preserving manual mappings
                 for (domain, target) in new_mappings.iter() {
+                    // Skip recently deleted domains even at this stage for extra safety
+                    if recently_deleted.contains(domain) {
+                        continue;
+                    }
+
                     // Only update if the mapping doesn't exist or was created by Swarm
                     if !store.contains_key(domain)
                         || store.get(domain).map_or(false, |(_, origin)| {
@@ -356,23 +402,55 @@ impl SwarmDiscoveryService {
 }
 
 #[async_trait]
+#[async_trait]
 impl Service for SwarmDiscoveryService {
     async fn start_service(&mut self, _fds: Option<ListenFds>, _shutdown: ShutdownWatch) {
         println!("Starting Docker Swarm discovery service");
 
         let mut interval = time::interval(self.check_interval);
+        let mut cleanup_interval = time::interval(Duration::from_secs(300)); // Every 5 minutes
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    // First discover services
+                    if let Err(e) = self.discover_services().await {
+                        println!("Error in service discovery: {}", e);
+                    }
 
-            // First discover services
-            if let Err(e) = self.discover_services().await {
-                println!("Error in service discovery: {}", e);
-            }
+                    // Then ensure networks exist
+                    if let Err(e) = self.ensure_org_networks().await {
+                        println!("Error ensuring organization networks: {}", e);
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    // Clean up expired recently deleted entries
+                    let recently_deleted_file = PathBuf::from("/mnt/gluster/pingora-proxy/locks/recently_deleted.json");
+                    if recently_deleted_file.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&recently_deleted_file) {
+                            if let Ok(timestamp_domains) = serde_json::from_str::<Vec<(u64, String)>>(&content) {
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
 
-            // Then ensure networks exist
-            if let Err(e) = self.ensure_org_networks().await {
-                println!("Error ensuring organization networks: {}", e);
+                                // Filter out entries older than 5 minutes
+                                let fresh_entries: Vec<(u64, String)> = timestamp_domains
+                                    .into_iter()
+                                    .filter(|(timestamp, _)| now - timestamp < 300)
+                                    .collect();
+
+                                if let Ok(json) = serde_json::to_string(&fresh_entries) {
+                                    if let Err(e) = std::fs::write(&recently_deleted_file, json) {
+                                        println!("Error writing recently deleted file during cleanup: {}", e);
+                                    } else {
+                                        println!("Cleaned up recently deleted domains list");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

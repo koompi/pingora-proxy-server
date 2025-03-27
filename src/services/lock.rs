@@ -275,4 +275,31 @@ impl FileLock {
         // This should never be reached due to the loop structure
         Err(IoError::new(ErrorKind::Other, "Retry mechanism failed"))
     }
+    pub async fn cleanup_recently_deleted() -> Result<(), IoError> {
+        let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
+
+        if recently_deleted_file.exists() {
+            if let Ok(content) = fs::read_to_string(&recently_deleted_file) {
+                if let Ok(timestamp_domains) = serde_json::from_str::<Vec<(u64, String)>>(&content)
+                {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    // Filter out entries older than 5 minutes
+                    let fresh_entries: Vec<(u64, String)> = timestamp_domains
+                        .into_iter()
+                        .filter(|(timestamp, _)| now - timestamp < 300)
+                        .collect();
+
+                    if let Ok(json) = serde_json::to_string(&fresh_entries) {
+                        let _ = fs::write(&recently_deleted_file, json);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
