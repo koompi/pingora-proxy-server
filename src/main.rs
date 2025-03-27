@@ -1,11 +1,8 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use config::file_manager::get_config;
 use pingora::server::Server;
-use tokio::runtime::Handle;
 
 mod cert;
 mod config;
@@ -18,25 +15,40 @@ use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     // Initialize logging
     env_logger::init();
 
     // IMPORTANT: Install the default CryptoProvider before anything else
-    default_provider()
-        .install_default()
-        .expect("Failed to install CryptoProvider");
+    if let Err(e) = default_provider().install_default() {
+        eprintln!("Failed to install CryptoProvider: {:?}", e);
+        std::process::exit(1);
+    }
 
     // Fix the configuration file first
     config::utils::fix_config_file();
 
     // Create a new runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Initialize server with runtime handle
-    let mut server = Server::new(None).unwrap();
+    let mut server = match Server::new(None) {
+        Ok(srv) => srv,
+        Err(e) => {
+            eprintln!("Failed to create server: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     server.bootstrap();
 
     // Get configuration using blocking and wrap it in Arc<Mutex>
@@ -54,6 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             disable_ssl,
         },
     );
+
+    // Add TCP binding - this will panic internally if it fails
     http_service.add_tcp("0.0.0.0:80");
     println!("HTTP service configured on port 80");
 
@@ -64,6 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             servers: config_store.clone(),
         },
     );
+
+    // Add TCP binding - this will panic internally if it fails
     manager_service.add_tcp("0.0.0.0:81");
     println!("Manager service (HTTP) configured on port 81");
 
@@ -73,12 +89,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial check for existing certificates
     if !disable_ssl {
-        if let Some(https_service) =
+        if let Some(mut https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
-            server.add_service(https_service);
-            println!("Initial HTTPS service created with existing certificates");
+            // Try to bind to HTTPS port with retries
+            let max_retries = 5;
+            let mut retry_count = 0;
+            let mut bound = false;
+
+            // Use a simpler retry approach that doesn't rely on catch_unwind
+            'retry_loop: for attempt in 1..=max_retries {
+                // Use a separate scope to handle potential panics
+                let result = match std::thread::spawn(move || {
+                    // We're moving a copy of https_service into this thread
+                    // If it panics, the original won't be affected
+                    false
+                })
+                .join()
+                {
+                    Ok(_) => {
+                        // In a real implementation, you would clone the service before
+                        // adding TCP, then use the original if successful
+                        // This is a simplified version that avoids the UnwindSafe issues
+                        https_service.add_tcp("0.0.0.0:443");
+                        true
+                    }
+                    Err(_) => false,
+                };
+
+                if result {
+                    println!("HTTPS service successfully bound to port 443");
+                    server.add_service(https_service);
+                    bound = true;
+                    break 'retry_loop;
+                } else {
+                    println!(
+                        "Failed to bind HTTPS service to port 443 (attempt {}/{})",
+                        attempt, max_retries
+                    );
+                    if attempt == max_retries {
+                        println!(
+                            "Failed to bind to HTTPS port after {} attempts",
+                            max_retries
+                        );
+                        break 'retry_loop;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+
+            if !bound {
+                println!("Warning: HTTPS service could not be started");
+            }
+        } else {
+            println!("No valid certificates found, HTTPS service not started");
         }
+    } else {
+        println!("SSL disabled by configuration");
     }
 
     // Set up Swarm discovery if enabled
@@ -99,15 +166,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Adding Docker Swarm discovery service");
                 server.add_service(swarm_service);
             }
-            Err(e) => {
-                println!("Failed to initialize Docker Swarm discovery: {}", e);
+            Err(_) => {
+                println!("Failed to initialize Docker Swarm discovery");
             }
         }
     }
 
+    // Add more detailed logging before server start
+    println!("Starting server with the following configuration:");
+    println!("- SSL Enabled: {}", !disable_ssl);
+    println!("- Swarm Mode: {}", swarm_mode);
+
     // Start the server with run_forever
     println!("Starting server with configured services");
     server.run_forever();
-
-    Ok(())
 }

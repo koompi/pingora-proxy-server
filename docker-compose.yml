@@ -8,6 +8,8 @@ services:
       - 127.0.0.11
       - 8.8.8.8
       - 1.1.1.1
+    cap_add:
+      - NET_BIND_SERVICE
     ports:
       - target: 80
         published: 80
@@ -25,7 +27,7 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/certbot:/certbot:ro
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
       - /mnt/gluster/proxy-config:/app/config # Persistent configuration directory
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks # Shared lock directory
@@ -38,6 +40,9 @@ services:
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
+      # Add these for debugging
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
     deploy:
       mode: global
       update_config:
