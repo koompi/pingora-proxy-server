@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use config::file_manager::get_config;
 use pingora::server::Server;
+use tokio::runtime::Handle;
 
 mod cert;
 mod config;
@@ -16,8 +18,7 @@ use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init();
 
@@ -29,12 +30,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fix the configuration file first
     config::utils::fix_config_file();
 
-    // Initialize server
+    // Create a new runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // Initialize server with runtime handle
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    // Get configuration
-    let config_store = get_config().await;
+    // Get configuration using blocking and wrap it in Arc<Mutex>
+    let config_store = Arc::new(Mutex::new(runtime.block_on(async { get_config().await })));
+
     let disable_ssl = std::env::var("DISABLE_SSL")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
@@ -43,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut http_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         HttpProxy {
-            servers: Arc::new(Mutex::new(config_store.clone())),
+            servers: config_store.clone(),
             disable_ssl,
         },
     );
@@ -53,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager_service = pingora_proxy::http_proxy_service(
         &server.configuration,
         ManagerProxy {
-            servers: Arc::new(Mutex::new(config_store.clone())),
+            servers: config_store.clone(),
         },
     );
     manager_service.add_tcp("0.0.0.0:81");
@@ -65,10 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial check for existing certificates
     if !disable_ssl {
-        if let Some(https_service) = create_https_service_if_needed(
-            Arc::new(Mutex::new(config_store.clone())),
-            &server.configuration,
-        ) {
+        if let Some(https_service) =
+            create_https_service_if_needed(config_store.clone(), &server.configuration)
+        {
             server.add_service(https_service);
             println!("Initial HTTPS service created with existing certificates");
         }
@@ -83,18 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
 
     if swarm_mode {
-        // Default swarm networks to check
         let networks = std::env::var("SWARM_NETWORKS")
             .map(|nets| nets.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_else(|_| vec!["ingress".to_string()]);
 
-        // Setup swarm discovery service
-        match SwarmDiscoveryService::new(
-            Arc::new(Mutex::new(config_store.clone())),
-            &docker_endpoint,
-            networks,
-            30, // Check every 30 seconds
-        ) {
+        match SwarmDiscoveryService::new(config_store.clone(), &docker_endpoint, networks, 30) {
             Ok(swarm_service) => {
                 println!("Adding Docker Swarm discovery service");
                 server.add_service(swarm_service);
