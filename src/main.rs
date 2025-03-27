@@ -88,24 +88,28 @@ fn main() {
     server.add_service(manager_service);
 
     // Initial check for existing certificates
+    // Replace the HTTPS service section with this code:
+
     if !disable_ssl {
         if let Some(mut https_service) =
             create_https_service_if_needed(config_store.clone(), &server.configuration)
         {
-            // Try to bind to 443 with better error handling
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Use a safer binding approach
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Try to bind to port 443
                 https_service.add_tcp("0.0.0.0:443");
-            })) {
-                Ok(_) => {
+                true
+            }));
+
+            match result {
+                Ok(true) => {
                     println!("HTTPS service successfully bound to port 443");
+                    // Important: Only add the service to the server if binding succeeded
                     server.add_service(https_service);
                 }
-                Err(e) => {
-                    // Don't panic if another container already bound the port
+                _ => {
                     println!("Could not bind HTTPS service to port 443, possibly already in use");
-                    if let Some(err) = e.downcast_ref::<&str>() {
-                        println!("Error details: {}", err);
-                    }
+                    // Don't add the service to the server if binding failed
                 }
             }
         } else {
