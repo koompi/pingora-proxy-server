@@ -764,16 +764,14 @@ impl ProxyHttp for ManagerProxy {
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let pathname = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
-        // Split path into segments
-        let path_segments: Vec<String> = pathname.split('/').map(|seg| seg.to_string()).collect();
-
-        // Check for certificate reload endpoint
-        if path_segments.len() > 2
-            && path_segments[1] == "admin"
-            && path_segments[2] == "reload_certs"
-        {
+        // Check for certificate reload endpoint - special case
+        if pathname == "/admin/reload_certs" {
+            println!("Processing certificate reload request");
             return self.handle_reload_certificates(session).await;
         }
+
+        // Split path into segments for other endpoints
+        let path_segments: Vec<String> = pathname.split('/').map(|seg| seg.to_string()).collect();
 
         // Handle certificate endpoints
         if path_segments.len() > 1 && path_segments[1].starts_with("certificates") {
