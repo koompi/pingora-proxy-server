@@ -184,38 +184,40 @@ impl ProxyHttp for HttpProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        if self.disable_ssl {
-            // When SSL is disabled, we need to handle HTTP forwarding here
-            let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+        // When SSL is disabled or no certificate is found, handle HTTP forwarding here
+        let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+        println!("Attempting to route HTTP request for domain: {}", hostname);
 
-            let target = {
-                let servers_lock = match self.servers.lock() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        println!("Error locking servers mutex in HttpProxy: {:?}", e);
-                        return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
-                    }
-                };
-
-                servers_lock
-                    .get(&hostname)
-                    .map(|(target, _)| target.clone())
+        let target = {
+            let servers_lock = match self.servers.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    println!("Error locking servers mutex in HttpProxy: {:?}", e);
+                    return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+                }
             };
 
-            match target {
-                Some(to) => {
-                    println!("Routing HTTP request to backend: {}", to);
-                    let peer = HttpPeer::new(to, false, hostname.clone());
-                    Ok(Box::new(peer))
-                }
-                None => {
-                    println!("No backend found for host: {}", hostname);
-                    Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
-                }
+            // Debug output to see what domains are in the config store
+            println!(
+                "Available domains in config store: {:?}",
+                servers_lock.keys().collect::<Vec<_>>()
+            );
+
+            servers_lock
+                .get(&hostname)
+                .map(|(target, _)| target.clone())
+        };
+
+        match target {
+            Some(to) => {
+                println!("Routing HTTP request to backend: {}", to);
+                let peer = HttpPeer::new(to, false, hostname.clone());
+                Ok(Box::new(peer))
             }
-        } else {
-            // This should not be called because request_filter should handle everything
-            Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
+            None => {
+                println!("No backend found for host: {}", hostname);
+                Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
+            }
         }
     }
 }

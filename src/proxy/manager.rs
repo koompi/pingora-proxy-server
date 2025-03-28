@@ -767,6 +767,14 @@ impl ProxyHttp for ManagerProxy {
         // Split path into segments
         let path_segments: Vec<String> = pathname.split('/').map(|seg| seg.to_string()).collect();
 
+        // Check for certificate reload endpoint
+        if path_segments.len() > 2
+            && path_segments[1] == "admin"
+            && path_segments[2] == "reload_certs"
+        {
+            return self.handle_reload_certificates(session).await;
+        }
+
         // Handle certificate endpoints
         if path_segments.len() > 1 && path_segments[1].starts_with("certificates") {
             let clean_segments: Vec<String> = path_segments
