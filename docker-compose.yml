@@ -112,8 +112,8 @@ services:
   prometheus:
     image: prom/prometheus:latest
     volumes:
-      - ./prometheus:/etc/prometheus
-      - prometheus_data:/prometheus
+      - /mnt/gluster/prometheus/config:/etc/prometheus
+      - /mnt/gluster/prometheus/data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -131,13 +131,13 @@ services:
   grafana:
     image: grafana/grafana:latest
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
+      - /mnt/gluster/grafana/data:/var/lib/grafana
+      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     ports:
-      - "3000:3000"
+      - "3005:3000" # Changed port from 3000 to 3005
     networks:
       - proxy-network
     depends_on:
@@ -154,7 +154,4 @@ networks:
 configs:
   proxy-security-policy:
     file: ./security-policy.json
-
-volumes:
-  prometheus_data:
-  grafana_data:
+# Removed local volumes since we're now using Gluster
