@@ -1,8 +1,68 @@
 // src/proxy/utils.rs with improved Swarm service discovery handling
 use regex::Regex;
-// Remove unused ErrorKind
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+
+pub struct RateLimiter {
+    limits: Arc<RwLock<HashMap<String, TokenBucket>>>,
+    default_rate: u32,
+    default_burst: u32,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    last_update: std::time::Instant,
+    rate: f64,
+    capacity: f64,
+}
+
+impl RateLimiter {
+    pub fn new(default_rate: u32, default_burst: u32) -> Self {
+        Self {
+            limits: Arc::new(RwLock::new(HashMap::new())),
+            default_rate,
+            default_burst,
+        }
+    }
+
+    pub async fn check_rate_limit(&self, key: &str) -> bool {
+        let mut limits = self.limits.write().await;
+        let bucket = limits
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket {
+                tokens: self.default_burst as f64,
+                last_update: std::time::Instant::now(),
+                rate: self.default_rate as f64,
+                capacity: self.default_burst as f64,
+            });
+
+        bucket.refill();
+        bucket.try_consume()
+    }
+}
+
+impl TokenBucket {
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.last_update = now;
+    }
+
+    fn try_consume(&mut self) -> bool {
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Extract hostname from HTTP request header
 pub fn extract_hostname(request_line: &str) -> Option<String> {
@@ -175,4 +235,58 @@ pub fn log_request_summary(summary: &str) -> Option<String> {
     }
 
     None
+}
+
+pub struct ServiceCircuitBreaker {
+    failures: AtomicUsize,
+    last_failure: AtomicU64,
+    threshold: usize,
+    reset_timeout: Duration,
+}
+
+impl ServiceCircuitBreaker {
+    pub fn new(threshold: usize, reset_timeout: Duration) -> Self {
+        Self {
+            failures: AtomicUsize::new(0),
+            last_failure: AtomicU64::new(0),
+            threshold,
+            reset_timeout,
+        }
+    }
+
+    pub fn record_failure(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.last_failure.store(now, Ordering::SeqCst);
+        let failures = self.failures.fetch_add(1, Ordering::SeqCst) + 1;
+
+        failures >= self.threshold
+    }
+
+    pub fn record_success(&self) {
+        self.failures.store(0, Ordering::SeqCst);
+    }
+
+    pub fn is_open(&self) -> bool {
+        let failures = self.failures.load(Ordering::SeqCst);
+        if failures >= self.threshold {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let last_failure = self.last_failure.load(Ordering::SeqCst);
+
+            if now - last_failure > self.reset_timeout.as_secs() {
+                self.failures.store(0, Ordering::SeqCst);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
 }

@@ -1,21 +1,68 @@
+use anyhow::Result;
+use log::{error, warn};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::sleep;
 
 use config::file_manager::get_config;
+use config::model::{ConfigStore, MappingOrigin};
 use pingora::server::Server;
 use proxy::https::HttpsProxy;
 
 mod cert;
 mod config;
 mod logging;
+mod metrics;
 mod proxy;
 mod services;
-
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
+
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+async fn get_config_with_retry() -> Result<ConfigStore> {
+    let mut retries = 0;
+    let mut last_error = None;
+
+    while retries < MAX_RETRIES {
+        match get_config().await {
+            config_store => {
+                // Directly return the config store
+                return Ok(config_store);
+            }
+        }
+    }
+
+    // If we get here, all retries failed - try fallback
+    match load_fallback_config().await {
+        Ok(config) => {
+            warn!("Using fallback configuration");
+            Ok(config)
+        }
+        Err(_) => {
+            error!("Failed to load both main and fallback configurations");
+            Err(anyhow::anyhow!(
+                "Configuration loading failed: {:?}",
+                last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error"))
+            ))
+        }
+    }
+}
+
+async fn load_fallback_config() -> Result<ConfigStore> {
+    // Load minimal configuration that allows the proxy to start
+    let mut config = ConfigStore::new();
+    config.insert(
+        "localhost".to_string(),
+        ("127.0.0.1:8080".to_string(), MappingOrigin::Manual),
+    );
+    Ok(config)
+}
 
 fn main() {
     // Initialize logging
@@ -55,7 +102,15 @@ fn main() {
     server.bootstrap();
 
     // Get configuration using blocking and wrap it in Arc<Mutex>
-    let config_store = Arc::new(Mutex::new(runtime.block_on(async { get_config().await })));
+    let config_store = Arc::new(Mutex::new(runtime.block_on(async {
+        match get_config_with_retry().await {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Failed to load configuration: {}", e);
+                std::process::exit(1);
+            }
+        }
+    })));
 
     let disable_ssl = std::env::var("DISABLE_SSL")
         .map(|v| v.to_lowercase() == "true")
@@ -97,6 +152,7 @@ fn main() {
             &server.configuration,
             HttpsProxy {
                 servers: config_store.clone(),
+                cert_cache: Arc::new(Mutex::new(HashMap::new())),
             },
         );
 

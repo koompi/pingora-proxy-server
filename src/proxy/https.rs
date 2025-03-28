@@ -1,78 +1,127 @@
-// Fixed HTTPS Proxy Implementation (Updated for MappingOrigin)
 use std::{
     collections::HashMap,
+    str,
     sync::{Arc, Mutex},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use pingora::{prelude::HttpPeer, Result};
+use pingora::{prelude::HttpPeer, Error, ErrorType, Result};
 use pingora_proxy::{ProxyHttp, Session};
 
 use crate::{
+    cert::certbot,
     config::model::ConfigStore,
+    metrics::PROXY_METRICS,
     proxy::utils::{parse_swarm_target, test_service_connectivity, validate_org_network_access},
 };
 
 use super::utils::extract_hostname;
+use log::{error, info};
 
 /// HTTPS Proxy implementation
 #[derive(Clone)]
 pub struct HttpsProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
+    pub cert_cache: Arc<Mutex<HashMap<String, (Vec<u8>, Vec<u8>, u64)>>>, // (cert, key, timestamp)
+}
+
+impl HttpsProxy {
+    pub fn new(servers: Arc<Mutex<ConfigStore>>) -> Self {
+        Self {
+            servers,
+            cert_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Handles certificate loading and caching
+    pub async fn reload_certificates(&self) -> Result<()> {
+        info!("Checking for certificate changes...");
+
+        // Get current timestamp
+        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(err) => {
+                let err = Error::err::<()>(ErrorType::ConnectRefused);
+                return Err(err).unwrap();
+            }
+        };
+
+        // Lock servers to get domains
+        let servers_guard = match self.servers.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                let err = Error::err::<()>(ErrorType::ConnectRefused);
+                return Err(err).unwrap();
+            }
+        };
+
+        let domains = servers_guard.keys().cloned().collect::<Vec<String>>();
+        drop(servers_guard); // Release the lock early
+
+        // Find certificates for domains
+        let certs = certbot::find_certbot_certs(&domains);
+        if certs.is_empty() {
+            info!("No certificates found");
+            return Ok(());
+        }
+
+        // Lock cert cache for update
+        let mut cache_guard = match self.cert_cache.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let err = Error::err::<()>(ErrorType::ConnectRefused);
+                return Err(err).unwrap();
+            }
+        };
+
+        // Process each certificate
+        for cert in certs {
+            // Read certificate file
+            let cert_data = match std::fs::read(&cert.cert_path) {
+                Ok(data) => data,
+                Err(err) => {
+                    let err = Error::err::<()>(ErrorType::ConnectRefused);
+                    return Err(err).unwrap();
+                }
+            };
+
+            // Read key file
+            let key_data = match std::fs::read(&cert.key_path) {
+                Ok(data) => data,
+                Err(err) => {
+                    let err = Error::err::<()>(ErrorType::ConnectRefused);
+                    return Err(err).unwrap();
+                }
+            };
+
+            // Store in cache
+            cache_guard.insert(cert.domain, (cert_data, key_data, timestamp));
+        }
+
+        info!("Certificate reload complete");
+        Ok(())
+    }
+
+    pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let cache = self.cert_cache.lock().ok()?;
+        cache
+            .get(domain)
+            .map(|(cert, key, _)| (cert.clone(), key.clone()))
+    }
 }
 
 #[async_trait::async_trait]
 /// Implementation of the HTTPS proxy functionality.
-///
-/// This implementation handles HTTPS requests by routing them to appropriate backend servers
-/// based on hostname, with support for Docker Swarm service discovery and organization-level
-/// network isolation.
-///
-/// # Security Features
-/// - Organization network isolation
-/// - Strict network boundary enforcement
-/// - Service connectivity validation
-/// - Organization access validation
-///
-/// # Implementation Details
-/// Implements four main methods:
-/// - `new_ctx`: Creates a new empty context
-/// - `request_filter`: Processes incoming HTTPS requests
-/// - `upstream_peer`: Routes requests to appropriate backend servers
-/// - `logging`: Provides detailed logging of HTTPS requests
-///
-/// # Examples
-/// The proxy supports two types of backend targets:
-/// 1. Direct IP:port targets
-/// 2. Docker Swarm service discovery (using DNS-based routing)
-///
-/// For Swarm services, additional security headers are added:
-/// - X-Organization-ID
-/// - X-Network-Isolation
-/// - X-Organization-Boundary
-/// - X-Forwarded-Proto
-/// - X-Proxy-Source
-///
-/// # Error Handling
-/// - Provides fallback to default backend (127.0.0.1:5500) when target resolution fails
-/// - Includes comprehensive error logging
-/// - Maintains mutex safety for concurrent access
-///
-/// # Note
-/// This implementation assumes the existence of supporting functions like
-/// `extract_hostname`, `parse_swarm_target`, `test_service_connectivity`,
-/// and `validate_org_network_access`.
 impl ProxyHttp for HttpsProxy {
     type CTX = ();
 
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        // For HTTPS, we don't need to handle ACME challenges (they're HTTP-only)
-        // Extract hostname for logging purposes
-        let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-        println!("HTTPS request for hostname: {}", hostname);
+        let hostname = extract_hostname(&session.request_summary());
+        let hostname_str = hostname.as_deref().unwrap_or("");
 
-        // Return false to continue normal request processing
+        info!("HTTPS request for hostname: {}", hostname_str);
         Ok(false)
     }
 
@@ -81,29 +130,35 @@ impl ProxyHttp for HttpsProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+        let hostname = extract_hostname(&session.request_summary());
+        let hostname_str = hostname.as_deref().unwrap_or("");
 
-        // IMPORTANT: Get the target outside the await points to avoid holding MutexGuard across await
+        // Start timing the request
+        let start_time = Instant::now();
+        // Store timing info in a request header
+        session
+            .req_header_mut()
+            .insert_header(
+                "x-request-start-time",
+                start_time.elapsed().as_secs_f64().to_string(),
+            )
+            .unwrap_or(());
+
+        // Get the target outside await points to avoid holding MutexGuard across await
         let target = {
-            let servers_lock = match self.servers.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    println!("Error locking servers mutex in HttpsProxy: {:?}", e);
-                    return Ok(Box::new(HttpPeer::new(
-                        "127.0.0.1:5500",
-                        false,
-                        "".to_string(),
-                    )));
+            match self.servers.lock() {
+                Ok(guard) => {
+                    let key = hostname.as_ref().map(String::as_str).unwrap_or("");
+                    guard.get(key).map(|(target, _)| target.clone())
                 }
-            };
-
-            // Clone the target string to avoid holding the mutex lock
-            servers_lock
-                .get(&hostname)
-                .map(|(target, _)| target.clone())
+                Err(e) => {
+                    error!("Error locking servers mutex in HttpsProxy: {:?}", e);
+                    None
+                }
+            }
         };
 
-        // Now process the target outside the mutex lock
+        // Process the target
         match target {
             Some(to) => {
                 println!("Routing HTTPS request to backend: {}", to);
@@ -115,8 +170,11 @@ impl ProxyHttp for HttpsProxy {
                     println!("Using Swarm DNS target: {}", host);
 
                     // Create peer with proper host resolution
-                    let mut peer =
-                        HttpPeer::new(format!("{}:{}", host, port), false, hostname.to_string());
+                    let mut peer = HttpPeer::new(
+                        format!("{}:{}", host, port),
+                        false,
+                        hostname.unwrap_or_default(),
+                    );
 
                     // Add security headers for organization isolation
                     if let Some(org) = org_id {
@@ -167,7 +225,7 @@ impl ProxyHttp for HttpsProxy {
                 } else {
                     // Standard IP:port target - use directly
                     println!("Using direct target: {}", to);
-                    let mut peer = HttpPeer::new(to, false, hostname.to_string());
+                    let mut peer = HttpPeer::new(to, false, hostname.unwrap_or_default());
 
                     // Add basic security headers
                     peer.options
@@ -183,10 +241,11 @@ impl ProxyHttp for HttpsProxy {
                 }
             }
             None => {
-                // Default backend when no matching host is found
-                println!("No backend found for host: {}", hostname);
-                let res = HttpPeer::new("127.0.0.1:5500", false, "".to_string());
-                Ok(Box::new(res))
+                PROXY_METRICS
+                    .requests_total
+                    .with_label_values(&[hostname_str, "404"])
+                    .inc();
+                Err(Error::new(ErrorType::HTTPStatus(404)))
             }
         }
     }
@@ -198,35 +257,45 @@ impl ProxyHttp for HttpsProxy {
         _ctx: &mut Self::CTX,
     ) {
         // Extract hostname and other details for logging
-        let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
-        let method = session.req_header().method.to_string();
-        let path = session.req_header().uri.path().to_string();
+        let hostname = extract_hostname(&session.request_summary());
+        let hostname_str = hostname.as_deref().unwrap_or("");
 
-        if let Some(response) = session.response_written() {
-            let status = response.status;
-            log::info!(
-                "HTTPS request completed: host={}, method={}, path={}, status={}",
-                hostname,
-                method,
-                path,
-                status
-            );
+        // Record request duration
 
-            // Log potential security issues
-            if status == 403 {
-                log::warn!(
-                    "Security warning: Forbidden HTTPS access attempt to {}",
-                    hostname
-                );
+        let start_time_header = session.req_header().headers.get("x-request-start-time");
+        if let Some(start_time_str) = start_time_header {
+            if let Ok(start_time) = str::from_utf8(start_time_str.as_ref()) {
+                if let Ok(start_time_secs) = start_time.parse::<f64>() {
+                    let duration = start_time_secs;
+                    PROXY_METRICS
+                        .request_duration
+                        .with_label_values(&[hostname.as_deref().unwrap_or("")])
+                        .observe(duration);
+                }
             }
-
-            // Use our custom logging function instead of printing full response
-            crate::logging::log_http_response(&hostname, status.as_u16());
         }
 
-        // Log errors
+        if let Some(response) = session.as_ref().response_written() {
+            let status = response.status.as_u16().to_string();
+
+            PROXY_METRICS
+                .requests_total
+                .with_label_values(&[hostname_str, &status])
+                .inc();
+
+            if status == "403" {
+                PROXY_METRICS
+                    .backend_failures
+                    .with_label_values(&[hostname_str, "forbidden"])
+                    .inc();
+            }
+        }
+
         if let Some(err) = error {
-            log::error!("Error handling HTTPS request: {}, error: {}", hostname, err);
+            PROXY_METRICS
+                .backend_failures
+                .with_label_values(&[hostname_str, "connection_error"])
+                .inc();
         }
     }
 }

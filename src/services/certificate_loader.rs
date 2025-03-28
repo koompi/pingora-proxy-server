@@ -224,6 +224,7 @@ pub fn create_https_service(
         server_configuration,
         HttpsProxy {
             servers: config_store.clone(),
+            cert_cache: Arc::new(Mutex::new(HashMap::new())),
         },
     );
 

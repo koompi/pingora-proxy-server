@@ -109,6 +109,44 @@ services:
         compress: "true"
         tag: "certbot-{{.Name}}"
 
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    ports:
+      - "9090:9090"
+    networks:
+      - proxy-network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - proxy-network
+    depends_on:
+      - prometheus
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
 networks:
   proxy-network:
     external: true
@@ -116,3 +154,7 @@ networks:
 configs:
   proxy-security-policy:
     file: ./security-policy.json
+
+volumes:
+  prometheus_data:
+  grafana_data:

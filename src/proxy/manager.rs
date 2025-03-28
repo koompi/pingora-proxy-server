@@ -5,14 +5,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::{http, prelude::HttpPeer, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use serde::{Deserialize, Serialize};
 
-use crate::config::file_manager::{create_mappings_from_store, update_config};
 use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
+use crate::metrics::PROXY_METRICS;
+use crate::{
+    cert::certbot,
+    config::file_manager::{create_mappings_from_store, update_config},
+};
 use crate::{
     cert::issuer::{CertificateIssuer, CertificateRequest, CertificateStatus},
     config::model::Configuration,
@@ -28,6 +33,8 @@ struct ApiResponse {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mappings: Option<Vec<DomainMapping>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<HealthStatus>,
 }
 
 // Domain mapping structure
@@ -37,6 +44,21 @@ struct DomainMapping {
     to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
+}
+
+// Health status structure
+#[derive(Serialize)]
+struct HealthStatus {
+    status: String,
+    timestamp: String,
+    components: HashMap<String, ComponentHealth>,
+}
+
+// Component health structure
+#[derive(Serialize)]
+struct ComponentHealth {
+    status: String,
+    details: HashMap<String, String>,
 }
 
 /// Manager Proxy for configuration endpoints
@@ -113,6 +135,7 @@ impl ManagerProxy {
             error: None,
             message: None,
             mappings: None,
+            health: None,
         }
     }
 
@@ -123,6 +146,7 @@ impl ManagerProxy {
             error: Some(message.to_string()),
             message: None,
             mappings: None,
+            health: None,
         }
     }
 
@@ -156,6 +180,7 @@ impl ManagerProxy {
             error: None,
             message: Some("Certificate reload triggered".to_string()),
             mappings: None,
+            health: None,
         };
 
         self.send_json_response(session, http::StatusCode::OK, response)
@@ -223,6 +248,7 @@ impl ManagerProxy {
                         request.domain
                     )),
                     mappings: None,
+                    health: None,
                 };
 
                 self.send_json_response(session, http::StatusCode::OK, response)
@@ -734,6 +760,7 @@ impl ManagerProxy {
                         error: None,
                         message: None,
                         mappings: Some(mappings),
+                        health: None,
                     },
                 )
             }
@@ -744,6 +771,133 @@ impl ManagerProxy {
                     Self::error_response("Failed to acquire lock on server configuration"),
                 )
             }
+        }
+    }
+
+    async fn handle_health_check(&self, session: &mut Session) -> Result<bool> {
+        let mut health_status = HealthStatus {
+            status: "healthy".to_string(),
+            components: HashMap::new(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Check certificate status
+        health_status.components.insert(
+            "certificates".to_string(),
+            self.check_certificate_health().await,
+        );
+
+        // Check backend connectivity
+        health_status
+            .components
+            .insert("backends".to_string(), self.check_backend_health().await);
+
+        // Check configuration state
+        health_status.components.insert(
+            "configuration".to_string(),
+            self.check_config_health().await,
+        );
+
+        // Overall status determination
+        let is_healthy = health_status
+            .components
+            .values()
+            .all(|status| status.status == "healthy");
+
+        let response = ApiResponse {
+            status: if is_healthy { "healthy" } else { "unhealthy" }.to_string(),
+            error: None,
+            message: Some("Health check completed".to_string()),
+            health: Some(health_status),
+            mappings: None,
+        };
+
+        self.send_json_response(
+            session,
+            if is_healthy {
+                http::StatusCode::OK
+            } else {
+                http::StatusCode::SERVICE_UNAVAILABLE
+            },
+            response,
+        )
+        .await
+    }
+
+    async fn check_certificate_health(&self) -> ComponentHealth {
+        let mut health = ComponentHealth {
+            status: "healthy".to_string(),
+            details: HashMap::new(),
+        };
+
+        if let Ok(store) = self.servers.lock() {
+            for domain in store.keys() {
+                let cert_status = certbot::check_certificate_status(domain);
+                health.details.insert(
+                    domain.clone(),
+                    match cert_status {
+                        Ok(status) => status.to_string(),
+                        Err(e) => {
+                            health.status = "unhealthy".to_string();
+                            e.to_string()
+                        }
+                    },
+                );
+            }
+        }
+
+        health
+    }
+
+    async fn check_backend_health(&self) -> ComponentHealth {
+        let mut health = ComponentHealth {
+            status: "healthy".to_string(),
+            details: HashMap::new(),
+        };
+
+        if let Ok(store) = self.servers.lock() {
+            for (domain, (backend, _origin)) in store.iter() {
+                let status = self.check_backend_connectivity(backend).await;
+                match status {
+                    Ok(_) => {
+                        health
+                            .details
+                            .insert(format!("{}->{}", domain, backend), "connected".to_string());
+                    }
+                    Err(e) => {
+                        health.status = "unhealthy".to_string();
+                        health
+                            .details
+                            .insert(format!("{}->{}", domain, backend), e.to_string());
+                        PROXY_METRICS
+                            .backend_failures
+                            .with_label_values(&[backend, "health_check_failed"])
+                            .inc();
+                    }
+                }
+            }
+        }
+
+        health
+    }
+
+    async fn check_config_health(&self) -> ComponentHealth {
+        ComponentHealth {
+            status: if let Ok(_) = self.servers.lock() {
+                "healthy".to_string()
+            } else {
+                "unhealthy".to_string()
+            },
+            details: HashMap::new(),
+        }
+    }
+
+    async fn check_backend_connectivity(&self, backend: &str) -> Result<(), String> {
+        let (service_name, port, _) = crate::proxy::utils::parse_swarm_target(backend);
+        if crate::proxy::utils::test_service_connectivity(&service_name, port).await {
+            Ok(())
+        } else {
+            Err(format!("Failed to connect to backend: {}", backend))
         }
     }
 }

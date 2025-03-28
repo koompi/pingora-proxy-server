@@ -1,23 +1,21 @@
 // src/proxy/http.rs (Updated for MappingOrigin)
 use std::{
-    collections::HashMap,
     fs,
     path::Path,
+    str,
     sync::{Arc, Mutex},
 };
 
 use bytes::Bytes;
 use pingora::{prelude::HttpPeer, Result};
-use pingora_http::{RequestHeader, ResponseHeader, StatusCode};
+use pingora_http::{ResponseHeader, StatusCode};
 use pingora_proxy::{ProxyHttp, Session};
 
-use crate::{
-    cert::issuer::CertificateIssuer,
-    config::model::ConfigStore,
-    proxy::utils::{parse_swarm_target, test_service_connectivity, validate_org_network_access},
-};
+use crate::{cert::issuer::CertificateIssuer, config::model::ConfigStore};
 
 use super::utils::extract_hostname;
+use crate::metrics::PROXY_METRICS;
+use std::time::Instant;
 
 /// HTTP Proxy implementation
 #[derive(Clone)]
@@ -63,6 +61,16 @@ impl ProxyHttp for HttpProxy {
 
         // Get the hostname for domain verification
         let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+
+        // Start timing the request - store time in request header
+        let start_time = Instant::now();
+        session
+            .req_header_mut()
+            .insert_header(
+                "x-request-start-time",
+                start_time.elapsed().as_secs_f64().to_string(),
+            )
+            .unwrap_or(());
 
         // Handle ACME challenges from Let's Encrypt
         if path.starts_with("/.well-known/acme-challenge/") {
@@ -215,11 +223,16 @@ impl ProxyHttp for HttpProxy {
                 Ok(Box::new(peer))
             }
             None => {
-                println!("No backend found for host: {}", hostname);
+                // Increment failed requests counter
+                PROXY_METRICS
+                    .requests_total
+                    .with_label_values(&[&hostname, "404"])
+                    .inc();
                 Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)))
             }
         }
     }
+
     async fn logging(
         &self,
         session: &mut Session,
@@ -231,24 +244,36 @@ impl ProxyHttp for HttpProxy {
         let method = session.req_header().method.to_string();
         let path = session.req_header().uri.path().to_string();
 
-        if let Some(response) = session.response_written() {
-            let status = response.status;
-            log::info!(
-                "HTTP request completed: host={}, method={}, path={}, status={}",
-                hostname,
-                method,
-                path,
-                status
-            );
-
-            // Instead of log::debug! with full response content, use a simple status log
-            // This eliminates the verbose response body logging
-            crate::logging::log_http_response(&hostname, status.as_u16());
+        // Record request duration
+        let start_time_header = session.req_header().headers.get("x-request-start-time");
+        if let Some(start_time_str) = start_time_header {
+            if let Ok(start_time) = str::from_utf8(start_time_str.as_ref()) {
+                if let Ok(start_time_secs) = start_time.parse::<f64>() {
+                    let duration = start_time_secs;
+                    PROXY_METRICS
+                        .request_duration
+                        .with_label_values(&[&hostname])
+                        .observe(duration);
+                }
+            }
         }
 
-        // Log errors
+        if let Some(response) = session.response_written() {
+            let status = response.status.as_u16().to_string();
+
+            // Increment total requests counter with status
+            PROXY_METRICS
+                .requests_total
+                .with_label_values(&[&hostname, &status])
+                .inc();
+        }
+
         if let Some(err) = error {
-            log::error!("Error handling HTTP request: {}, error: {}", hostname, err);
+            // Record backend failures
+            PROXY_METRICS
+                .backend_failures
+                .with_label_values(&[&hostname, "connection_error"])
+                .inc();
         }
     }
 }
