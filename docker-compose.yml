@@ -10,7 +10,6 @@ services:
       - 1.1.1.1
     cap_add:
       - NET_BIND_SERVICE
-    # Simplified port mapping
     ports:
       - "80:80"
       - "443:443"
@@ -109,10 +108,11 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
-    user: "nobody:nogroup" # Run as a non-root user
+    # Using numeric UID directly instead of user:group name
+    user: "65534:65534" # Use nobody user ID directly
     volumes:
-      - /mnt/gluster/prometheus/config:/etc/prometheus:ro # Read-only for config
-      - prometheus_data:/prometheus # Use Docker volume for data
+      - /mnt/gluster/prometheus/config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -131,17 +131,46 @@ services:
     image: grafana/grafana:latest
     user: "472" # This is the grafana user ID inside the container
     volumes:
-      - grafana_data:/var/lib/grafana # Use Docker volume for data
-      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning:ro # Read-only for provisioning
+      - grafana_data:/var/lib/grafana
+      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     ports:
-      - "3005:3000" # Changed port from 3000 to 3005
+      - "3005:3000"
     networks:
       - proxy-network
     depends_on:
       - prometheus
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Adding Redis Commander as requested
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    ports:
+      - "8081:8081"
+    networks:
+      - proxy-network
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+    depends_on:
+      - redis
+
+  # Adding Redis
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - proxy-network
     deploy:
       placement:
         constraints:
@@ -168,3 +197,9 @@ volumes:
       type: none
       o: bind
       device: /mnt/gluster/grafana/data
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/redis/data
