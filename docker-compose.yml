@@ -35,6 +35,7 @@ services:
       - RUST_BACKTRACE=0
       - RUST_LOG_STYLE=auto
       - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
+      - METRICS_PORT=9100
     deploy:
       mode: replicated
       replicas: 3
