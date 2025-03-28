@@ -1,4 +1,4 @@
-# docker-compose.yml with improved logging configuration
+# docker-compose.yml with improved logging configuration and fixed permissions
 version: "3.9"
 
 services:
@@ -28,14 +28,13 @@ services:
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
-      - LOG_LEVEL=info # Changed from debug to info
+      - LOG_LEVEL=info
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
-      - RUST_LOG=info # Changed from debug to info
-      - RUST_BACKTRACE=0 # Changed from 1 to 0 for production
+      - RUST_LOG=info
+      - RUST_BACKTRACE=0
       - RUST_LOG_STYLE=auto
-      # Add log filter to specifically exclude verbose response logging
       - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
     deploy:
       mode: replicated
@@ -61,7 +60,6 @@ services:
         max-size: "10m"
         max-file: "3"
         compress: "true"
-        # This tag allows for filtering out response body logs
         tag: "proxy-{{.Name}}"
 
   # Certificate manager service
@@ -111,9 +109,10 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    user: "nobody:nogroup" # Run as a non-root user
     volumes:
-      - /mnt/gluster/prometheus/config:/etc/prometheus
-      - /mnt/gluster/prometheus/data:/prometheus
+      - /mnt/gluster/prometheus/config:/etc/prometheus:ro # Read-only for config
+      - prometheus_data:/prometheus # Use Docker volume for data
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -130,9 +129,10 @@ services:
 
   grafana:
     image: grafana/grafana:latest
+    user: "472" # This is the grafana user ID inside the container
     volumes:
-      - /mnt/gluster/grafana/data:/var/lib/grafana
-      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana # Use Docker volume for data
+      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning:ro # Read-only for provisioning
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
@@ -154,4 +154,17 @@ networks:
 configs:
   proxy-security-policy:
     file: ./security-policy.json
-# Removed local volumes since we're now using Gluster
+
+volumes:
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/prometheus/data
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/grafana/data
