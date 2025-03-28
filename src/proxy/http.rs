@@ -80,7 +80,6 @@ impl ProxyHttp for HttpProxy {
             {
                 if token == challenge_token {
                     let mut res_headers = ResponseHeader::build(StatusCode::OK, None)?;
-
                     res_headers.insert_header("content-type", "text/plain")?;
 
                     session
@@ -97,6 +96,37 @@ impl ProxyHttp for HttpProxy {
                     println!("Successfully served ACME challenge for token: {}", token);
                     return Ok(true);
                 }
+            } else {
+                // Fallback to filesystem if no in-memory challenge found
+                let challenge_path =
+                    Path::new("/var/www/html/.well-known/acme-challenge/").join(token);
+                if challenge_path.exists() {
+                    match fs::read_to_string(&challenge_path) {
+                        Ok(content) => {
+                            let mut res_headers = ResponseHeader::build(StatusCode::OK, None)?;
+                            res_headers.insert_header("content-type", "text/plain")?;
+
+                            session
+                                .write_response_header(Box::new(res_headers), false)
+                                .await?;
+                            session
+                                .write_response_body(
+                                    Some(Bytes::copy_from_slice(content.as_bytes())),
+                                    true,
+                                )
+                                .await?;
+
+                            println!(
+                                "Successfully served ACME challenge from file for token: {}",
+                                token
+                            );
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            println!("Error reading challenge file: {}", e);
+                        }
+                    }
+                }
             }
 
             // If we couldn't find the challenge or token doesn't match, return 404
@@ -106,6 +136,20 @@ impl ProxyHttp for HttpProxy {
         // Skip HTTPS redirect if SSL is disabled
         if self.disable_ssl {
             // Proceed with normal HTTP handling if SSL is disabled
+            return Ok(false);
+        }
+
+        // Check if certificate exists for this domain before redirecting
+        let cert_path = Path::new("/certbot/letsencrypt/live")
+            .join(&hostname)
+            .join("fullchain.pem");
+
+        if !cert_path.exists() {
+            // No certificate exists yet, allow HTTP access instead of redirecting
+            println!(
+                "No certificate found for {}, allowing HTTP access",
+                hostname
+            );
             return Ok(false);
         }
 
