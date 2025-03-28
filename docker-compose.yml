@@ -36,7 +36,7 @@ services:
       - RUST_BACKTRACE=1
     deploy:
       mode: replicated
-      replicas: 3
+      replicas: 4
       update_config:
         parallelism: 1
         delay: 10s
