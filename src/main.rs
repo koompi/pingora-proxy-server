@@ -8,6 +8,7 @@ use proxy::https::HttpsProxy;
 
 mod cert;
 mod config;
+mod logging;
 mod proxy;
 mod services;
 
@@ -18,7 +19,8 @@ use rustls::crypto::ring::default_provider;
 
 fn main() {
     // Initialize logging
-    env_logger::init();
+    // env_logger::init();
+    crate::logging::setup_logging();
 
     // IMPORTANT: Install the default CryptoProvider before anything else
     if let Err(e) = default_provider().install_default() {

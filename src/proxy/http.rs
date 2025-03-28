@@ -220,4 +220,35 @@ impl ProxyHttp for HttpProxy {
             }
         }
     }
+    async fn logging(
+        &self,
+        session: &mut Session,
+        error: Option<&pingora::Error>,
+        _ctx: &mut Self::CTX,
+    ) {
+        // Extract hostname and other details for logging
+        let hostname = extract_hostname(&session.request_summary()).unwrap_or_default();
+        let method = session.req_header().method.to_string();
+        let path = session.req_header().uri.path().to_string();
+
+        if let Some(response) = session.response_written() {
+            let status = response.status;
+            log::info!(
+                "HTTP request completed: host={}, method={}, path={}, status={}",
+                hostname,
+                method,
+                path,
+                status
+            );
+
+            // Instead of log::debug! with full response content, use a simple status log
+            // This eliminates the verbose response body logging
+            crate::logging::log_http_response(&hostname, status.as_u16());
+        }
+
+        // Log errors
+        if let Some(err) = error {
+            log::error!("Error handling HTTP request: {}, error: {}", hostname, err);
+        }
+    }
 }

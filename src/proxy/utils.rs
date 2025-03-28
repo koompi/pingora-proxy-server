@@ -1,6 +1,6 @@
 // src/proxy/utils.rs with improved Swarm service discovery handling
 use regex::Regex;
-use std::io::ErrorKind;
+// Remove unused ErrorKind
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -128,4 +128,51 @@ pub fn validate_org_network_access(service_name: &str, org_id: &str) -> bool {
 
     // Default to deny for security
     false
+}
+
+/// Handle response logging with minimal output - using pingora headers instead of ResponseEvent
+pub fn handle_response_event<T>(event: &Option<T>, is_debug: bool) {
+    if !is_debug {
+        return; // Skip if not in debug mode
+    }
+
+    // Instead of trying to match on ResponseEvent which might not exist,
+    // we'll just log a generic message about the response
+    if event.is_some() {
+        log::debug!("Response event received (details omitted to reduce log size)");
+    }
+}
+
+/// Process a request summary string with reduced logging
+pub fn log_request_summary(summary: &str) -> Option<String> {
+    // Parse just what we need from the request summary
+    let parts: Vec<&str> = summary.split_whitespace().collect();
+
+    if parts.len() >= 2 {
+        let method = parts[0];
+        let path = parts[1];
+
+        // Extract host if available
+        let host = if summary.contains("Host:") {
+            let host_parts: Vec<&str> = summary.split("Host:").collect();
+            if host_parts.len() > 1 {
+                let host_value = host_parts[1].split_whitespace().next().unwrap_or("unknown");
+                format!(", host: {}", host_value)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        // Log concise request info
+        log::info!("Request: {} {}{}", method, path, host);
+
+        // Extract just the hostname for domain routing
+        if let Some(host_value) = extract_hostname(summary) {
+            return Some(host_value);
+        }
+    }
+
+    None
 }

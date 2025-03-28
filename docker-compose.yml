@@ -1,4 +1,4 @@
-# docker-compose.yml with load balancing across replicas
+# docker-compose.yml with improved logging configuration
 version: "3.9"
 
 services:
@@ -28,15 +28,18 @@ services:
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
-      - LOG_LEVEL=info
+      - LOG_LEVEL=info # Changed from debug to info
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
-      - RUST_LOG=debug
-      - RUST_BACKTRACE=1
+      - RUST_LOG=info # Changed from debug to info
+      - RUST_BACKTRACE=0 # Changed from 1 to 0 for production
+      - RUST_LOG_STYLE=auto
+      # Add log filter to specifically exclude verbose response logging
+      - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
     deploy:
       mode: replicated
-      replicas: 4
+      replicas: 3
       update_config:
         parallelism: 1
         delay: 10s
@@ -52,6 +55,14 @@ services:
       - source: proxy-security-policy
         target: /etc/security-policy.json
         mode: 0644
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+        # This tag allows for filtering out response body logs
+        tag: "proxy-{{.Name}}"
 
   # Certificate manager service
   certbot:
@@ -71,6 +82,8 @@ services:
     environment:
       - PROXY_SERVICE_NAME=proxy_proxy
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - LOG_LEVEL=info
+      - RUST_LOG=info
     deploy:
       mode: replicated
       replicas: 1
@@ -88,6 +101,13 @@ services:
       interval: 60s
       timeout: 10s
       retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+        tag: "certbot-{{.Name}}"
 
 networks:
   proxy-network:

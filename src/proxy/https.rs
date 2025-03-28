@@ -191,7 +191,6 @@ impl ProxyHttp for HttpsProxy {
         }
     }
 
-    // Add enhanced logging method for HTTPS requests
     async fn logging(
         &self,
         session: &mut Session,
@@ -205,23 +204,29 @@ impl ProxyHttp for HttpsProxy {
 
         if let Some(response) = session.response_written() {
             let status = response.status;
-            println!(
+            log::info!(
                 "HTTPS request completed: host={}, method={}, path={}, status={}",
-                hostname, method, path, status
+                hostname,
+                method,
+                path,
+                status
             );
 
             // Log potential security issues
             if status == 403 {
-                println!(
+                log::warn!(
                     "Security warning: Forbidden HTTPS access attempt to {}",
                     hostname
                 );
             }
+
+            // Use our custom logging function instead of printing full response
+            crate::logging::log_http_response(&hostname, status.as_u16());
         }
 
         // Log errors
         if let Some(err) = error {
-            println!("Error handling HTTPS request: {}, error: {}", hostname, err);
+            log::error!("Error handling HTTPS request: {}, error: {}", hostname, err);
         }
     }
 }
