@@ -932,40 +932,49 @@ impl ProxyHttp for ManagerProxy {
             .map(|s| s.to_string())
             .collect();
 
-        // Check for certificate reload endpoint first
-        if path_segments.len() >= 2
-            && path_segments[0] == "admin"
-            && path_segments[1] == "reload_certs"
-        {
-            return self.handle_reload_certificates(session).await;
-        }
-
-        // Handle standard route management endpoints
-        let (status, response) = match method.as_str() {
+        // Handle different request types
+        match method.as_str() {
+            // Handle certificate operations with PATCH
+            "PATCH" => {
+                if path_segments.len() >= 2
+                    && path_segments[0] == "admin"
+                    && path_segments[1] == "reload_certs"
+                {
+                    return self.handle_reload_certificates(session).await;
+                }
+                return self
+                    .send_json_response(
+                        session,
+                        http::StatusCode::NOT_FOUND,
+                        Self::error_response("Invalid PATCH endpoint"),
+                    )
+                    .await;
+            }
+            // Handle standard mapping operations
             "PUT" | "POST" => {
-                // Add or update domain mapping
-                self.handle_add_update_mapping(&method, &path_segments)
-                    .await
+                let (status, response) = self
+                    .handle_add_update_mapping(&method, &path_segments)
+                    .await;
+                return self.send_json_response(session, status, response).await;
             }
             "DELETE" => {
-                // Remove domain mapping
-                self.handle_delete_mapping(&path_segments).await
+                let (status, response) = self.handle_delete_mapping(&path_segments).await;
+                return self.send_json_response(session, status, response).await;
             }
             "GET" => {
-                // List all mappings
-                self.handle_list_mappings().await
+                let (status, response) = self.handle_list_mappings().await;
+                return self.send_json_response(session, status, response).await;
             }
             _ => {
-                // Method not supported
-                (
-                    http::StatusCode::METHOD_NOT_ALLOWED,
-                    Self::error_response("Method not allowed"),
-                )
+                return self
+                    .send_json_response(
+                        session,
+                        http::StatusCode::METHOD_NOT_ALLOWED,
+                        Self::error_response("Method not allowed"),
+                    )
+                    .await;
             }
-        };
-
-        // Send response
-        self.send_json_response(session, status, response).await
+        }
     }
 
     async fn upstream_peer(

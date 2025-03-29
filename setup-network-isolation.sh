@@ -4,10 +4,26 @@
 
 set -e
 
+# Add distributed locking
+LOCK_KEY="network_setup_lock"
+if ! acquire_distributed_lock "$LOCK_KEY" 60; then
+    echo "Another instance is setting up networks"
+    exit 1
+fi
+
+trap 'release_distributed_lock "$LOCK_KEY"' EXIT
+
 # Function to create an isolated overlay network for an organization
 create_org_network() {
     local org_id="$1"
     local network_name="org_${org_id}_overlay"
+    
+    # Add version tracking for network changes
+    local current_version=$(get_network_version "$network_name")
+    
+    if ! network_needs_update "$network_name" "$current_version"; then
+        return 0
+    fi
     
     # Check if network already exists
     if docker network ls | grep -q "$network_name"; then
