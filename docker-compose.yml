@@ -25,6 +25,7 @@ services:
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
       - /tmp:/tmp
       - /var/cache:/var/cache
+      - cert_reload:/pingora-proxy:rw
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
@@ -32,7 +33,7 @@ services:
       - CONFIG_PATH=/app/config/config.json
       - DISABLE_SSL=false
       - PROXY_SERVICE_NAME=proxy_proxy
-      - RUST_LOG=info
+      - RUST_LOG=info,pingora=debug
       - RUST_BACKTRACE=0
       - RUST_LOG_STYLE=auto
       - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
@@ -206,3 +207,5 @@ volumes:
       type: none
       o: bind
       device: /mnt/gluster/redis/data
+  cert_reload:
+    driver: local

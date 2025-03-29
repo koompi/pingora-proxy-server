@@ -170,49 +170,82 @@ impl ManagerProxy {
         (from, to)
     }
 
-    async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
-        info!("Received certificate reload request");
+    fn get_current_mappings(&self) -> Vec<DomainMapping> {
+        if let Ok(servers) = self.servers.lock() {
+            servers
+                .iter()
+                .map(|(domain, (backend, origin))| {
+                    let origin_str = match origin {
+                        MappingOrigin::Manual => "Manual",
+                        MappingOrigin::SwarmDiscovery => "SwarmDiscovery",
+                    };
 
-        // Trigger certificate reload
-        if let Some(https_proxy) = &self.https_proxy {
-            match https_proxy.reload_certificates().await {
-                Ok(_) => {
-                    info!("Certificate reload completed successfully");
-                    return self
-                        .send_json_response(
-                            session,
-                            http::StatusCode::OK,
-                            ApiResponse {
-                                status: "success".to_string(),
-                                error: None,
-                                message: Some("Certificates reloaded successfully".to_string()),
-                                mappings: None,
-                                health: None,
-                            },
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    error!("Certificate reload failed: {:?}", e);
-                    return self
-                        .send_json_response(
-                            session,
-                            http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Self::error_response("Failed to reload certificates"),
-                        )
-                        .await;
-                }
-            }
+                    DomainMapping {
+                        from: domain.clone(),
+                        to: backend.clone(),
+                        origin: Some(origin_str.to_string()),
+                    }
+                })
+                .collect()
         } else {
-            warn!("Certificate reload requested but HTTPS proxy not configured");
-            return self
-                .send_json_response(
-                    session,
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    Self::error_response("HTTPS proxy not configured"),
-                )
-                .await;
+            Vec::new()
         }
+    }
+
+    async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
+        println!("=== Certificate Reload Started ===");
+        info!("Attempting cluster-wide certificate reload");
+
+        // First, reload certificates locally
+        if let Some(https_proxy) = &self.https_proxy {
+            if let Err(e) = https_proxy.reload_certificates().await {
+                error!("Local certificate reload failed: {:?}", e);
+                return self
+                    .send_json_response(
+                        session,
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Self::error_response(&format!("Local certificate reload failed: {:?}", e)),
+                    )
+                    .await;
+            }
+        }
+
+        // Signal other nodes to reload certificates
+        // Method 1: Create a timestamp file that other nodes will detect
+        if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if let Err(e) = std::fs::write(
+                "/pingora-proxy/cert_renewed",
+                timestamp.as_secs().to_string(),
+            ) {
+                error!("Failed to create reload signal file: {:?}", e);
+            }
+        }
+
+        // Method 2: Try to signal via Docker Swarm
+        if let Ok(service_name) = std::env::var("SERVICE_NAME") {
+            use std::process::Command;
+            match Command::new("docker")
+                .args(&["service", "update", "--force", &service_name])
+                .output()
+            {
+                Ok(_) => info!("Triggered service update for certificate reload"),
+                Err(e) => error!("Failed to trigger service update: {:?}", e),
+            }
+        }
+
+        // Return success response with current mappings
+        self.send_json_response(
+            session,
+            http::StatusCode::OK,
+            ApiResponse {
+                status: "success".to_string(),
+                error: None,
+                message: Some("Certificate reload initiated across cluster".to_string()),
+                mappings: Some(self.get_current_mappings()),
+                health: None,
+            },
+        )
+        .await
     }
 
     async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {
