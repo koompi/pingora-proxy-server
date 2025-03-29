@@ -12,11 +12,14 @@ pub struct ProxyMetrics {
     pub certificate_operations: IntCounterVec,
     pub backend_failures: IntCounterVec,
     pub certificate_expiry: GaugeVec,
+    // New metrics
+    pub active_connections: GaugeVec,
+    pub swarm_operations: IntCounterVec,
+    pub lock_operations: IntCounterVec,
 }
 
 impl ProxyMetrics {
     fn new() -> Self {
-        // Create metrics using low-level API to ensure correct types
         let requests_total = IntCounterVec::new(
             prometheus::Opts::new("proxy_requests_total", "Total number of proxy requests"),
             &["domain", "status"],
@@ -56,29 +59,55 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        // Register metrics with the registry
-        REGISTRY
-            .register(Box::new(requests_total.clone()))
-            .unwrap_or(());
-        REGISTRY
-            .register(Box::new(request_duration.clone()))
-            .unwrap_or(());
-        REGISTRY
-            .register(Box::new(certificate_operations.clone()))
-            .unwrap_or(());
-        REGISTRY
-            .register(Box::new(backend_failures.clone()))
-            .unwrap_or(());
-        REGISTRY
-            .register(Box::new(certificate_expiry.clone()))
-            .unwrap_or(());
+        let active_connections = GaugeVec::new(
+            prometheus::Opts::new("active_connections", "Number of active connections"),
+            &["type"],
+        )
+        .unwrap();
 
-        ProxyMetrics {
-            requests_total,
-            request_duration,
-            certificate_operations,
-            backend_failures,
-            certificate_expiry,
-        }
+        let swarm_operations = IntCounterVec::new(
+            prometheus::Opts::new("swarm_operations_total", "Total number of swarm operations"),
+            &["operation", "status"],
+        )
+        .unwrap();
+
+        let lock_operations = IntCounterVec::new(
+            prometheus::Opts::new(
+                "lock_operations_total",
+                "Total number of distributed lock operations",
+            ),
+            &["operation", "status"],
+        )
+        .unwrap();
+
+        // Register all metrics
+        let metrics = Self {
+            requests_total: requests_total.clone(),
+            request_duration: request_duration.clone(),
+            certificate_operations: certificate_operations.clone(),
+            backend_failures: backend_failures.clone(),
+            certificate_expiry: certificate_expiry.clone(),
+            active_connections: active_connections.clone(),
+            swarm_operations: swarm_operations.clone(),
+            lock_operations: lock_operations.clone(),
+        };
+
+        // Register with the registry
+        REGISTRY.register(Box::new(requests_total)).unwrap_or(());
+        REGISTRY.register(Box::new(request_duration)).unwrap_or(());
+        REGISTRY
+            .register(Box::new(certificate_operations))
+            .unwrap_or(());
+        REGISTRY.register(Box::new(backend_failures)).unwrap_or(());
+        REGISTRY
+            .register(Box::new(certificate_expiry))
+            .unwrap_or(());
+        REGISTRY
+            .register(Box::new(active_connections))
+            .unwrap_or(());
+        REGISTRY.register(Box::new(swarm_operations)).unwrap_or(());
+        REGISTRY.register(Box::new(lock_operations)).unwrap_or(());
+
+        metrics
     }
 }
