@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use log::{error, info, warn};
 use pingora::{http, prelude::HttpPeer, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
@@ -170,13 +171,13 @@ impl ManagerProxy {
     }
 
     async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
-        println!("Processing certificate reload request");
+        info!("Received certificate reload request");
 
         // Trigger certificate reload
         if let Some(https_proxy) = &self.https_proxy {
             match https_proxy.reload_certificates().await {
                 Ok(_) => {
-                    println!("Certificates reloaded successfully");
+                    info!("Certificate reload completed successfully");
                     return self
                         .send_json_response(
                             session,
@@ -192,7 +193,7 @@ impl ManagerProxy {
                         .await;
                 }
                 Err(e) => {
-                    println!("Error reloading certificates: {:?}", e);
+                    error!("Certificate reload failed: {:?}", e);
                     return self
                         .send_json_response(
                             session,
@@ -202,15 +203,16 @@ impl ManagerProxy {
                         .await;
                 }
             }
+        } else {
+            warn!("Certificate reload requested but HTTPS proxy not configured");
+            return self
+                .send_json_response(
+                    session,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    Self::error_response("HTTPS proxy not configured"),
+                )
+                .await;
         }
-
-        // If HTTPS proxy is not configured
-        self.send_json_response(
-            session,
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            Self::error_response("HTTPS proxy not configured"),
-        )
-        .await
     }
 
     async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {
@@ -364,7 +366,7 @@ impl ManagerProxy {
 
                 // Log wildcard information if applicable
                 if request.wildcard.unwrap_or(false) {
-                    println!(
+                    info!(
                         "Processing WILDCARD certificate request for domain: {}",
                         request.domain
                     );
@@ -404,7 +406,7 @@ impl ManagerProxy {
                         .await;
                     }
                 } else {
-                    println!(
+                    info!(
                         "Processing certificate request for domain: {}",
                         request.domain
                     );
@@ -538,7 +540,7 @@ impl ManagerProxy {
 
         let (from, to) = self.extract_domain_and_backend(path_segments);
 
-        println!("Processing {} request: mapping {} -> {}", method, from, &to);
+        info!("Processing {} request: mapping {} -> {}", method, from, &to);
 
         if from.is_empty() || to.is_empty() {
             return (
