@@ -334,10 +334,16 @@ impl ManagerProxy {
         method: &str,
         path_segments: &[String],
     ) -> Result<bool> {
-        if path_segments.get(0).map(|s| s.as_str()) == Some("reload-ssl") {
-            info!("Handling certificate reload request");
+        // First check for admin/reload_certs path directly
+        if path_segments.len() >= 1
+            && path_segments[0] == "admin"
+            && path_segments.len() >= 2
+            && path_segments[1] == "reload_certs"
+        {
+            info!("Handling admin certificate reload request");
             return self.handle_reload_certificates(session).await;
         }
+
         match method {
             // Request a new certificate
             "POST" => {
@@ -998,6 +1004,15 @@ impl ProxyHttp for ManagerProxy {
             .map(|s| s.to_string())
             .collect();
 
+        // Handle admin reload endpoint
+        if path_segments.len() >= 2
+            && path_segments[0] == "admin"
+            && path_segments[1] == "reload_certs"
+        {
+            info!("Handling admin certificate reload request");
+            return self.handle_reload_certificates(session).await;
+        }
+
         // Handle certificate-related requests
         if path.starts_with("/cert") || path.starts_with("/reload-ssl") {
             return self
@@ -1008,6 +1023,17 @@ impl ProxyHttp for ManagerProxy {
         // Handle standard operations
         match method.as_str() {
             "POST" | "PUT" => {
+                // Make sure we skip admin paths
+                if !path_segments.is_empty() && path_segments[0] == "admin" {
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::NOT_FOUND,
+                            Self::error_response("Not found"),
+                        )
+                        .await;
+                }
+
                 let (status, response) = self
                     .handle_add_update_mapping(&method, &path_segments)
                     .await;
