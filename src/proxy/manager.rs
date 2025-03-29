@@ -271,84 +271,6 @@ impl ManagerProxy {
         }
     }
 
-    async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {
-        // Read the request body
-        let mut body = Vec::new();
-        loop {
-            match session.downstream_session.read_request_body().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                Ok(None) => break,
-                Err(e) => {
-                    return self
-                        .send_json_response(
-                            session,
-                            http::StatusCode::BAD_REQUEST,
-                            Self::error_response(&format!("Failed to read request body: {}", e)),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Parse certificate request
-        let request: CertificateRequest = match serde_json::from_slice(&body) {
-            Ok(req) => req,
-            Err(e) => {
-                return self
-                    .send_json_response(
-                        session,
-                        http::StatusCode::BAD_REQUEST,
-                        Self::error_response(&format!("Invalid request format: {}", e)),
-                    )
-                    .await;
-            }
-        };
-
-        // Create a request file for the external certificate manager
-        let request_dir = "/pingora-proxy/cert_requests";
-        std::fs::create_dir_all(request_dir).ok();
-
-        let filename = format!(
-            "{}/{}_{}.req",
-            request_dir,
-            request.domain.replace(".", "_"),
-            chrono::Utc::now().timestamp()
-        );
-
-        let request_content = format!(
-            "domain={}\nemail={}\nwildcard={}\n",
-            request.domain,
-            request.email,
-            request.wildcard.unwrap_or(false)
-        );
-
-        match std::fs::write(&filename, request_content) {
-            Ok(_) => {
-                let response = ApiResponse {
-                    status: "success".to_string(),
-                    error: None,
-                    message: Some(format!(
-                        "Certificate request for {} submitted",
-                        request.domain
-                    )),
-                    mappings: None,
-                    health: None,
-                };
-
-                self.send_json_response(session, http::StatusCode::OK, response)
-                    .await
-            }
-            Err(e) => {
-                self.send_json_response(
-                    session,
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Self::error_response(&format!("Failed to submit request: {}", e)),
-                )
-                .await
-            }
-        }
-    }
-
     // Handle certificate requests
     async fn handle_certificate_request(
         &self,
@@ -523,7 +445,10 @@ impl ManagerProxy {
                         .await;
                 }
 
-                let domain = &path_segments[2];
+                // Clean the domain parameter to remove any trailing commas or whitespace
+                let domain =
+                    path_segments[2].trim_end_matches(|c| c == ',' || c == ' ' || c == ';');
+
                 let issuer = match CertificateIssuer::new("/certbot/letsencrypt", "certs") {
                     Ok(issuer) => issuer,
                     Err(e) => {
@@ -543,7 +468,7 @@ impl ManagerProxy {
                 let mut status = match issuer.check_certificate(domain) {
                     Some(status) => status,
                     None => CertificateStatus {
-                        domain: domain.clone(),
+                        domain: domain.to_string().clone(),
                         status: "not_found".to_string(),
                         cert_path: None,
                         key_path: None,

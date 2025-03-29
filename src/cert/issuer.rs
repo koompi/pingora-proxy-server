@@ -232,11 +232,30 @@ impl CertificateIssuer {
 
     // Check if a valid certificate already exists
     pub fn check_certificate(&self, domain: &str) -> Option<CertificateStatus> {
-        let live_dir = self.certbot_dir.join("live").join(domain);
+        // Remove any trailing commas or whitespace
+        let clean_domain = domain.trim_end_matches(|c| c == ',' || c == ' ');
+
+        let live_dir = self.certbot_dir.join("live").join(clean_domain);
         let cert_path = live_dir.join("fullchain.pem");
         let key_path = live_dir.join("privkey.pem");
 
+        println!("Checking certificate at: {:?}", cert_path);
+
         if cert_path.exists() && key_path.exists() {
+            // Check if files are symlinks and resolve them
+            let real_cert_path = match std::fs::read_link(&cert_path) {
+                Ok(link_path) => live_dir.join(link_path),
+                Err(_) => cert_path.clone(),
+            };
+
+            let real_key_path = match std::fs::read_link(&key_path) {
+                Ok(link_path) => live_dir.join(link_path),
+                Err(_) => key_path.clone(),
+            };
+
+            println!("Real cert path: {:?}", real_cert_path);
+            println!("Real key path: {:?}", real_key_path);
+
             // Check certificate expiry
             match self.get_cert_expiry(&cert_path) {
                 Ok(expiry) => {
@@ -246,7 +265,7 @@ impl CertificateIssuer {
                     // If certificate expires in more than 30 days, it's valid
                     if expiry > now + thirty_days {
                         return Some(CertificateStatus {
-                            domain: domain.to_string(),
+                            domain: clean_domain.to_string(),
                             status: "valid".to_string(),
                             cert_path: Some(cert_path.to_string_lossy().to_string()),
                             key_path: Some(key_path.to_string_lossy().to_string()),
@@ -258,7 +277,7 @@ impl CertificateIssuer {
 
                     // Certificate exists but expires soon
                     return Some(CertificateStatus {
-                        domain: domain.to_string(),
+                        domain: clean_domain.to_string(),
                         status: "expiring_soon".to_string(),
                         cert_path: Some(cert_path.to_string_lossy().to_string()),
                         key_path: Some(key_path.to_string_lossy().to_string()),
@@ -267,15 +286,15 @@ impl CertificateIssuer {
                         is_wildcard: None, // Will be set by the caller
                     });
                 }
-                Err(_) => {
+                Err(e) => {
                     // Certificate exists but can't read expiry
                     return Some(CertificateStatus {
-                        domain: domain.to_string(),
+                        domain: clean_domain.to_string(),
                         status: "unknown_expiry".to_string(),
                         cert_path: Some(cert_path.to_string_lossy().to_string()),
                         key_path: Some(key_path.to_string_lossy().to_string()),
                         expiry: None,
-                        error: Some("Could not determine certificate expiry".to_string()),
+                        error: Some(format!("Could not determine certificate expiry: {}", e)),
                         is_wildcard: None, // Will be set by the caller
                     });
                 }

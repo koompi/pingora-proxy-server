@@ -23,7 +23,6 @@ use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
 
 const MAX_RETRIES: u32 = 3;
-const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 async fn get_config_with_retry() -> Result<ConfigStore> {
     let mut retries = 0;

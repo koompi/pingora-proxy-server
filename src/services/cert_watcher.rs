@@ -1,7 +1,7 @@
 // src/services/cert_watcher.rs
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use log::{error, info};
