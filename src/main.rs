@@ -1,7 +1,8 @@
 use anyhow::Result;
 use log::{error, warn};
+use services::letsencrypt::LetsEncryptService;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -144,6 +145,45 @@ fn main() {
     // Add the HTTP and manager services to the server
     server.add_service(http_service);
     server.add_service(manager_service);
+
+    // Initialize Let's Encrypt service
+    let certbot_dir = PathBuf::from("/certbot/letsencrypt");
+    let email =
+        std::env::var("LETSENCRYPT_EMAIL").unwrap_or_else(|_| "admin@example.com".to_string());
+
+    // Check if the Let's Encrypt service is enabled
+    let enable_letsencrypt = std::env::var("ENABLE_LETSENCRYPT")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(true); // Enable by default
+
+    if enable_letsencrypt {
+        // Create Let's Encrypt service
+        let mut letsencrypt_service = LetsEncryptService::new(
+            config_store.clone(),
+            certbot_dir,
+            email,
+            // Check every 12 hours by default (configurable via env var)
+            std::env::var("LETSENCRYPT_CHECK_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(12 * 60 * 60),
+        );
+
+        // Add Cloudflare credentials if available
+        let cloudflare_api_token = std::env::var("CLOUDFLARE_API_TOKEN").ok();
+        let cloudflare_api_key = std::env::var("CLOUDFLARE_API_KEY").ok();
+        let cloudflare_api_email = std::env::var("CLOUDFLARE_API_EMAIL").ok();
+
+        letsencrypt_service = letsencrypt_service.with_cloudflare_credentials(
+            cloudflare_api_token,
+            cloudflare_api_key,
+            cloudflare_api_email,
+        );
+
+        // Add the service to the server
+        server.add_service(letsencrypt_service);
+        println!("Let's Encrypt certificate service added");
+    }
 
     if !disable_ssl {
         // First, create a standard HttpsProxy instance

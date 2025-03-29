@@ -27,7 +27,7 @@ services:
       - /tmp:/tmp
       - /var/cache:/var/cache
       - cert_reload:/pingora-proxy/cert-reload:rw
-
+      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
@@ -76,6 +76,7 @@ services:
       - /mnt/gluster/certbot:/certbot
       - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
     entrypoint:
       [
         "bash",

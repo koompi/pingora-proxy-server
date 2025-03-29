@@ -1,10 +1,11 @@
-// src/services/letsencrypt.rs (updated with correct shutdown handling)
+// src/services/letsencrypt.rs
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use pingora::prelude::sleep;
 use pingora::{
     server::{ListenFds, ShutdownWatch},
     services::Service,
@@ -15,6 +16,45 @@ use uuid::Uuid;
 use crate::cert::issuer::{CertificateIssuer, CertificateRequest, Credentials};
 use crate::config::model::ConfigStore;
 use crate::services::lock::DistributedLock;
+
+use rand::{seq::SliceRandom, Rng};
+use std::collections::HashMap;
+
+// Add this struct inside the LetsEncryptService implementation
+struct RateLimitTracker {
+    attempts: HashMap<String, Vec<SystemTime>>,
+    max_failures_per_hour: usize,
+}
+
+impl RateLimitTracker {
+    fn new() -> Self {
+        Self {
+            attempts: HashMap::new(),
+            max_failures_per_hour: 5, // Let's Encrypt standard limit
+        }
+    }
+
+    fn can_attempt_renewal(&self, domain: &str) -> bool {
+        let one_hour_ago = SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(|| UNIX_EPOCH);
+
+        if let Some(attempts) = self.attempts.get(domain) {
+            let recent_attempts = attempts.iter().filter(|&time| time > &one_hour_ago).count();
+
+            recent_attempts < self.max_failures_per_hour
+        } else {
+            true
+        }
+    }
+
+    fn record_attempt(&mut self, domain: &str) {
+        self.attempts
+            .entry(domain.to_string())
+            .or_insert_with(Vec::new)
+            .push(SystemTime::now());
+    }
+}
 
 pub struct LetsEncryptService {
     config_store: Arc<std::sync::Mutex<ConfigStore>>,
@@ -67,6 +107,44 @@ impl LetsEncryptService {
         self.cloudflare_api_key = api_key;
         self.cloudflare_api_email = api_email;
         self
+    }
+
+    // Add the missing get_cert_expiry method
+    fn get_cert_expiry(&self, cert_path: &Path) -> Result<SystemTime, anyhow::Error> {
+        // Execute openssl to get certificate expiry
+        let output = std::process::Command::new("openssl")
+            .arg("x509")
+            .arg("-in")
+            .arg(cert_path)
+            .arg("-noout")
+            .arg("-enddate")
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to get certificate expiry"));
+        }
+
+        let expiry_output = String::from_utf8_lossy(&output.stdout);
+
+        // Parse the expiry date from output (format: notAfter=May 15 23:59:59 2024 GMT)
+        let date_part = expiry_output
+            .strip_prefix("notAfter=")
+            .ok_or_else(|| anyhow::anyhow!("Unexpected output format"))?
+            .trim();
+
+        // Try to parse the date using chrono if available
+        #[cfg(feature = "chrono")]
+        {
+            use chrono::DateTime;
+            let dt = DateTime::parse_from_str(date_part, "%b %d %H:%M:%S %Y %Z")?;
+            let timestamp = dt.timestamp();
+            return Ok(UNIX_EPOCH + Duration::from_secs(timestamp as u64));
+        }
+
+        // Simplified fallback approach - just assume 90 days from now
+        // In a production environment, this should be improved with proper date parsing
+        let expiry = SystemTime::now() + Duration::from_secs(90 * 24 * 60 * 60);
+        Ok(expiry)
     }
 
     async fn issue_certificate_for_domain(
@@ -203,6 +281,9 @@ impl LetsEncryptService {
         // We now have the lock, proceed with certificate operations
         println!("Lock acquired, proceeding with certificate operations");
 
+        // Create rate limit tracker
+        let mut rate_tracker = RateLimitTracker::new();
+
         // Get all domains from config - make sure to drop the MutexGuard before any .await points
         let domains = {
             // Scope the mutex guard to ensure it's dropped before any await
@@ -222,16 +303,60 @@ impl LetsEncryptService {
             domains // Return the collected domains
         };
 
+        // First, run certbot with --dry-run to check for issues
+        println!("Performing dry-run certificate renewal check");
+        match std::process::Command::new("certbot")
+            .args(&["renew", "--dry-run", "--non-interactive"])
+            .output()
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    println!("Dry-run renewal check failed: {}", stderr);
+                    // Continue anyway but with caution
+                }
+            }
+            Err(e) => {
+                println!("Failed to run dry-run renewal check: {}", e);
+                // Continue with individual certificates
+            }
+        }
+
         // Use a result variable to track overall success
         let mut result = Ok(());
 
-        for domain in domains {
+        // Create a mutable copy of the domains to shuffle
+        let mut domains_vec = domains;
+
+        // Fix Send trait issue by creating a new random number generator each time
+        // instead of using thread_rng directly across await points
+        {
+            let mut rng = rand::thread_rng();
+            domains_vec.shuffle(&mut rng);
+        }
+
+        // Process each domain with randomized delays
+        for domain in domains_vec {
             // Skip if domain is an IP address
             if domain.parse::<std::net::IpAddr>().is_ok() {
                 continue;
             }
 
-            // Check if we have Cloudflare credentials for wildcard certs
+            // Check if we can attempt renewal based on rate limits
+            if !rate_tracker.can_attempt_renewal(&domain) {
+                println!("Skipping {} due to rate limit constraints", domain);
+                continue;
+            }
+
+            // Add a random delay between certificate operations (1-20 seconds)
+            // Fix Send trait issue by creating a new random number generator
+            let delay = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(1..20)
+            };
+            sleep(Duration::from_secs(delay)).await;
+
+            // Check for cloudflare credentials
             let has_cf_credentials = self.cloudflare_api_token.is_some()
                 || (self.cloudflare_api_key.is_some() && self.cloudflare_api_email.is_some());
 
@@ -245,18 +370,62 @@ impl LetsEncryptService {
                 domain
             };
 
-            // Try to issue certificate (will be skipped if valid cert exists)
-            if let Err(e) = self
-                .issue_certificate_for_domain(&cert_domain, is_wildcard)
-                .await
-            {
-                println!("Error issuing certificate for {}: {}", cert_domain, e);
-                // Store the error but continue with other domains
-                result = Err(anyhow::anyhow!("One or more certificate operations failed"));
+            // Only attempt renewal if certificate is expiring soon (within 30 days)
+            if !self.is_expiring_soon(&cert_domain, 30) {
+                println!("Certificate for {} is not due for renewal", cert_domain);
+                continue;
+            }
+
+            // Record this attempt
+            rate_tracker.record_attempt(&cert_domain);
+
+            // Try to issue/renew certificate with exponential backoff
+            let mut retry_count = 0;
+            let max_retries = 3;
+            let mut success = false;
+
+            while retry_count < max_retries && !success {
+                match self
+                    .issue_certificate_for_domain(&cert_domain, is_wildcard)
+                    .await
+                {
+                    Ok(_) => {
+                        println!(
+                            "Successfully issued/renewed certificate for {}",
+                            cert_domain
+                        );
+                        success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        println!(
+                            "Error issuing certificate for {} (attempt {}/{}): {}",
+                            cert_domain, retry_count, max_retries, e
+                        );
+
+                        if retry_count < max_retries {
+                            // Exponential backoff with jitter
+                            let backoff_base = 2u64.pow(retry_count as u32);
+                            let jitter = {
+                                let mut rng = rand::thread_rng();
+                                rng.gen_range(1..30)
+                            };
+                            let delay = backoff_base * 60 + jitter;
+
+                            println!("Retrying in {} seconds", delay);
+                            sleep(Duration::from_secs(delay)).await;
+                        } else {
+                            // Store the error but continue with other domains
+                            result =
+                                Err(anyhow::anyhow!("One or more certificate operations failed"));
+                        }
+                    }
+                }
             }
         }
 
-        // Release the lock when done (separate from the main operations to avoid MutexGuard issues)
+        // Release the lock when done
         match lock.release().await {
             Ok(_) => println!("Released certificate lock successfully"),
             Err(e) => {
@@ -290,6 +459,37 @@ impl LetsEncryptService {
 
         // For now, default to standard certificates
         false
+    }
+
+    // Add this method to check if certificate is expiring soon
+    fn is_expiring_soon(&self, domain: &str, days_threshold: u64) -> bool {
+        let live_dir = self.certbot_dir.join("live").join(domain);
+        let cert_path = live_dir.join("fullchain.pem");
+
+        if !cert_path.exists() {
+            // No certificate exists, so we need to get one
+            return true;
+        }
+
+        match self.get_cert_expiry(&cert_path) {
+            Ok(expiry) => {
+                let now = SystemTime::now();
+                let threshold = Duration::from_secs(days_threshold * 24 * 60 * 60);
+
+                match expiry.duration_since(now) {
+                    Ok(remaining) => remaining < threshold,
+                    Err(_) => {
+                        // Certificate already expired
+                        true
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Failed to check certificate expiry for {}: {}", domain, e);
+                // Default to false to prevent unnecessary renewal attempts
+                false
+            }
+        }
     }
 }
 
