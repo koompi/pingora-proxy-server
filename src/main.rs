@@ -134,6 +134,7 @@ fn main() {
         &server.configuration,
         ManagerProxy {
             servers: config_store.clone(),
+            https_proxy: None,
         },
     );
 

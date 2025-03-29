@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
 use crate::metrics::PROXY_METRICS;
+use crate::proxy::https::HttpsProxy;
 use crate::{
     cert::certbot,
     config::file_manager::{create_mappings_from_store, update_config},
@@ -65,6 +66,7 @@ struct ComponentHealth {
 #[derive(Clone)]
 pub struct ManagerProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
+    pub https_proxy: Option<HttpsProxy>,
 }
 
 /// Manager for handling proxy configuration and certificate operations.
@@ -167,12 +169,13 @@ impl ManagerProxy {
     async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
         println!("Received certificate reload request");
 
-        // Implementation approaches:
-        // 1. Create a file that triggers the monitor to reload certs
-        std::fs::write("/pingora-proxy/reload_certs", "reload").ok();
-
-        // 2. For immediate reload, you could directly call a reload function here
-        // but careful not to create nested runtime issues
+        // Actually reload the certificates using the HttpsProxy method
+        if let Some(https_proxy) = &self.https_proxy {
+            match https_proxy.reload_certificates().await {
+                Ok(_) => println!("Certificates reloaded successfully"),
+                Err(e) => println!("Error reloading certificates: {:?}", e),
+            }
+        }
 
         // Return success response
         let response = ApiResponse {
@@ -918,25 +921,19 @@ impl ProxyHttp for ManagerProxy {
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let pathname = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
-        // Check for certificate reload endpoint - special case
-        if pathname == "/admin/reload_certs" {
-            println!("Processing certificate reload request");
+        // Split path into segments
+        let path_segments: Vec<String> = pathname
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        // Check for certificate reload endpoint first
+        if path_segments.len() >= 2
+            && path_segments[0] == "admin"
+            && path_segments[1] == "reload_certs"
+        {
             return self.handle_reload_certificates(session).await;
-        }
-
-        // Split path into segments for other endpoints
-        let path_segments: Vec<String> = pathname.split('/').map(|seg| seg.to_string()).collect();
-
-        // Handle certificate endpoints
-        if path_segments.len() > 1 && path_segments[1].starts_with("certificates") {
-            let clean_segments: Vec<String> = path_segments
-                .iter()
-                .map(|s| s.trim_end_matches(",").to_string())
-                .collect();
-
-            return self
-                .handle_certificate_request(session, &method, &clean_segments)
-                .await;
         }
 
         // Handle standard route management endpoints
