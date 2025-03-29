@@ -198,7 +198,30 @@ impl ManagerProxy {
         // First, reload certificates locally
         if let Some(https_proxy) = &self.https_proxy {
             match https_proxy.reload_certificates().await {
-                Ok(_) => info!("Local certificate reload successful"),
+                Ok(_) => {
+                    info!("Local certificate reload successful");
+
+                    // Create reload notification file for other nodes
+                    let reload_status_path =
+                        std::path::Path::new("/pingora-proxy/cert-reload/last_reload");
+                    if let Some(parent) = reload_status_path.parent() {
+                        if !parent.exists() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                    }
+
+                    // Write timestamp to trigger other nodes
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if let Err(e) = std::fs::write(reload_status_path, now.to_string()) {
+                        error!("Failed to create reload notification: {}", e);
+                    }
+
+                    info!("Certificate reload notification created for other nodes");
+                }
                 Err(e) => {
                     error!("Local certificate reload failed: {:?}", e);
                     return self
@@ -217,16 +240,13 @@ impl ManagerProxy {
                 }
             }
 
-            // The certificate watcher service on each node will pick up this change
-            info!("Certificate reload notification created - all nodes will reload");
-
             return self.send_json_response(
                 session,
                 http::StatusCode::OK,
                 ApiResponse {
                     status: "success".to_string(),
                     error: None,
-                    message: Some("Certificate reload completed. All nodes will pick up changes within 15 seconds.".to_string()),
+                    message: Some("Certificate reload completed successfully. All nodes will pick up changes within 15 seconds.".to_string()),
                     mappings: Some(self.get_current_mappings()),
                     health: None,
                 },
@@ -240,7 +260,9 @@ impl ManagerProxy {
                     ApiResponse {
                         status: "error".to_string(),
                         error: Some("HTTPS proxy not configured".to_string()),
-                        message: None,
+                        message: Some(
+                            "The SSL/TLS functionality is not enabled on this instance".to_string(),
+                        ),
                         mappings: None,
                         health: None,
                     },
@@ -997,6 +1019,8 @@ impl ProxyHttp for ManagerProxy {
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let path = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
+        println!("Processing request: {} {}", method, path);
+
         // Split path into segments for other operations
         let path_segments: Vec<String> = path
             .split('/')
@@ -1004,12 +1028,12 @@ impl ProxyHttp for ManagerProxy {
             .map(|s| s.to_string())
             .collect();
 
-        // Handle admin reload endpoint
-        if path_segments.len() >= 2
-            && path_segments[0] == "admin"
-            && path_segments[1] == "reload_certs"
-        {
-            info!("Handling admin certificate reload request");
+        // Debug what path segments we're getting
+        println!("Path segments: {:?}", path_segments);
+
+        // Explicitly handle the exact admin/reload_certs path
+        if path == "/admin/reload_certs" || path == "/admin/reload_certs/" {
+            info!("Handling exact admin certificate reload request");
             return self.handle_reload_certificates(session).await;
         }
 
@@ -1023,13 +1047,18 @@ impl ProxyHttp for ManagerProxy {
         // Handle standard operations
         match method.as_str() {
             "POST" | "PUT" => {
-                // Make sure we skip admin paths
-                if !path_segments.is_empty() && path_segments[0] == "admin" {
+                // Check explicitly for admin paths
+                if path.starts_with("/admin") {
+                    info!("Caught admin path: {}", path);
+                    if path.starts_with("/admin/reload_certs") {
+                        return self.handle_reload_certificates(session).await;
+                    }
+
                     return self
                         .send_json_response(
                             session,
                             http::StatusCode::NOT_FOUND,
-                            Self::error_response("Not found"),
+                            Self::error_response("Admin endpoint not found"),
                         )
                         .await;
                 }
