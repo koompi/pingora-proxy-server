@@ -19,6 +19,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
       - /mnt/gluster/proxy-config:/app/config
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
@@ -70,6 +71,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
     entrypoint:
       [
