@@ -170,27 +170,47 @@ impl ManagerProxy {
     }
 
     async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
-        println!("Received certificate reload request");
+        println!("Processing certificate reload request");
 
-        // Actually reload the certificates using the HttpsProxy method
+        // Trigger certificate reload
         if let Some(https_proxy) = &self.https_proxy {
             match https_proxy.reload_certificates().await {
-                Ok(_) => println!("Certificates reloaded successfully"),
-                Err(e) => println!("Error reloading certificates: {:?}", e),
+                Ok(_) => {
+                    println!("Certificates reloaded successfully");
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::OK,
+                            ApiResponse {
+                                status: "success".to_string(),
+                                error: None,
+                                message: Some("Certificates reloaded successfully".to_string()),
+                                mappings: None,
+                                health: None,
+                            },
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    println!("Error reloading certificates: {:?}", e);
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Self::error_response("Failed to reload certificates"),
+                        )
+                        .await;
+                }
             }
         }
 
-        // Return success response
-        let response = ApiResponse {
-            status: "success".to_string(),
-            error: None,
-            message: Some("Certificate reload triggered".to_string()),
-            mappings: None,
-            health: None,
-        };
-
-        self.send_json_response(session, http::StatusCode::OK, response)
-            .await
+        // If HTTPS proxy is not configured
+        self.send_json_response(
+            session,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::error_response("HTTPS proxy not configured"),
+        )
+        .await
     }
 
     async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {
@@ -923,56 +943,43 @@ impl ProxyHttp for ManagerProxy {
         // Parse request method and path
         let segments = summary.split_whitespace().collect::<Vec<&str>>();
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
-        let pathname = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
+        let path = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
-        // Split path into segments
-        let path_segments: Vec<String> = pathname
+        // Handle certificate reload endpoint first
+        if method == "PATCH" && path == "/admin/reload_certs" {
+            return self.handle_reload_certificates(session).await;
+        }
+
+        // Split path into segments for other operations
+        let path_segments: Vec<String> = path
             .split('/')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
 
-        // Handle different request types
+        // Handle standard operations
         match method.as_str() {
-            // Handle certificate operations with PATCH
-            "PATCH" => {
-                if path_segments.len() >= 2
-                    && path_segments[0] == "admin"
-                    && path_segments[1] == "reload_certs"
-                {
-                    return self.handle_reload_certificates(session).await;
-                }
-                return self
-                    .send_json_response(
-                        session,
-                        http::StatusCode::NOT_FOUND,
-                        Self::error_response("Invalid PATCH endpoint"),
-                    )
-                    .await;
-            }
-            // Handle standard mapping operations
             "PUT" | "POST" => {
                 let (status, response) = self
                     .handle_add_update_mapping(&method, &path_segments)
                     .await;
-                return self.send_json_response(session, status, response).await;
+                self.send_json_response(session, status, response).await
             }
             "DELETE" => {
                 let (status, response) = self.handle_delete_mapping(&path_segments).await;
-                return self.send_json_response(session, status, response).await;
+                self.send_json_response(session, status, response).await
             }
             "GET" => {
                 let (status, response) = self.handle_list_mappings().await;
-                return self.send_json_response(session, status, response).await;
+                self.send_json_response(session, status, response).await
             }
             _ => {
-                return self
-                    .send_json_response(
-                        session,
-                        http::StatusCode::METHOD_NOT_ALLOWED,
-                        Self::error_response("Method not allowed"),
-                    )
-                    .await;
+                self.send_json_response(
+                    session,
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    Self::error_response("Method not allowed"),
+                )
+                .await
             }
         }
     }
