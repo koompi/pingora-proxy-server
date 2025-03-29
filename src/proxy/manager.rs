@@ -233,32 +233,59 @@ impl ManagerProxy {
                 .await;
         }
 
+        // Add debug logging for file creation
+        let cert_renewed_path = "/pingora-proxy/cert_renewed";
+        info!(
+            "Attempting to create reload signal file at: {}",
+            cert_renewed_path
+        );
+
+        // Create directory if it doesn't exist
+        if let Err(e) = std::fs::create_dir_all("/pingora-proxy") {
+            error!("Failed to create directory for reload signal: {:?}", e);
+        }
+
         // Signal other nodes to reload certificates
-        // Method 1: Create a timestamp file that other nodes will detect
         if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            if let Err(e) = std::fs::write(
-                "/pingora-proxy/cert_renewed",
-                timestamp.as_secs().to_string(),
-            ) {
-                error!("Failed to create reload signal file: {:?}", e);
+            let timestamp_str = timestamp.as_secs().to_string();
+            match std::fs::write(cert_renewed_path, &timestamp_str) {
+                Ok(_) => info!(
+                    "Successfully created reload signal file with timestamp: {}",
+                    timestamp_str
+                ),
+                Err(e) => error!("Failed to create reload signal file: {:?}", e),
             }
         }
 
-        // Method 2: Try to signal via Docker Swarm
+        // Try to signal via Docker Swarm
         if let Ok(service_name) = std::env::var("PROXY_SERVICE_NAME") {
+            info!("Attempting to signal Docker service: {}", service_name);
             use std::process::Command;
             match Command::new("docker")
                 .args(&["service", "update", "--force", &service_name])
                 .output()
             {
-                Ok(_) => info!("Triggered service update for certificate reload"),
+                Ok(output) => {
+                    info!(
+                        "Docker service update result: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    if !output.stderr.is_empty() {
+                        warn!(
+                            "Docker service update stderr: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
                 Err(e) => error!("Failed to trigger service update: {:?}", e),
             }
+        } else {
+            info!("PROXY_SERVICE_NAME not set, skipping Docker service update");
         }
 
         info!("=== Certificate Reload Completed ===");
 
-        // Return success response with current mappings
+        // Return success response
         self.send_json_response(
             session,
             http::StatusCode::OK,
@@ -358,6 +385,10 @@ impl ManagerProxy {
         method: &str,
         path_segments: &[String],
     ) -> Result<bool> {
+        if path_segments.get(0).map(|s| s.as_str()) == Some("reload-ssl") {
+            info!("Handling certificate reload request");
+            return self.handle_reload_certificates(session).await;
+        }
         match method {
             // Request a new certificate
             "POST" => {
@@ -572,6 +603,12 @@ impl ManagerProxy {
 
             // Method not supported
             _ => {
+                // For any other method, if it's /reload-ssl, handle it
+                if path_segments.get(0).map(|s| s.as_str()) == Some("reload-ssl") {
+                    info!("Handling certificate reload request via {}", method);
+                    return self.handle_reload_certificates(session).await;
+                }
+
                 self.send_json_response(
                     session,
                     http::StatusCode::METHOD_NOT_ALLOWED,
@@ -1005,17 +1042,19 @@ impl ProxyHttp for ManagerProxy {
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let path = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
-        // Handle SSL reload endpoint with a simple path
-        if path == "/reload-ssl" {
-            return self.handle_reload_certificates(session).await;
-        }
-
         // Split path into segments for other operations
         let path_segments: Vec<String> = path
             .split('/')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
+
+        // Handle certificate-related requests
+        if path.starts_with("/cert") || path.starts_with("/reload-ssl") {
+            return self
+                .handle_certificate_request(session, &method, &path_segments)
+                .await;
+        }
 
         // Handle standard operations
         match method.as_str() {
