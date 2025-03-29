@@ -154,10 +154,13 @@ impl ManagerProxy {
 
     // Extract clean domain and backend from path segments
     fn extract_domain_and_backend(&self, path_segments: &[String]) -> (String, String) {
-        let from = path_segments.get(1).unwrap_or(&String::new()).clone();
+        // For paths like /test2003.koompi.cloud/192.168.1.109:3002
+        // path_segments[0] will be "test2003.koompi.cloud"
+        // path_segments[1] will be "192.168.1.109:3002"
 
+        let from = path_segments.get(0).unwrap_or(&String::new()).clone();
         let to = path_segments
-            .get(2)
+            .get(1)
             .unwrap_or(&String::new())
             .clone()
             .trim_end_matches(|c| c == ',' || c == ' ' || c == ';')
@@ -505,6 +508,14 @@ impl ManagerProxy {
         method: &str,
         path_segments: &[String],
     ) -> (http::StatusCode, ApiResponse) {
+        // Skip if this is an admin endpoint
+        if !path_segments.is_empty() && path_segments[0] == "admin" {
+            return (
+                http::StatusCode::BAD_REQUEST,
+                Self::error_response("Invalid request path"),
+            );
+        }
+
         let (from, to) = self.extract_domain_and_backend(path_segments);
 
         println!("Processing {} request: mapping {} -> {}", method, from, &to);
@@ -516,15 +527,20 @@ impl ManagerProxy {
             );
         }
 
+        // Validate the backend address format (host:port)
+        if !to.contains(':') {
+            return (
+                http::StatusCode::BAD_REQUEST,
+                Self::error_response("Backend address must be in format host:port"),
+            );
+        }
+
         match self.servers.lock() {
             Ok(mut servers) => {
                 // Mark this mapping as manually added
                 servers.insert(from.clone(), (to.clone(), MappingOrigin::Manual));
 
-                // Important: Only create mappings for THIS manual addition
-                // Don't use create_mappings_from_store here as it will overwrite everything
-
-                // Instead, properly merge with existing config
+                // Update config file
                 let config_path =
                     std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.json".to_string());
                 let mut current_config = match std::fs::read_to_string(&config_path) {
@@ -551,17 +567,14 @@ impl ManagerProxy {
                     });
                 }
 
-                // Write updated config back to file
+                // Save updated config
                 match serde_json::to_string_pretty(&current_config) {
-                    Ok(data) => {
-                        if let Err(e) = std::fs::write(&config_path, data) {
-                            println!("Error writing config: {}", e);
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&config_path, json) {
+                            println!("Error writing config file: {}", e);
                             return (
                                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                                Self::error_response(&format!(
-                                    "Failed to persist configuration: {}",
-                                    e
-                                )),
+                                Self::error_response("Failed to save configuration"),
                             );
                         }
                     }
@@ -569,20 +582,11 @@ impl ManagerProxy {
                         println!("Error serializing config: {}", e);
                         return (
                             http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Self::error_response(&format!(
-                                "Failed to serialize configuration: {}",
-                                e
-                            )),
+                            Self::error_response("Failed to serialize configuration"),
                         );
                     }
                 }
 
-                println!(
-                    "{} mapping: {} -> {} (Manual)",
-                    if method == "POST" { "Added" } else { "Updated" },
-                    from,
-                    &to
-                );
                 (http::StatusCode::OK, Self::success_response())
             }
             Err(e) => {
