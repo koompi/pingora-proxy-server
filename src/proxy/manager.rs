@@ -193,7 +193,7 @@ impl ManagerProxy {
     }
 
     async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
-        info!("=== Certificate Reload Started ===");
+        info!("=== Certificate Reload Initiated ===");
 
         // First, reload certificates locally
         if let Some(https_proxy) = &self.https_proxy {
@@ -216,6 +216,21 @@ impl ManagerProxy {
                         .await;
                 }
             }
+
+            // The certificate watcher service on each node will pick up this change
+            info!("Certificate reload notification created - all nodes will reload");
+
+            return self.send_json_response(
+                session,
+                http::StatusCode::OK,
+                ApiResponse {
+                    status: "success".to_string(),
+                    error: None,
+                    message: Some("Certificate reload completed. All nodes will pick up changes within 15 seconds.".to_string()),
+                    mappings: Some(self.get_current_mappings()),
+                    health: None,
+                },
+            ).await;
         } else {
             error!("HTTPS proxy not configured");
             return self
@@ -232,72 +247,6 @@ impl ManagerProxy {
                 )
                 .await;
         }
-
-        // Add debug logging for file creation
-        let cert_renewed_path = "/pingora-proxy/cert_renewed";
-        info!(
-            "Attempting to create reload signal file at: {}",
-            cert_renewed_path
-        );
-
-        // Create directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all("/pingora-proxy") {
-            error!("Failed to create directory for reload signal: {:?}", e);
-        }
-
-        // Signal other nodes to reload certificates
-        if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            let timestamp_str = timestamp.as_secs().to_string();
-            match std::fs::write(cert_renewed_path, &timestamp_str) {
-                Ok(_) => info!(
-                    "Successfully created reload signal file with timestamp: {}",
-                    timestamp_str
-                ),
-                Err(e) => error!("Failed to create reload signal file: {:?}", e),
-            }
-        }
-
-        // Try to signal via Docker Swarm
-        if let Ok(service_name) = std::env::var("PROXY_SERVICE_NAME") {
-            info!("Attempting to signal Docker service: {}", service_name);
-            use std::process::Command;
-            match Command::new("docker")
-                .args(&["service", "update", "--force", &service_name])
-                .output()
-            {
-                Ok(output) => {
-                    info!(
-                        "Docker service update result: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                    if !output.stderr.is_empty() {
-                        warn!(
-                            "Docker service update stderr: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                }
-                Err(e) => error!("Failed to trigger service update: {:?}", e),
-            }
-        } else {
-            info!("PROXY_SERVICE_NAME not set, skipping Docker service update");
-        }
-
-        info!("=== Certificate Reload Completed ===");
-
-        // Return success response
-        self.send_json_response(
-            session,
-            http::StatusCode::OK,
-            ApiResponse {
-                status: "success".to_string(),
-                error: None,
-                message: Some("Certificate reload completed successfully".to_string()),
-                mappings: Some(self.get_current_mappings()),
-                health: None,
-            },
-        )
-        .await
     }
 
     async fn handle_submit_certificate_request(&self, session: &mut Session) -> Result<bool> {

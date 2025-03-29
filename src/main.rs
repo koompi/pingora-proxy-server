@@ -146,16 +146,19 @@ fn main() {
     server.add_service(http_service);
     server.add_service(manager_service);
 
-    // Initial check for existing certificates
     if !disable_ssl {
-        // Create HTTPS service directly here
-        let mut https_service = pingora_proxy::http_proxy_service(
-            &server.configuration,
-            HttpsProxy {
-                servers: config_store.clone(),
-                cert_cache: Arc::new(Mutex::new(HashMap::new())),
-            },
-        );
+        // First, create a standard HttpsProxy instance
+        let https_proxy = HttpsProxy {
+            servers: config_store.clone(),
+            cert_cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Create a shared reference to the proxy for our watcher service
+        let shared_proxy = Arc::new(https_proxy.clone());
+
+        // Create the service with the standard (non-Arc) instance
+        let mut https_service =
+            pingora_proxy::http_proxy_service(&server.configuration, https_proxy);
 
         // Get domains from config store
         let domains = match config_store.lock() {
@@ -224,6 +227,28 @@ fn main() {
                                 println!("HTTPS service initialized with {} certificates", added);
                                 server.add_service(https_service);
                                 println!("HTTPS service added to server");
+
+                                // Create a new manager service with https_proxy
+                                let mut manager_service = pingora_proxy::http_proxy_service(
+                                    &server.configuration,
+                                    ManagerProxy {
+                                        servers: config_store.clone(),
+                                        https_proxy: Some((*shared_proxy).clone()),
+                                    },
+                                );
+
+                                // Add TCP binding - this will panic internally if it fails
+                                manager_service.add_tcp("0.0.0.0:81");
+                                server.add_service(manager_service);
+                                println!("Manager service updated with HTTPS proxy access");
+
+                                // Create and add the certificate watcher service
+                                let cert_watcher = services::cert_watcher::CertWatcherService::new(
+                                    shared_proxy.clone(),
+                                    15, // Check every 15 seconds
+                                );
+                                server.add_service(cert_watcher);
+                                println!("Certificate watcher service added");
                             }
                             Err(e) => {
                                 println!("Error binding to port 443: {:?}", e);

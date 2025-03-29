@@ -23,9 +23,11 @@ services:
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
       - /mnt/gluster/proxy-config:/app/config
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
+      - /mnt/gluster/pingora-proxy/cert_requests:/pingora-proxy/cert_requests
       - /tmp:/tmp
       - /var/cache:/var/cache
-      - cert_reload:/pingora-proxy:rw
+      - cert_reload:/pingora-proxy/cert-reload:rw
+
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
@@ -209,3 +211,7 @@ volumes:
       device: /mnt/gluster/redis/data
   cert_reload:
     driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/pingora-proxy/cert-reload

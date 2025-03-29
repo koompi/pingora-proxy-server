@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Path,
     str,
     sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -37,29 +38,28 @@ impl HttpsProxy {
     pub async fn reload_certificates(&self) -> Result<()> {
         info!("Starting certificate reload process...");
 
-        // Get current timestamp
+        // Get current timestamp for cache invalidation
         let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(err) => {
                 error!("Failed to get system time: {:?}", err);
-                let err = Error::err::<()>(ErrorType::ConnectRefused);
-                return Err(err).unwrap();
+                return Err(Error::new(ErrorType::ConnectRefused));
             }
         };
 
-        // Lock servers to get domains
-        let servers_guard = match self.servers.lock() {
-            Ok(guard) => guard,
-            Err(err) => {
-                error!("Failed to lock servers: {:?}", err);
-                let err = Error::err::<()>(ErrorType::ConnectRefused);
-                return Err(err).unwrap();
-            }
+        // Domains to check for certificates
+        let domains = {
+            let servers_guard = match self.servers.lock() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    error!("Failed to lock servers: {:?}", err);
+                    return Err(Error::new(ErrorType::ConnectRefused));
+                }
+            };
+            servers_guard.keys().cloned().collect::<Vec<String>>()
         };
 
-        let domains = servers_guard.keys().cloned().collect::<Vec<String>>();
         info!("Reloading certificates for {} domains", domains.len());
-        drop(servers_guard);
 
         // Find certificates for domains
         let certs = certbot::find_certbot_certs(&domains);
@@ -70,31 +70,28 @@ impl HttpsProxy {
             Ok(guard) => guard,
             Err(e) => {
                 error!("Failed to lock cert cache: {:?}", e);
-                let err = Error::err::<()>(ErrorType::ConnectRefused);
-                return Err(err).unwrap();
+                return Err(Error::new(ErrorType::ConnectRefused));
             }
         };
+
+        // Clear existing cache to ensure we reload everything
+        cache_guard.clear();
 
         // Process each certificate
         for cert in certs {
             info!("Processing certificate for domain: {}", cert.domain);
 
-            // Read certificate file
             match std::fs::read(&cert.cert_path) {
-                Ok(cert_data) => {
-                    // Read key file
-                    match std::fs::read(&cert.key_path) {
-                        Ok(key_data) => {
-                            info!("Successfully loaded certificate for: {}", cert.domain);
-                            cache_guard
-                                .insert(cert.domain.clone(), (cert_data, key_data, timestamp));
-                        }
-                        Err(e) => {
-                            error!("Failed to read key file for {}: {:?}", cert.domain, e);
-                            continue;
-                        }
+                Ok(cert_data) => match std::fs::read(&cert.key_path) {
+                    Ok(key_data) => {
+                        info!("Successfully loaded certificate for: {}", cert.domain);
+                        cache_guard.insert(cert.domain.clone(), (cert_data, key_data, timestamp));
                     }
-                }
+                    Err(e) => {
+                        error!("Failed to read key file for {}: {:?}", cert.domain, e);
+                        continue;
+                    }
+                },
                 Err(e) => {
                     error!("Failed to read cert file for {}: {:?}", cert.domain, e);
                     continue;
@@ -106,6 +103,20 @@ impl HttpsProxy {
             "Certificate reload complete. Cache now contains {} certificates",
             cache_guard.len()
         );
+
+        // Write reload status to shared volume for other nodes
+        let reload_status_path = Path::new("/pingora-proxy/cert-reload/last_reload");
+        if let Some(parent) = reload_status_path.parent() {
+            if !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        let reload_info = format!("{}:{}", timestamp, domains.len());
+        if let Err(e) = std::fs::write(reload_status_path, reload_info) {
+            error!("Failed to write reload status: {}", e);
+        }
+
         Ok(())
     }
 
@@ -114,6 +125,49 @@ impl HttpsProxy {
         cache
             .get(domain)
             .map(|(cert, key, _)| (cert.clone(), key.clone()))
+    }
+
+    pub async fn reload_certificate_for_domain(&self, domain: &str) -> Result<()> {
+        info!("Reloading certificate for domain: {}", domain);
+
+        // Get current timestamp
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| {
+                error!("Failed to get system time: {:?}", e);
+                Error::new(ErrorType::ConnectRefused)
+            })
+            .map(|duration| duration.as_secs())?;
+
+        // Find certificate for domain
+        let certs = certbot::find_certbot_certs(&[domain.to_string()]);
+
+        // Lock cert cache for update
+        let mut cache_guard = self.cert_cache.lock().map_err(|e| {
+            error!("Failed to lock cert cache: {:?}", e);
+            Error::new(ErrorType::ConnectRefused)
+        })?;
+
+        // Process certificate if found
+        if let Some(cert) = certs.first() {
+            match (
+                std::fs::read(&cert.cert_path),
+                std::fs::read(&cert.key_path),
+            ) {
+                (Ok(cert_data), Ok(key_data)) => {
+                    info!("Successfully loaded certificate for: {}", domain);
+                    cache_guard.insert(domain.to_string(), (cert_data, key_data, timestamp));
+                    Ok(())
+                }
+                _ => {
+                    error!("Failed to read certificate files for {}", domain);
+                    Err(Error::new(ErrorType::ConnectRefused))
+                }
+            }
+        } else {
+            error!("No certificate found for {}", domain);
+            Err(Error::new(ErrorType::ConnectRefused))
+        }
     }
 }
 
