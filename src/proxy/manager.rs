@@ -193,21 +193,44 @@ impl ManagerProxy {
     }
 
     async fn handle_reload_certificates(&self, session: &mut Session) -> Result<bool> {
-        println!("=== Certificate Reload Started ===");
-        info!("Attempting cluster-wide certificate reload");
+        info!("=== Certificate Reload Started ===");
 
         // First, reload certificates locally
         if let Some(https_proxy) = &self.https_proxy {
-            if let Err(e) = https_proxy.reload_certificates().await {
-                error!("Local certificate reload failed: {:?}", e);
-                return self
-                    .send_json_response(
-                        session,
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Self::error_response(&format!("Local certificate reload failed: {:?}", e)),
-                    )
-                    .await;
+            match https_proxy.reload_certificates().await {
+                Ok(_) => info!("Local certificate reload successful"),
+                Err(e) => {
+                    error!("Local certificate reload failed: {:?}", e);
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ApiResponse {
+                                status: "error".to_string(),
+                                error: Some(format!("Certificate reload failed: {:?}", e)),
+                                message: None,
+                                mappings: None,
+                                health: None,
+                            },
+                        )
+                        .await;
+                }
             }
+        } else {
+            error!("HTTPS proxy not configured");
+            return self
+                .send_json_response(
+                    session,
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiResponse {
+                        status: "error".to_string(),
+                        error: Some("HTTPS proxy not configured".to_string()),
+                        message: None,
+                        mappings: None,
+                        health: None,
+                    },
+                )
+                .await;
         }
 
         // Signal other nodes to reload certificates
@@ -222,7 +245,7 @@ impl ManagerProxy {
         }
 
         // Method 2: Try to signal via Docker Swarm
-        if let Ok(service_name) = std::env::var("SERVICE_NAME") {
+        if let Ok(service_name) = std::env::var("PROXY_SERVICE_NAME") {
             use std::process::Command;
             match Command::new("docker")
                 .args(&["service", "update", "--force", &service_name])
@@ -233,6 +256,8 @@ impl ManagerProxy {
             }
         }
 
+        info!("=== Certificate Reload Completed ===");
+
         // Return success response with current mappings
         self.send_json_response(
             session,
@@ -240,7 +265,7 @@ impl ManagerProxy {
             ApiResponse {
                 status: "success".to_string(),
                 error: None,
-                message: Some("Certificate reload initiated across cluster".to_string()),
+                message: Some("Certificate reload completed successfully".to_string()),
                 mappings: Some(self.get_current_mappings()),
                 health: None,
             },
