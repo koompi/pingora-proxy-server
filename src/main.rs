@@ -19,6 +19,7 @@ mod metrics;
 mod proxy;
 mod services;
 use crate::services::docker_swarm::SwarmDiscoveryService;
+use crate::services::metrics_service::MetricsService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
 use rustls::crypto::ring::default_provider;
@@ -98,6 +99,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Initialize metrics service
+    let metrics_port = std::env::var("METRICS_PORT")
+        .map(|p| p.parse::<u16>().unwrap_or(9100))
+        .unwrap_or(9100);
+
+    // Add metrics service
+    let metrics_service = MetricsService::new(metrics_port);
+    server.add_service(metrics_service);
+    println!("Metrics service configured on port {}", metrics_port);
 
     server.bootstrap();
 

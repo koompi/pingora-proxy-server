@@ -257,7 +257,7 @@ impl CertificateIssuer {
             println!("Real key path: {:?}", real_key_path);
 
             // Check certificate expiry
-            match self.get_cert_expiry(&cert_path) {
+            match self.get_cert_expiry(&cert_path, clean_domain) {
                 Ok(expiry) => {
                     let now = SystemTime::now();
                     let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
@@ -389,6 +389,13 @@ impl CertificateIssuer {
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
             println!("Certbot error: {}", error);
+
+            // Add this line to track failures
+            crate::metrics::PROXY_METRICS
+                .certificate_operations
+                .with_label_values(&[domain, "issue", "failed"])
+                .inc();
+
             return Err(anyhow!("Certbot failed: {}", error));
         }
 
@@ -416,10 +423,16 @@ impl CertificateIssuer {
         fs::copy(&key_path, self.output_dir.join(domain).join("privkey.pem"))?;
 
         // Get expiry information
-        let expiry = match self.get_cert_expiry(&cert_path) {
+        let expiry = match self.get_cert_expiry(&cert_path, domain) {
             Ok(expiry) => Some(format!("{:?}", expiry)),
             Err(_) => None,
         };
+
+        // When successfully issuing a certificate, log it
+        crate::metrics::PROXY_METRICS
+            .certificate_operations
+            .with_label_values(&[domain, "issue", "success"])
+            .inc();
 
         Ok(CertificateStatus {
             domain: domain.to_string(),
@@ -475,7 +488,7 @@ impl CertificateIssuer {
     }
 
     // Get certificate expiry date
-    fn get_cert_expiry(&self, cert_path: &Path) -> Result<SystemTime> {
+    fn get_cert_expiry(&self, cert_path: &Path, domain: &str) -> Result<SystemTime> {
         // Execute openssl to get certificate expiry
         let output = Command::new("openssl")
             .arg("x509")
@@ -500,6 +513,21 @@ impl CertificateIssuer {
         // This is a simplified example - in production, use a proper date parser
         // For this example, we'll return current time + 90 days
         let expiry = SystemTime::now() + Duration::from_secs(90 * 24 * 60 * 60);
+
+        if let Ok(expiry) = self.get_cert_expiry(&cert_path, domain) {
+            let now = SystemTime::now();
+            if let Ok(remaining) = expiry.duration_since(now) {
+                // Record certificate expiry time
+                let domain_str = domain.to_string();
+                let remaining_seconds = remaining.as_secs();
+
+                // Update the metric
+                crate::metrics::PROXY_METRICS
+                    .certificate_expiry
+                    .with_label_values(&[&domain_str])
+                    .set(remaining_seconds as f64);
+            }
+        }
 
         Ok(expiry)
     }

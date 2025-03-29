@@ -1089,9 +1089,11 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1922,7 +1924,7 @@ dependencies = [
  "pingora-http",
  "pingora-ketama",
  "pingora-runtime",
- "rand 0.8.5",
+ "rand 0.9.0",
  "tokio",
 ]
 
@@ -1935,7 +1937,7 @@ dependencies = [
  "arrayvec",
  "hashbrown 0.15.2",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.9.0",
 ]
 
 [[package]]
@@ -1990,6 +1992,9 @@ dependencies = [
  "clap 4.5.32",
  "env_logger",
  "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jemallocator",
  "lazy_static",
  "log",
@@ -2012,6 +2017,7 @@ dependencies = [
  "sha256",
  "thiserror 2.0.12",
  "tokio",
+ "tower",
  "uuid",
 ]
 
@@ -2944,6 +2950,22 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "tower"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d039ad9159c98b70ecfd540b2573b97f7f52c3e8d9f8ad57a24b916a536975f9"
+dependencies = [
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "tower-layer"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-service"

@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use prometheus::{HistogramVec, IntCounterVec, Registry};
+use prometheus::{GaugeVec, HistogramVec, IntCounterVec, Registry};
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -11,6 +11,7 @@ pub struct ProxyMetrics {
     pub request_duration: HistogramVec,
     pub certificate_operations: IntCounterVec,
     pub backend_failures: IntCounterVec,
+    pub certificate_expiry: GaugeVec,
 }
 
 impl ProxyMetrics {
@@ -46,6 +47,15 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let certificate_expiry = GaugeVec::new(
+            prometheus::Opts::new(
+                "certificate_expiry_seconds",
+                "Seconds until certificate expiry",
+            ),
+            &["domain"],
+        )
+        .unwrap();
+
         // Register metrics with the registry
         REGISTRY
             .register(Box::new(requests_total.clone()))
@@ -59,12 +69,16 @@ impl ProxyMetrics {
         REGISTRY
             .register(Box::new(backend_failures.clone()))
             .unwrap_or(());
+        REGISTRY
+            .register(Box::new(certificate_expiry.clone()))
+            .unwrap_or(());
 
         ProxyMetrics {
             requests_total,
             request_duration,
             certificate_operations,
             backend_failures,
+            certificate_expiry,
         }
     }
 }
