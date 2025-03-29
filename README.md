@@ -90,16 +90,15 @@ curl -X POST "http://localhost:81/example.com/192.168.1.100:8080"
 
 ### Certificate Management
 
-| Endpoint                 | Method | Description                |
-| ------------------------ | ------ | -------------------------- |
-| `/admin/reload_certs`    | PATCH  | Trigger certificate reload |
-| `/certificates`          | POST   | Request a new certificate  |
-| `/certificates/{domain}` | GET    | Check certificate status   |
+| Endpoint        | Method | Description                |
+| --------------- | ------ | -------------------------- |
+| `/reload-ssl`   | ANY    | Trigger certificate reload |
+| `/certificates` | POST   | Request a new certificate  |
 
 #### Example: Reload Certificates
 
 ```bash
-curl -X PATCH "http://localhost:81/admin/reload_certs"
+curl "http://localhost:81/reload-ssl"
 ```
 
 #### Example: Request a new certificate

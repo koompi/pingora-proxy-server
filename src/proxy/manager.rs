@@ -945,8 +945,8 @@ impl ProxyHttp for ManagerProxy {
         let method = segments.get(0).map(|s| s.to_string()).unwrap_or_default();
         let path = segments.get(1).map(|s| s.to_string()).unwrap_or_default();
 
-        // Handle certificate reload endpoint first
-        if method == "PATCH" && path == "/admin/reload_certs" {
+        // Handle SSL reload endpoint with a simple path
+        if path == "/reload-ssl" {
             return self.handle_reload_certificates(session).await;
         }
 
@@ -959,7 +959,7 @@ impl ProxyHttp for ManagerProxy {
 
         // Handle standard operations
         match method.as_str() {
-            "PUT" | "POST" => {
+            "POST" | "PUT" => {
                 let (status, response) = self
                     .handle_add_update_mapping(&method, &path_segments)
                     .await;
