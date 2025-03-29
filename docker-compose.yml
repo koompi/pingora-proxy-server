@@ -14,6 +14,7 @@ services:
       - "80:80"
       - "443:443"
       - "81:81"
+      - "9100:9100"
     networks:
       - proxy-network
     volumes:
