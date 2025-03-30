@@ -29,6 +29,8 @@ services:
       - /var/cache:/var/cache
       - /mnt/gluster/pingora-proxy/cert-reload:/pingora-proxy/cert-reload:rw
       - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
+      - /mnt/gluster/proxy-config:/app/config
+      - /mnt/gluster/proxy-config/config.json:/app/config/config.json
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
@@ -41,9 +43,9 @@ services:
       - RUST_LOG_STYLE=auto
       - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
       - METRICS_PORT=9100
-      - CONFIG_REFRESH_INTERVAL=30
-      - DISTRIBUTED_LOCK_TTL=60
-      - HOSTNAME_FOR_LOCKS=${HOSTNAME}
+      - CONFIG_REFRESH_INTERVAL=30 # Check for config changes every 30 seconds
+      - DISTRIBUTED_LOCK_TTL=60 # How long lock is held (seconds)
+      - HOSTNAME_FOR_LOCKS=${HOSTNAME} # Use container hostname for locks
     deploy:
       mode: replicated
       replicas: 3
@@ -69,3 +71,154 @@ services:
         max-file: "3"
         compress: "true"
         tag: "proxy-{{.Name}}"
+
+  # Certificate manager service
+  certbot:
+    image: image.koompi.org/library/pingora-proxy-server:latest
+    networks:
+      - proxy-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/gluster/certbot:/certbot
+      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
+      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
+    entrypoint:
+      [
+        "bash",
+        "-c",
+        "while true; do /app/certbot-wrapper.sh renew; sleep 43200; done",
+      ]
+    environment:
+      - PROXY_SERVICE_NAME=proxy_proxy
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - LOG_LEVEL=info
+      - RUST_LOG=info
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 256M
+      restart_policy:
+        condition: any
+        delay: 5s
+    healthcheck:
+      test: ["CMD", "test", "-f", "/certbot/live"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+        tag: "certbot-{{.Name}}"
+
+  prometheus:
+    image: prom/prometheus:latest
+    # Using numeric UID directly instead of user:group name
+    user: "65534:65534" # Use nobody user ID directly
+    volumes:
+      - /mnt/gluster/prometheus/config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    ports:
+      - "9090:9090"
+    networks:
+      - proxy-network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  grafana:
+    image: grafana/grafana:latest
+    user: "472" # This is the grafana user ID inside the container
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3005:3000"
+    networks:
+      - proxy-network
+    depends_on:
+      - prometheus
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Adding Redis Commander as requested
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    ports:
+      - "8081:8081"
+    networks:
+      - proxy-network
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+    depends_on:
+      - redis
+
+  # Adding Redis
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - proxy-network
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+networks:
+  proxy-network:
+    external: true
+
+configs:
+  proxy-security-policy:
+    file: ./security-policy.json
+
+volumes:
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/prometheus/data
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/grafana/data
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/redis/data
+  cert_reload:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/pingora-proxy/cert-reload
