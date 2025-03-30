@@ -104,6 +104,7 @@ pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> 
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(data.as_bytes())?;
         file.sync_all()?; // Make sure all data is flushed to disk
+        drop(file); // Explicitly close the file
     }
 
     // Rename temp file to actual config file

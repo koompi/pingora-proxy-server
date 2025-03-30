@@ -203,6 +203,9 @@ impl DistributedLock {
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
 
+        // Explicitly drop the file handle
+        drop(file);
+
         Ok(())
     }
     /// Release the lock

@@ -19,17 +19,17 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot
-      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
-      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
-      - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks
-      - /mnt/gluster/pingora-proxy/cert_requests:/pingora-proxy/cert_requests
+      - /mnt/gluster/certbot:/certbot:rw
+      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt:rw
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge:rw
+      - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks:rw
+      - /mnt/gluster/pingora-proxy/cert_requests:/pingora-proxy/cert_requests:rw
       - /tmp:/tmp
       - /var/cache:/var/cache
       - /mnt/gluster/pingora-proxy/cert-reload:/pingora-proxy/cert-reload:rw
-      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
-      - /mnt/gluster/proxy-config:/app/config
-      - /mnt/gluster/proxy-config/config.json:/app/config/config.json
+      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits:rw
+      - /mnt/gluster/proxy-config:/app/config:rw
+      - /mnt/gluster/proxy-config/config.json:/app/config/config.json:rw
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
