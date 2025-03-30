@@ -2002,6 +2002,7 @@ dependencies = [
  "openssl",
  "pingora",
  "pingora-core",
+ "pingora-error",
  "pingora-http",
  "pingora-load-balancing",
  "pingora-proxy",

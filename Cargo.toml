@@ -46,3 +46,4 @@ hyper = "1.6.0"
 tower = "0.5.2"
 hyper-util = { version = "0.1.4", features = ["full"] }
 http-body-util = "0.1.3"
+pingora-error = "0.4.0"

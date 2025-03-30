@@ -27,8 +27,9 @@ services:
       - /mnt/gluster/pingora-proxy/cert_requests:/pingora-proxy/cert_requests
       - /tmp:/tmp
       - /var/cache:/var/cache
-      - cert_reload:/pingora-proxy/cert-reload:rw
+      - /mnt/gluster/pingora-proxy/cert-reload:/pingora-proxy/cert-reload:rw
       - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
+      - /mnt/gluster/proxy-config/config.json:/app/config/config.json
     environment:
       - SWARM_MODE=true
       - SWARM_NETWORKS=proxy-network
@@ -41,6 +42,9 @@ services:
       - RUST_LOG_STYLE=auto
       - RUST_LOG_FILTER=pingora_core::protocols::http::v1::client=info,pingora_proxy::proxy_h1=info
       - METRICS_PORT=9100
+      - CONFIG_REFRESH_INTERVAL=30 # Check for config changes every 30 seconds
+      - DISTRIBUTED_LOCK_TTL=60 # How long lock is held (seconds)
+      - HOSTNAME_FOR_LOCKS=${HOSTNAME} # Use container hostname for locks
     deploy:
       mode: replicated
       replicas: 3

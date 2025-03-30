@@ -5,13 +5,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use async_trait::async_trait;
+// No need to import async_trait here since it's used via macro
 use bytes::Bytes;
-use log::{error, info, warn};
+use log::{error, info}; // Removed 'warn' as it's unused
 use pingora::{http, prelude::HttpPeer, Result};
+// Removed pingora_error import as it's no longer used
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
-use serde::{Deserialize, Serialize};
+use serde::Serialize; // Removed 'Deserialize' as it's unused
 
 use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
 use crate::metrics::PROXY_METRICS;
@@ -170,9 +171,11 @@ impl ManagerProxy {
         (from, to)
     }
 
+    // Make sure this method doesn't hold a MutexGuard across an await
     fn get_current_mappings(&self) -> Vec<DomainMapping> {
         if let Ok(servers) = self.servers.lock() {
-            servers
+            // Create the mappings while holding the lock
+            let mappings = servers
                 .iter()
                 .map(|(domain, (backend, origin))| {
                     let origin_str = match origin {
@@ -186,7 +189,10 @@ impl ManagerProxy {
                         origin: Some(origin_str.to_string()),
                     }
                 })
-                .collect()
+                .collect();
+
+            // Return the mappings after the lock is released
+            mappings
         } else {
             Vec::new()
         }
@@ -240,6 +246,9 @@ impl ManagerProxy {
                 }
             }
 
+            // Get the mappings before sending the response (to avoid holding lock across await)
+            let mappings = self.get_current_mappings();
+
             return self.send_json_response(
                 session,
                 http::StatusCode::OK,
@@ -247,7 +256,7 @@ impl ManagerProxy {
                     status: "success".to_string(),
                     error: None,
                     message: Some("Certificate reload completed successfully. All nodes will pick up changes within 15 seconds.".to_string()),
-                    mappings: Some(self.get_current_mappings()),
+                    mappings: Some(mappings),
                     health: None,
                 },
             ).await;
@@ -522,6 +531,7 @@ impl ManagerProxy {
     }
 
     // Handle adding or updating domain mapping
+    // Handle adding or updating domain mapping
     async fn handle_add_update_mapping(
         &self,
         method: &str,
@@ -554,68 +564,109 @@ impl ManagerProxy {
             );
         }
 
-        match self.servers.lock() {
-            Ok(mut servers) => {
-                // Mark this mapping as manually added
-                servers.insert(from.clone(), (to.clone(), MappingOrigin::Manual));
+        // Create a scope to ensure the lock is released before any await points
+        let config_result = {
+            // First acquire the lock
+            match self.servers.lock() {
+                Ok(mut servers) => {
+                    // Mark this mapping as manually added
+                    servers.insert(from.clone(), (to.clone(), MappingOrigin::Manual));
 
-                // Update config file
-                let config_path =
-                    std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.json".to_string());
-                let mut current_config = match std::fs::read_to_string(&config_path) {
-                    Ok(content) => match serde_json::from_str::<Configuration>(&content) {
-                        Ok(cfg) => cfg,
+                    // Update config file
+                    let config_path =
+                        std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.json".to_string());
+                    let mut current_config = match std::fs::read_to_string(&config_path) {
+                        Ok(content) => match serde_json::from_str::<Configuration>(&content) {
+                            Ok(cfg) => cfg,
+                            Err(_) => Configuration::new(),
+                        },
                         Err(_) => Configuration::new(),
-                    },
-                    Err(_) => Configuration::new(),
-                };
+                    };
 
-                // Check if this domain already exists in the config
-                let domain_exists = current_config.servers.iter().position(|s| s.from == from);
+                    // Check if this domain already exists in the config
+                    let domain_exists = current_config.servers.iter().position(|s| s.from == from);
 
-                if let Some(index) = domain_exists {
-                    // Update existing entry
-                    current_config.servers[index].to = to.clone();
-                    current_config.servers[index].origin = MappingOrigin::Manual;
-                } else {
-                    // Add new entry
-                    current_config.servers.push(ServerMapping {
-                        from: from.clone(),
-                        to: to.clone(),
-                        origin: MappingOrigin::Manual,
-                    });
-                }
+                    if let Some(index) = domain_exists {
+                        // Update existing entry
+                        current_config.servers[index].to = to.clone();
+                        current_config.servers[index].origin = MappingOrigin::Manual;
+                    } else {
+                        // Add new entry
+                        current_config.servers.push(ServerMapping {
+                            from: from.clone(),
+                            to: to.clone(),
+                            origin: MappingOrigin::Manual,
+                        });
+                    }
 
-                // Save updated config
-                match serde_json::to_string_pretty(&current_config) {
-                    Ok(json) => {
-                        if let Err(e) = std::fs::write(&config_path, json) {
-                            println!("Error writing config file: {}", e);
+                    // Save updated config
+                    match serde_json::to_string_pretty(&current_config) {
+                        Ok(json) => {
+                            if let Err(e) = std::fs::write(&config_path, json) {
+                                println!("Error writing config file: {}", e);
+                                return (
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    Self::error_response("Failed to save configuration"),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error serializing config: {}", e);
                             return (
                                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                                Self::error_response("Failed to save configuration"),
+                                Self::error_response("Failed to serialize configuration"),
                             );
                         }
                     }
-                    Err(e) => {
-                        println!("Error serializing config: {}", e);
-                        return (
-                            http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Self::error_response("Failed to serialize configuration"),
-                        );
-                    }
-                }
 
-                (http::StatusCode::OK, Self::success_response())
+                    // Return success
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("Error locking servers mutex: {}", e);
+                    Err(e.to_string())
+                }
             }
-            Err(e) => {
-                println!("Error locking servers mutex: {}", e);
-                (
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Self::error_response("Failed to acquire lock on server configuration"),
-                )
+        }; // Lock is released here
+
+        // Check if the config update was successful
+        if let Err(err_msg) = config_result {
+            return (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                Self::error_response(&format!(
+                    "Failed to acquire lock on server configuration: {}",
+                    err_msg
+                )),
+            );
+        }
+
+        // After successfully updating configuration, now we can do the async operations
+        // Force propagation to other nodes
+        if let Some(https_proxy) = &self.https_proxy {
+            if let Err(e) = https_proxy.reload_certificates().await {
+                println!("Warning: error reloading certificates: {:?}", e);
+            }
+
+            // Create notification file for other nodes
+            let reload_path = std::path::Path::new("/pingora-proxy/cert-reload/last_reload");
+            if let Some(parent) = reload_path.parent() {
+                if !parent.exists() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+
+            // Write timestamp to trigger other nodes
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            if let Err(e) = std::fs::write(reload_path, now.to_string()) {
+                println!("Warning: Failed to create reload notification: {}", e);
             }
         }
+
+        (http::StatusCode::OK, Self::success_response())
     }
 
     // Handle removing domain mapping
@@ -856,20 +907,33 @@ impl ManagerProxy {
             details: HashMap::new(),
         };
 
-        if let Ok(store) = self.servers.lock() {
-            for domain in store.keys() {
-                let cert_status = certbot::check_certificate_status(domain);
-                health.details.insert(
-                    domain.clone(),
-                    match cert_status {
-                        Ok(status) => status.to_string(),
-                        Err(e) => {
-                            health.status = "unhealthy".to_string();
-                            e.to_string()
-                        }
-                    },
-                );
-            }
+        // Get domains from servers while holding the lock
+        let domains = if let Ok(servers) = self.servers.lock() {
+            // Clone the keys to avoid holding the lock
+            servers.keys().cloned().collect::<Vec<String>>()
+        } else {
+            // Error case
+            health.status = "unhealthy".to_string();
+            health.details.insert(
+                "lock_error".to_string(),
+                "Failed to acquire lock on server configuration".to_string(),
+            );
+            return health;
+        };
+
+        // Process domains outside of the lock
+        for domain in domains {
+            let cert_status = certbot::check_certificate_status(&domain);
+            health.details.insert(
+                domain,
+                match cert_status {
+                    Ok(status) => status.to_string(),
+                    Err(e) => {
+                        health.status = "unhealthy".to_string();
+                        e.to_string()
+                    }
+                },
+            );
         }
 
         health
@@ -881,25 +945,40 @@ impl ManagerProxy {
             details: HashMap::new(),
         };
 
-        if let Ok(store) = self.servers.lock() {
-            for (domain, (backend, _origin)) in store.iter() {
-                let status = self.check_backend_connectivity(backend).await;
-                match status {
-                    Ok(_) => {
-                        health
-                            .details
-                            .insert(format!("{}->{}", domain, backend), "connected".to_string());
-                    }
-                    Err(e) => {
-                        health.status = "unhealthy".to_string();
-                        health
-                            .details
-                            .insert(format!("{}->{}", domain, backend), e.to_string());
-                        PROXY_METRICS
-                            .backend_failures
-                            .with_label_values(&[backend, "health_check_failed"])
-                            .inc();
-                    }
+        // Get domain-backend pairs while holding the lock
+        let backend_mappings: Vec<(String, String)> = if let Ok(servers) = self.servers.lock() {
+            servers
+                .iter()
+                .map(|(domain, (backend, _))| (domain.clone(), backend.clone()))
+                .collect()
+        } else {
+            // Error case
+            health.status = "unhealthy".to_string();
+            health.details.insert(
+                "lock_error".to_string(),
+                "Failed to acquire lock on server configuration".to_string(),
+            );
+            return health;
+        };
+
+        // Process backends outside of the lock
+        for (domain, backend) in backend_mappings {
+            let status = self.check_backend_connectivity(&backend).await;
+            match status {
+                Ok(_) => {
+                    health
+                        .details
+                        .insert(format!("{}->{}", domain, backend), "connected".to_string());
+                }
+                Err(e) => {
+                    health.status = "unhealthy".to_string();
+                    health
+                        .details
+                        .insert(format!("{}->{}", domain, backend), e.to_string());
+                    PROXY_METRICS
+                        .backend_failures
+                        .with_label_values(&[&backend, "health_check_failed"])
+                        .inc();
                 }
             }
         }
@@ -908,18 +987,22 @@ impl ManagerProxy {
     }
 
     async fn check_config_health(&self) -> ComponentHealth {
+        // Just quick check if we can acquire the lock
+        let status = if self.servers.lock().is_ok() {
+            "healthy".to_string()
+        } else {
+            "unhealthy".to_string()
+        };
+
         ComponentHealth {
-            status: if let Ok(_) = self.servers.lock() {
-                "healthy".to_string()
-            } else {
-                "unhealthy".to_string()
-            },
+            status,
             details: HashMap::new(),
         }
     }
 
     async fn check_backend_connectivity(&self, backend: &str) -> Result<(), String> {
         let (service_name, port, _) = crate::proxy::utils::parse_swarm_target(backend);
+        let service_name = service_name.to_string(); // Clone the string before the await
         if crate::proxy::utils::test_service_connectivity(&service_name, port).await {
             Ok(())
         } else {
@@ -969,8 +1052,13 @@ impl ProxyHttp for ManagerProxy {
                 .await;
         }
 
-        // Handle standard operations
-        match method.as_str() {
+        // Handle health check directly
+        if path.starts_with("/health") {
+            return self.handle_health_check(session).await;
+        }
+
+        // Prepare response data before any await points
+        let response_data = match method.as_str() {
             "POST" | "PUT" => {
                 // Check explicitly for admin paths
                 if path.starts_with("/admin") {
@@ -988,28 +1076,74 @@ impl ProxyHttp for ManagerProxy {
                         .await;
                 }
 
-                let (status, response) = self
-                    .handle_add_update_mapping(&method, &path_segments)
-                    .await;
-                self.send_json_response(session, status, response).await
+                self.handle_add_update_mapping(&method, &path_segments)
+                    .await
             }
-            "DELETE" => {
-                let (status, response) = self.handle_delete_mapping(&path_segments).await;
-                self.send_json_response(session, status, response).await
-            }
+            "DELETE" => self.handle_delete_mapping(&path_segments).await,
             "GET" => {
-                let (status, response) = self.handle_list_mappings().await;
-                self.send_json_response(session, status, response).await
+                // Important: We need to drop the MutexGuard before the await point
+                // Create mappings vector while holding the lock, then drop the lock
+                let (mappings, lock_failed) = {
+                    // Scope the lock to ensure it's dropped
+                    match self.servers.lock() {
+                        Ok(servers) => {
+                            // Create mappings vector while holding the lock
+                            let mappings = servers
+                                .iter()
+                                .map(|(domain, (backend, origin))| {
+                                    let origin_str = match origin {
+                                        MappingOrigin::Manual => "Manual",
+                                        MappingOrigin::SwarmDiscovery => "SwarmDiscovery",
+                                    };
+
+                                    DomainMapping {
+                                        from: domain.clone(),
+                                        to: backend.clone(),
+                                        origin: Some(origin_str.to_string()),
+                                    }
+                                })
+                                .collect::<Vec<DomainMapping>>();
+
+                            (mappings, false) // MutexGuard is dropped here at end of scope
+                        }
+                        Err(e) => {
+                            // Handle error case
+                            println!("Error locking servers mutex: {}", e);
+                            (Vec::new(), true) // Return empty vector and indicate lock failure
+                        }
+                    }
+                };
+
+                // Now create the response tuple outside the lock
+                if mappings.is_empty() && lock_failed {
+                    // Only show error if it was actually a lock error
+                    (
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Self::error_response("Failed to acquire lock on server configuration"),
+                    )
+                } else {
+                    // Successful case
+                    (
+                        http::StatusCode::OK,
+                        ApiResponse {
+                            status: "success".to_string(),
+                            error: None,
+                            message: None,
+                            mappings: Some(mappings),
+                            health: None,
+                        },
+                    )
+                }
             }
-            _ => {
-                self.send_json_response(
-                    session,
-                    http::StatusCode::METHOD_NOT_ALLOWED,
-                    Self::error_response("Method not allowed"),
-                )
-                .await
-            }
-        }
+            _ => (
+                http::StatusCode::METHOD_NOT_ALLOWED,
+                Self::error_response("Method not allowed"),
+            ),
+        };
+
+        // Send the response after preparing the data
+        self.send_json_response(session, response_data.0, response_data.1)
+            .await
     }
 
     async fn upstream_peer(

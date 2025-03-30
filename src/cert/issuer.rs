@@ -10,6 +10,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::metrics::PROXY_METRICS;
+
 static ACTIVE_CHALLENGES: Lazy<Mutex<std::collections::HashMap<String, (String, String)>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 

@@ -207,6 +207,13 @@ impl SwarmDiscoveryService {
     async fn discover_services(&self) -> Result<()> {
         info!("Running Docker Swarm service discovery");
 
+        // Try to acquire a lock with much shorter timeout for discovery operations
+        let lock_acquired = self
+            .distributed_lock
+            .acquire(3, Duration::from_millis(500))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to acquire lock: {}", e))?;
+
         // Filter for services with a specific label for our proxy
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert(
@@ -370,6 +377,13 @@ impl SwarmDiscoveryService {
             }
         } else if !is_leader {
             info!("Node is not the leader - skipping config file update");
+        }
+
+        // Make sure to explicitly release the lock when done
+        if lock_acquired {
+            if let Err(e) = self.distributed_lock.release().await {
+                error!("Error releasing lock: {}", e);
+            }
         }
 
         Ok(())

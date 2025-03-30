@@ -47,6 +47,26 @@ impl CertWatcherService {
                                 modified_timestamp
                             );
                             self.last_modified = modified_timestamp;
+
+                            // In addition to reloading certificates, also reload configuration
+                            let config_path = std::env::var("CONFIG_PATH")
+                                .unwrap_or_else(|_| "config.json".to_string());
+
+                            info!("Reloading domain mappings from {}", config_path);
+                            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                                if let Ok(config) = serde_json::from_str::<
+                                    crate::config::model::Configuration,
+                                >(&content)
+                                {
+                                    // Convert to hashmap and update in-memory store
+                                    let store = config.to_hashmap();
+                                    if let Ok(mut servers) = self.https_proxy.servers.lock() {
+                                        *servers = store;
+                                        info!("Successfully reloaded domain mappings from file");
+                                    }
+                                }
+                            }
+
                             return true;
                         }
                     }
