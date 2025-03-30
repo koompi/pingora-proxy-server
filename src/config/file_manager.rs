@@ -79,8 +79,14 @@ pub async fn get_config() -> ConfigStore {
 pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> {
     let config_path = get_config_path();
 
-    // Ensure the config directory exists
-    ensure_config_dir(&config_path)?;
+    // Create a completely temporary file with a uuid name
+    let uuid = uuid::Uuid::new_v4();
+    let temp_path = format!("{}.{}.tmp", config_path, uuid);
+
+    // Ensure parent directories exist
+    if let Some(parent) = Path::new(&config_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     let config = Configuration { servers };
     let data = match serde_json::to_string_pretty(&config) {
@@ -94,21 +100,28 @@ pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> 
         }
     };
 
-    // Use a more robust approach to writing the file:
-    // 1. First write to a temporary file
-    // 2. Then rename the temporary file to the target file
-    let temp_path = format!("{}.tmp", config_path);
-
-    // Create and write to temp file
+    // Create a new file exclusively
     {
-        let mut file = std::fs::File::create(&temp_path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
+
+        // Write data to temp file
         file.write_all(data.as_bytes())?;
-        file.sync_all()?; // Make sure all data is flushed to disk
-        drop(file); // Explicitly close the file
+        file.flush()?; // Ensure data is written
+        file.sync_all()?; // Sync to disk
+
+        // Explicitly close file by dropping it at end of scope
     }
 
-    // Rename temp file to actual config file
-    std::fs::rename(&temp_path, config_path)?;
+    // Try to remove the original config file first to avoid the "Device busy" error
+    // Ignore errors here, since the file might not exist
+    let _ = fs::remove_file(&config_path);
+
+    // Now rename the temp file to the config file
+    fs::rename(&temp_path, &config_path)?;
 
     println!("Config updated successfully");
     Ok(())

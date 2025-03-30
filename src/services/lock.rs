@@ -209,23 +209,52 @@ impl DistributedLock {
         Ok(())
     }
     /// Release the lock
+    // In the DistributedLock implementation
     pub async fn release(&self) -> Result<(), IoError> {
-        // Only remove the lock if it's ours
-        if self.lock_path.exists() {
-            let mut lock_file = File::open(&self.lock_path)?;
-            let mut contents = String::new();
-            lock_file.read_to_string(&mut contents)?;
+        if !self.lock_path.exists() {
+            // If lock doesn't exist, consider it released already
+            return Ok(());
+        }
 
-            let parts: Vec<&str> = contents.trim().split(':').collect();
-            if parts.len() >= 1 && parts[0] == self.node_id {
-                // This is our lock, remove it
-                fs::remove_file(&self.lock_path)?;
-                println!("Released lock: {:?}", self.lock_path);
-            } else {
-                println!("Lock {:?} not owned by us, not releasing", self.lock_path);
+        // Check if this is our lock
+        match File::open(&self.lock_path) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                if file.read_to_string(&mut contents).is_ok() {
+                    let parts: Vec<&str> = contents.trim().split(':').collect();
+
+                    if parts.len() >= 1 && parts[0] == self.node_id {
+                        // Drop the file handle before removal
+                        drop(file);
+
+                        // This is our lock, try to remove it with retries
+                        let max_attempts = 3;
+                        for attempt in 1..=max_attempts {
+                            match fs::remove_file(&self.lock_path) {
+                                Ok(_) => {
+                                    println!("Released lock: {:?}", self.lock_path);
+                                    return Ok(());
+                                }
+                                Err(e) if attempt < max_attempts => {
+                                    println!(
+                                        "Error removing lock file (attempt {}): {:?}",
+                                        attempt, e
+                                    );
+                                    sleep(Duration::from_millis(50 * attempt as u64)).await;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    } else {
+                        println!("Lock {:?} not owned by us, not releasing", self.lock_path);
+                    }
+                }
             }
-        } else {
-            println!("Lock {:?} not found", self.lock_path);
+            Err(e) => {
+                println!("Error opening lock file for reading: {:?}", e);
+                // If we can't open it, try to remove it anyway
+                let _ = fs::remove_file(&self.lock_path);
+            }
         }
 
         Ok(())

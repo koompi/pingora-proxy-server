@@ -403,6 +403,17 @@ impl SwarmDiscoveryService {
 
     // New method to ensure organization networks exist
     async fn ensure_org_networks(&self) -> Result<()> {
+        // Create lock directory if it doesn't exist
+        let lock_dir = PathBuf::from("/pingora-proxy/locks");
+        if !lock_dir.exists() {
+            match std::fs::create_dir_all(&lock_dir) {
+                Ok(_) => info!("Created lock directory: {:?}", lock_dir),
+                Err(e) => {
+                    error!("Failed to create lock directory: {:?} - {}", lock_dir, e);
+                    // Continue anyway with a warning
+                }
+            }
+        }
         // Try to acquire network setup lock
         if !self
             .distributed_lock
