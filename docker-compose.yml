@@ -93,7 +93,7 @@ services:
       [
         "bash",
         "-c",
-        "while true; do /app/certbot-wrapper.sh renew; sleep 43200; done",
+        "mkdir -p /certbot/live && bash -c 'while true; do /app/certbot-wrapper.sh renew; sleep 43200; done'",
       ]
     environment:
       - PROXY_SERVICE_NAME=proxy_proxy
@@ -108,15 +108,24 @@ services:
           - node.role == manager
       resources:
         limits:
-          memory: 256M
+          memory: 512M
+        reservations:
+          memory: 128M
       restart_policy:
         condition: any
         delay: 5s
     healthcheck:
-      test: ["CMD", "test", "-f", "/certbot/live"]
-      interval: 60s
-      timeout: 10s
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "test -d /certbot/letsencrypt || test -d /certbot/live || exit 0",
+        ]
+      interval: 15s
+      timeout: 15s
       retries: 3
+      start_period: 60s
     logging:
       driver: "json-file"
       options:
