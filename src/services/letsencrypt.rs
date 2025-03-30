@@ -42,20 +42,33 @@ impl RateLimitTracker {
         if let Some(attempts) = self.attempts.get(domain) {
             let recent_attempts = attempts.iter().filter(|&time| time > &one_hour_ago).count();
 
-            recent_attempts < self.max_failures_per_hour
+            if recent_attempts >= self.max_failures_per_hour {
+                println!(
+                    "Rate limit reached for {}: {} attempts in the last hour",
+                    domain, recent_attempts
+                );
+                return false;
+            }
+
+            println!(
+                "Domain {} has made {} attempts in the last hour (limit: {})",
+                domain, recent_attempts, self.max_failures_per_hour
+            );
+            true
         } else {
+            println!("No recent attempts for domain {}", domain);
             true
         }
     }
 
     fn record_attempt(&mut self, domain: &str) {
+        println!("Recording renewal attempt for domain: {}", domain);
         self.attempts
             .entry(domain.to_string())
             .or_insert_with(Vec::new)
             .push(SystemTime::now());
     }
 }
-
 pub struct LetsEncryptService {
     config_store: Arc<std::sync::Mutex<ConfigStore>>,
     certbot_dir: PathBuf,
@@ -303,14 +316,34 @@ impl LetsEncryptService {
             domains // Return the collected domains
         };
 
-        // NEW ADDITION: Only process existing certificates (don't auto-issue new ones)
+        // Only process existing certificates (don't auto-issue new ones)
         let mut existing_domains = Vec::new();
         for domain in &domains {
             // Check if certificate directory exists
             let cert_path = self.certbot_dir.join("live").join(domain);
             if cert_path.exists() {
                 existing_domains.push(domain.clone());
+            } else {
+                println!("Skipping domain {} - no existing certificate found", domain);
             }
+        }
+
+        println!(
+            "Found {} existing domains with certificates, out of {} total domains",
+            existing_domains.len(),
+            domains.len()
+        );
+
+        if existing_domains.is_empty() {
+            println!("No existing certificates found, nothing to renew");
+
+            // Release the lock when done
+            if let Err(e) = lock.release().await {
+                println!("Error releasing certificate manager lock: {:?}", e);
+                return Err(anyhow::anyhow!("Failed to release lock"));
+            }
+
+            return Ok(());
         }
 
         // First, run certbot with --dry-run to check for issues
@@ -335,20 +368,25 @@ impl LetsEncryptService {
         // Use a result variable to track overall success
         let mut result = Ok(());
 
-        // Create a mutable copy of the domains to shuffle
-        let mut domains_vec = domains;
-
-        // Fix Send trait issue by creating a new random number generator each time
-        // instead of using thread_rng directly across await points
+        // Shuffle the existing domains to randomize processing order
+        let mut existing_domains_vec = existing_domains;
         {
             let mut rng = rand::thread_rng();
-            domains_vec.shuffle(&mut rng);
+            existing_domains_vec.shuffle(&mut rng);
         }
 
         // Process each domain with randomized delays
-        for domain in existing_domains {
+        for (index, domain) in existing_domains_vec.iter().enumerate() {
+            println!(
+                "Processing domain {} ({}/{})",
+                domain,
+                index + 1,
+                existing_domains_vec.len()
+            );
+
             // Skip if domain is an IP address
             if domain.parse::<std::net::IpAddr>().is_ok() {
+                println!("Skipping IP address domain: {}", domain);
                 continue;
             }
 
@@ -358,12 +396,12 @@ impl LetsEncryptService {
                 continue;
             }
 
-            // Add a random delay between certificate operations (1-20 seconds)
-            // Fix Send trait issue by creating a new random number generator
+            // Add a longer random delay between certificate operations (5-60 seconds)
             let delay = {
                 let mut rng = rand::thread_rng();
-                rng.gen_range(1..20)
+                rng.gen_range(5..60)
             };
+            println!("Waiting {} seconds before processing next domain", delay);
             sleep(Duration::from_secs(delay)).await;
 
             // Check for cloudflare credentials
@@ -377,7 +415,7 @@ impl LetsEncryptService {
             let cert_domain = if domain.starts_with("*.") {
                 domain[2..].to_string()
             } else {
-                domain
+                domain.clone()
             };
 
             // Only attempt renewal if certificate is expiring soon (within 30 days)
@@ -385,6 +423,11 @@ impl LetsEncryptService {
                 println!("Certificate for {} is not due for renewal", cert_domain);
                 continue;
             }
+
+            println!(
+                "Certificate for {} is expiring soon, attempting renewal",
+                cert_domain
+            );
 
             // Record this attempt
             rate_tracker.record_attempt(&cert_domain);
@@ -477,8 +520,12 @@ impl LetsEncryptService {
         let cert_path = live_dir.join("fullchain.pem");
 
         if !cert_path.exists() {
-            // No certificate exists, so we need to get one
-            return true;
+            // No certificate exists, so return false since we don't want to auto-issue
+            println!(
+                "Certificate for {} doesn't exist, skipping auto-issuance",
+                domain
+            );
+            return false;
         }
 
         match self.get_cert_expiry(&cert_path) {
@@ -487,9 +534,17 @@ impl LetsEncryptService {
                 let threshold = Duration::from_secs(days_threshold * 24 * 60 * 60);
 
                 match expiry.duration_since(now) {
-                    Ok(remaining) => remaining < threshold,
+                    Ok(remaining) => {
+                        let days_remaining = remaining.as_secs() / (24 * 60 * 60);
+                        println!(
+                            "Certificate for {} expires in {} days",
+                            domain, days_remaining
+                        );
+                        remaining < threshold
+                    }
                     Err(_) => {
                         // Certificate already expired
+                        println!("Certificate for {} has already expired", domain);
                         true
                     }
                 }
