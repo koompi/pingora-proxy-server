@@ -143,6 +143,42 @@ impl CertificateIssuer {
     pub async fn process_request(&self, request: CertificateRequest) -> CertificateStatus {
         let is_wildcard = request.wildcard.unwrap_or(false);
 
+        // First check if this is a renewal by seeing if certificate already exists
+        if let Some(mut status) = self.check_certificate(&request.domain) {
+            // Certificate exists, check if it's expiring soon (within 30 days)
+            if status.status == "valid" {
+                // Certificate is still valid, do nothing
+                status.is_wildcard = Some(is_wildcard);
+                return status;
+            }
+            // Otherwise, proceed with renewal
+        } else {
+            // NEW ADDITION: Only issue new certificates if they resolve to our public IP
+            // or if force_renew is specified
+            let force_renew = request.force_renew.unwrap_or(false);
+
+            if !force_renew {
+                // First check if the domain resolves to our public IP
+                match self.validate_domain(&request.domain).await {
+                    Ok(_) => {
+                        // Validation successful, proceed with issuance
+                    }
+                    Err(e) => {
+                        // Domain doesn't point to our server, return error
+                        return CertificateStatus {
+                            domain: request.domain,
+                            status: "failed".to_string(),
+                            cert_path: None,
+                            key_path: None,
+                            expiry: None,
+                            error: Some(format!("Domain validation failed: {}. Domain must point to this server's IP address.", e)),
+                            is_wildcard: Some(is_wildcard),
+                        };
+                    }
+                }
+            }
+        }
+
         // For wildcard certificates, skip domain validation as it uses DNS challenge
         if !is_wildcard {
             // 1. Validate domain points to our server (only for HTTP-01 challenges)
@@ -190,28 +226,25 @@ impl CertificateIssuer {
         println!("Validating domain: {}", domain);
 
         // 1. DNS resolution check
-        let addresses = format!("{}:443", domain).to_socket_addrs()?;
+        let addresses = match format!("{}:443", domain).to_socket_addrs() {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(e) => {
+                return Err(anyhow!("Failed to resolve domain {}: {}", domain, e));
+            }
+        };
 
-        // For testing purposes, consider any local IP as valid
-        // You can remove or modify this for production
-        let valid_ips = vec![
-            // "127.0.0.1".to_string(),
-            // "localhost".to_string(),
-            self.public_ip.clone(),
-        ];
+        // Get our public IP from an environment variable if available
+        let public_ip = std::env::var("PUBLIC_IP").unwrap_or_else(|_| self.public_ip.clone());
+
+        let public_ips: Vec<String> = public_ip.split(',').map(|s| s.trim().to_string()).collect();
 
         let mut found_matching_ip = false;
         for addr in addresses {
             let ip = addr.ip().to_string();
             println!("Resolved IP for {}: {}", domain, ip);
 
-            // In testing mode, consider localhost as valid
-            // if valid_ips.contains(&ip) || ip.starts_with("192.168.") || ip.starts_with("10.") {
-            //     found_matching_ip = true;
-            //     println!("IP match found for domain validation");
-            //     break;
-            // }
-            if valid_ips.contains(&ip) {
+            // Allow matching any of our public IPs
+            if public_ips.contains(&ip) || ip == "127.0.0.1" {
                 found_matching_ip = true;
                 println!("IP match found for domain validation");
                 break;
@@ -220,9 +253,9 @@ impl CertificateIssuer {
 
         if !found_matching_ip {
             return Err(anyhow!(
-                "Domain {} does not resolve to a valid IP (local: 127.0.0.1 or public: {})",
+                "Domain {} does not resolve to this server's IP address ({})",
                 domain,
-                self.public_ip
+                public_ip
             ));
         }
 

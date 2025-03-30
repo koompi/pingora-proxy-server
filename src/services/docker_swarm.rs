@@ -520,36 +520,39 @@ impl SwarmDiscoveryService {
             .await
             .map_err(|e| SwarmError::ConfigError(format!("Failed to get config version: {}", e)))?;
 
-        // Add retry logic here
+        // Add retry logic with better error handling
         let max_retries = 5;
         let mut retry_count = 0;
-        let mut last_error = None;
 
         while retry_count < max_retries {
             match update_config(mappings.clone()) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    last_error = Some(e);
-                    retry_count += 1;
-                    if retry_count < max_retries {
-                        // Exponential backoff
-                        let delay =
-                            std::time::Duration::from_millis(100 * 2u64.pow(retry_count as u32));
-                        tokio::time::sleep(delay).await;
+                    if e.kind() == std::io::ErrorKind::ResourceBusy {
+                        // Device busy error - wait a bit longer
+                        retry_count += 1;
+                        if retry_count < max_retries {
+                            let delay = std::time::Duration::from_millis(
+                                250 * 2u64.pow(retry_count as u32),
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                    } else {
+                        // For other errors, fail immediately
+                        return Err(SwarmError::ConfigError(format!(
+                            "Failed to update config: {}",
+                            e
+                        )));
                     }
                 }
             }
         }
 
-        // If we're here, all retries failed
-        if let Some(e) = last_error {
-            return Err(SwarmError::ConfigError(format!(
-                "Failed to update config after {} attempts: {}",
-                max_retries, e
-            )));
-        }
-
-        Ok(())
+        // All retries failed
+        Err(SwarmError::ConfigError(format!(
+            "Failed to update config after {} attempts: Device or resource busy (os error 16)",
+            max_retries
+        )))
     }
 
     async fn create_organization_network(&self, org_id: &str) -> Result<(), SwarmError> {

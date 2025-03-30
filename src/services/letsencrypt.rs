@@ -303,6 +303,16 @@ impl LetsEncryptService {
             domains // Return the collected domains
         };
 
+        // NEW ADDITION: Only process existing certificates (don't auto-issue new ones)
+        let mut existing_domains = Vec::new();
+        for domain in &domains {
+            // Check if certificate directory exists
+            let cert_path = self.certbot_dir.join("live").join(domain);
+            if cert_path.exists() {
+                existing_domains.push(domain.clone());
+            }
+        }
+
         // First, run certbot with --dry-run to check for issues
         println!("Performing dry-run certificate renewal check");
         match std::process::Command::new("certbot")
@@ -336,7 +346,7 @@ impl LetsEncryptService {
         }
 
         // Process each domain with randomized delays
-        for domain in domains_vec {
+        for domain in existing_domains {
             // Skip if domain is an IP address
             if domain.parse::<std::net::IpAddr>().is_ok() {
                 continue;

@@ -79,14 +79,12 @@ pub async fn get_config() -> ConfigStore {
 pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> {
     let config_path = get_config_path();
 
-    // Create a completely temporary file with a uuid name
+    // Generate a unique temporary file
     let uuid = uuid::Uuid::new_v4();
     let temp_path = format!("{}.{}.tmp", config_path, uuid);
 
-    // Ensure parent directories exist
-    if let Some(parent) = Path::new(&config_path).parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // Ensure the config directory exists
+    ensure_config_dir(&config_path)?;
 
     let config = Configuration { servers };
     let data = match serde_json::to_string_pretty(&config) {
@@ -100,28 +98,30 @@ pub fn update_config(servers: Vec<ServerMapping>) -> Result<(), std::io::Error> 
         }
     };
 
-    // Create a new file exclusively
+    // Write to temporary file first
     {
-        let mut file = fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temp_path)?;
 
-        // Write data to temp file
         file.write_all(data.as_bytes())?;
-        file.flush()?; // Ensure data is written
-        file.sync_all()?; // Sync to disk
+        file.flush()?;
+        file.sync_all()?;
 
-        // Explicitly close file by dropping it at end of scope
+        // File is closed here at end of scope
     }
 
-    // Try to remove the original config file first to avoid the "Device busy" error
-    // Ignore errors here, since the file might not exist
-    let _ = fs::remove_file(&config_path);
+    // Then try to replace the original file
+    if std::path::Path::new(&config_path).exists() {
+        // Try to remove the file first to avoid device busy errors
+        // Ignore errors from this step
+        let _ = std::fs::remove_file(&config_path);
+    }
 
-    // Now rename the temp file to the config file
-    fs::rename(&temp_path, &config_path)?;
+    // Now rename the temp file
+    std::fs::rename(&temp_path, &config_path)?;
 
     println!("Config updated successfully");
     Ok(())
