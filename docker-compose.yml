@@ -9,8 +9,8 @@ services:
       - 1.1.1.1
     cap_add:
       - NET_BIND_SERVICE
-    # Add staggered startup to avoid contention
-    command: ["sh", "-c", "sleep $((RANDOM % 10)) && /app/entrypoint.sh"]
+    # Fixed command for Docker Swarm compatibility
+    command: "sh -c 'sleep $$(shuf -i 1-10 -n 1) && /app/entrypoint.sh'"
     ports:
       - "80:80"
       - "443:443"
@@ -23,7 +23,6 @@ services:
       - /mnt/gluster/certbot:/certbot:rw
       - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt:rw
       - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge:rw
-      # Keep this for compatibility but use local-locks for actual locking
       - /mnt/gluster/pingora-proxy/locks:/pingora-proxy/locks:rw
       - /mnt/gluster/pingora-proxy/cert_requests:/pingora-proxy/cert_requests:rw
       - /tmp:/tmp
@@ -31,7 +30,7 @@ services:
       - /mnt/gluster/pingora-proxy/cert-reload:/pingora-proxy/cert-reload:rw
       - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits:rw
       - /mnt/gluster/proxy-config:/app/config:rw
-      # Add tmpfs for local lock directory
+      # Use tmpfs mount for local locks
       - type: tmpfs
         target: /pingora-proxy/local-locks
         tmpfs:
@@ -51,7 +50,7 @@ services:
       - CONFIG_REFRESH_INTERVAL=30
       - DISTRIBUTED_LOCK_TTL=60
       - HOSTNAME_FOR_LOCKS=${HOSTNAME}
-      # Add this to use local lock directory instead of shared one
+      # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
     deploy:
       mode: replicated
@@ -86,10 +85,10 @@ services:
       - proxy-network
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/gluster/certbot:/certbot
-      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt
-      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge
-      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits
+      - /mnt/gluster/certbot:/certbot:rw
+      - /mnt/gluster/certbot/letsencrypt:/etc/letsencrypt:rw
+      - /mnt/gluster/acme-challenge:/var/www/html/.well-known/acme-challenge:rw
+      - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits:rw
     entrypoint:
       [
         "bash",
@@ -128,8 +127,7 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
-    # Using numeric UID directly instead of user:group name
-    user: "65534:65534" # Use nobody user ID directly
+    user: "65534:65534"
     volumes:
       - /mnt/gluster/prometheus/config:/etc/prometheus:ro
       - prometheus_data:/prometheus
@@ -149,7 +147,7 @@ services:
 
   grafana:
     image: grafana/grafana:latest
-    user: "472" # This is the grafana user ID inside the container
+    user: "472"
     volumes:
       - grafana_data:/var/lib/grafana
       - /mnt/gluster/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -167,7 +165,6 @@ services:
         constraints:
           - node.role == manager
 
-  # Adding Redis Commander as requested
   redis-commander:
     image: rediscommander/redis-commander:latest
     ports:
@@ -183,7 +180,6 @@ services:
     depends_on:
       - redis
 
-  # Adding Redis
   redis:
     image: redis:alpine
     volumes:
