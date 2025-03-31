@@ -3,7 +3,7 @@ use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
@@ -519,9 +519,9 @@ impl CertificateIssuer {
     }
 
     // Get certificate expiry date
-    fn get_cert_expiry(&self, cert_path: &Path, domain: &str) -> Result<SystemTime> {
+    fn get_cert_expiry(&self, cert_path: &Path, domain: &str) -> Result<SystemTime, anyhow::Error> {
         // Execute openssl to get certificate expiry
-        let output = Command::new("openssl")
+        let output = std::process::Command::new("openssl")
             .arg("x509")
             .arg("-in")
             .arg(cert_path)
@@ -530,36 +530,96 @@ impl CertificateIssuer {
             .output()?;
 
         if !output.status.success() {
-            return Err(anyhow!("Failed to get certificate expiry"));
+            return Err(anyhow::anyhow!("Failed to get certificate expiry"));
         }
 
         let expiry_output = String::from_utf8_lossy(&output.stdout);
+        println!(
+            "Certificate expiry output for {}: {}",
+            domain, expiry_output
+        );
 
         // Parse the expiry date from output (format: notAfter=May 15 23:59:59 2024 GMT)
         let date_part = expiry_output
             .strip_prefix("notAfter=")
-            .ok_or_else(|| anyhow!("Unexpected output format"))?
+            .ok_or_else(|| anyhow::anyhow!("Unexpected output format"))?
             .trim();
 
-        // This is a simplified example - in production, use a proper date parser
-        // For this example, we'll return current time + 90 days
-        let expiry = SystemTime::now() + Duration::from_secs(90 * 24 * 60 * 60);
+        // Since parsing the exact date format is complex without proper libraries,
+        // we'll use the openssl x509 command again to get the expiry in seconds
+        let time_output = std::process::Command::new("openssl")
+            .arg("x509")
+            .arg("-in")
+            .arg(cert_path)
+            .arg("-noout")
+            .arg("-enddate")
+            .arg("-dateopt")
+            .arg("unix")
+            .output();
 
-        if let Ok(expiry) = self.get_cert_expiry(&cert_path, domain) {
-            let now = SystemTime::now();
-            if let Ok(remaining) = expiry.duration_since(now) {
-                // Record certificate expiry time
-                let domain_str = domain.to_string();
-                let remaining_seconds = remaining.as_secs();
+        match time_output {
+            Ok(output) if output.status.success() => {
+                let unix_time = String::from_utf8_lossy(&output.stdout);
+                if let Some(time_str) = unix_time.strip_prefix("notAfter=") {
+                    if let Ok(timestamp) = time_str.trim().parse::<u64>() {
+                        // Update the metric
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
 
-                // Update the metric
-                crate::metrics::PROXY_METRICS
-                    .certificate_expiry
-                    .with_label_values(&[&domain_str])
-                    .set(remaining_seconds as f64);
+                        let remaining_seconds = if timestamp > now { timestamp - now } else { 0 };
+
+                        // Update the metric
+                        crate::metrics::PROXY_METRICS
+                            .certificate_expiry
+                            .with_label_values(&[domain])
+                            .set(remaining_seconds as f64);
+
+                        return Ok(UNIX_EPOCH + Duration::from_secs(timestamp));
+                    }
+                }
+            }
+            _ => {
+                // Failed to get precise timestamp, continue with approximation
             }
         }
 
+        // Fallback: simplified parsing of the date string
+        println!("Using simplified date parsing for: {}", date_part);
+
+        // Simple heuristic: Extract year and estimate expiry
+        // This is a very rough approximation!
+        let year_str = date_part.split_whitespace().last().unwrap_or("2025");
+        let current_year = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        {
+            Ok(dur) => {
+                // Approximating current year from Unix timestamp
+                1970 + (dur.as_secs() / (365 * 24 * 60 * 60)) as u32
+            }
+            Err(_) => 2025, // Fallback if time is before epoch (shouldn't happen)
+        };
+
+        let cert_year = year_str.parse::<u32>().unwrap_or(current_year);
+        let years_valid = if cert_year > current_year {
+            cert_year - current_year
+        } else {
+            0
+        };
+
+        // Approximate expiry based on years valid
+        let expiry =
+            SystemTime::now() + Duration::from_secs(years_valid as u64 * 365 * 24 * 60 * 60);
+
+        // Update the metric with our approximation
+        if let Ok(remaining) = expiry.duration_since(SystemTime::now()) {
+            crate::metrics::PROXY_METRICS
+                .certificate_expiry
+                .with_label_values(&[domain])
+                .set(remaining.as_secs() as f64);
+        }
+
+        println!("Approximated expiry for {} set to {:?}", domain, expiry);
         Ok(expiry)
     }
 

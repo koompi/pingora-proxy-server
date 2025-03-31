@@ -409,25 +409,47 @@ impl ManagerProxy {
                     );
                 }
 
-                // Store values needed for timeout case
-                let domain = request.domain.clone();
-                let is_wildcard = request.wildcard;
+                // Check if certificate already exists before processing the request
+                if let Some(existing_cert) = issuer.check_certificate(&request.domain) {
+                    info!("Certificate already exists for domain: {}", request.domain);
 
-                // Process the request with a timeout
-                let status = tokio::time::timeout(
-                    std::time::Duration::from_secs(10), // 10 second timeout
-                    issuer.process_request(request),
-                )
-                .await
-                .unwrap_or_else(|_| CertificateStatus {
-                    domain,
-                    status: "timeout".to_string(),
-                    cert_path: None,
-                    key_path: None,
-                    expiry: None,
-                    error: Some("Certificate processing timed out".to_string()),
-                    is_wildcard,
-                });
+                    // Add wildcard flag if applicable
+                    let is_wildcard = request.wildcard.unwrap_or(false);
+                    let mut existing_cert = existing_cert;
+                    existing_cert.is_wildcard = Some(is_wildcard);
+
+                    // Send the existing certificate status
+                    let json = match serde_json::to_string(&existing_cert) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            return self
+                                .send_json_response(
+                                    session,
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    Self::error_response(&format!("Serialization error: {}", e)),
+                                )
+                                .await;
+                        }
+                    };
+
+                    // Send the response
+                    let mut resp = ResponseHeader::build(http::StatusCode::OK, None)?;
+                    resp.insert_header("content-type", "application/json")?;
+                    resp.insert_header("connection", "close")?;
+
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session
+                        .write_response_body(Some(Bytes::copy_from_slice(json.as_bytes())), true)
+                        .await?;
+
+                    session.response_written();
+                    session.set_keepalive(None);
+
+                    return Ok(true);
+                }
+
+                // Process the request for a new certificate
+                let status = issuer.process_request(request).await;
 
                 // Serialize the status directly
                 let json = serde_json::to_string(&status).unwrap_or_else(|_| {
