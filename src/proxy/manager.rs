@@ -409,8 +409,25 @@ impl ManagerProxy {
                     );
                 }
 
-                // Process the request
-                let status = issuer.process_request(request).await;
+                // Store values needed for timeout case
+                let domain = request.domain.clone();
+                let is_wildcard = request.wildcard;
+
+                // Process the request with a timeout
+                let status = tokio::time::timeout(
+                    std::time::Duration::from_secs(10), // 10 second timeout
+                    issuer.process_request(request),
+                )
+                .await
+                .unwrap_or_else(|_| CertificateStatus {
+                    domain,
+                    status: "timeout".to_string(),
+                    cert_path: None,
+                    key_path: None,
+                    expiry: None,
+                    error: Some("Certificate processing timed out".to_string()),
+                    is_wildcard,
+                });
 
                 // Serialize the status directly
                 let json = serde_json::to_string(&status).unwrap_or_else(|_| {
