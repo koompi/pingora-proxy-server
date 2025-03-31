@@ -10,8 +10,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::metrics::PROXY_METRICS;
-
 static ACTIVE_CHALLENGES: Lazy<Mutex<std::collections::HashMap<String, (String, String)>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -147,7 +145,11 @@ impl CertificateIssuer {
         if let Some(mut status) = self.check_certificate(&request.domain) {
             // Certificate exists, check if it's expiring soon (within 30 days)
             if status.status == "valid" {
-                // Certificate is still valid, do nothing
+                // Certificate is still valid, return immediately without further processing
+                println!(
+                    "Valid certificate found for {}, not issuing new one",
+                    request.domain
+                );
                 status.is_wildcard = Some(is_wildcard);
                 return status;
             }
