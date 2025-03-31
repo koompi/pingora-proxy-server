@@ -348,19 +348,12 @@ impl CertificateIssuer {
 
         println!("Issuing certificate for: {}", domain);
 
-        // Generate a token and validation string for the HTTP-01 challenge
-        let token = format!("{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-        let validation = format!("{}.{}", token, "valid-response-for-acme-challenge");
-
-        // Store the challenge token and validation for the HTTP server to use
-        if !is_wildcard {
-            let mut challenges = ACTIVE_CHALLENGES.lock().await;
-            challenges.insert(domain.to_string(), (token.clone(), validation.clone()));
-        }
-
-        // Build certbot command
+        // Build certbot command - use webroot directly, don't try to handle tokens yourself
         let mut cmd = Command::new("certbot");
         cmd.arg("certonly")
+            .arg("--webroot")
+            .arg("-w")
+            .arg("/var/www/html")
             .arg("--email")
             .arg(email)
             .arg("--agree-tos")
