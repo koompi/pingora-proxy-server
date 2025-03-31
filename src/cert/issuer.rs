@@ -294,8 +294,8 @@ impl CertificateIssuer {
             println!("Real key path: {:?}", real_key_path);
 
             // Check certificate expiry
-            match self.get_cert_expiry(&cert_path, clean_domain) {
-                Ok(expiry) => {
+            match std::panic::catch_unwind(|| self.get_cert_expiry(&cert_path, clean_domain)) {
+                Ok(Ok(expiry)) => {
                     let now = SystemTime::now();
                     let thirty_days = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -323,16 +323,17 @@ impl CertificateIssuer {
                         is_wildcard: None, // Will be set by the caller
                     });
                 }
-                Err(e) => {
-                    // Certificate exists but can't read expiry
+                _ => {
+                    println!("Error or timeout checking certificate expiry");
+                    // Return with unknown expiry instead of hanging
                     return Some(CertificateStatus {
                         domain: clean_domain.to_string(),
                         status: "unknown_expiry".to_string(),
                         cert_path: Some(cert_path.to_string_lossy().to_string()),
                         key_path: Some(key_path.to_string_lossy().to_string()),
                         expiry: None,
-                        error: Some(format!("Could not determine certificate expiry: {}", e)),
-                        is_wildcard: None, // Will be set by the caller
+                        error: Some("Could not determine certificate expiry".to_string()),
+                        is_wildcard: None,
                     });
                 }
             }
