@@ -246,13 +246,16 @@ pub struct TcpProxyService {
 }
 
 impl TcpProxyService {
-    pub fn new(servers: Arc<Mutex<ConfigStore>>, enable_tls: bool) -> Self {
-        Self {
+    pub async fn new(
+        servers: Arc<Mutex<ConfigStore>>,
+        enable_tls: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
             servers,
             db_mappings: Arc::new(Mutex::new(HashMap::new())),
             enable_tls,
-            ip_rules: DatabaseIpRules::new(),
-        }
+            ip_rules: DatabaseIpRules::new_with_storage().await?,
+        })
     }
 
     // Initialize database mappings from config

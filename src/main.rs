@@ -363,8 +363,12 @@ fn main() {
             .unwrap_or(!disable_ssl);
 
         // Create and add the TCP proxy service
-        let tcp_proxy_service =
-            proxy::tcp::TcpProxyService::new(config_store.clone(), tcp_proxy_tls);
+        let tcp_proxy_service = runtime
+            .block_on(proxy::tcp::TcpProxyService::new(
+                config_store.clone(),
+                tcp_proxy_tls,
+            ))
+            .unwrap();
 
         server.add_service(tcp_proxy_service);
         println!("TCP Proxy service added for database connections");
