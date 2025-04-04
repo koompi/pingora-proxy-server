@@ -16,6 +16,10 @@ services:
       - "443:443"
       - "81:81"
       - "9100:9100"
+      - "27017:27017" # MongoDB
+      - "5432:5432" # PostgreSQL
+      - "3306:3306" # MySQL/MariaDB
+      - "6379:6379" # Redis
     networks:
       - proxy-network
     volumes:
@@ -52,6 +56,9 @@ services:
       - HOSTNAME_FOR_LOCKS=${HOSTNAME}
       # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
+      - ENABLE_TCP_PROXY=true
+      - TCP_PROXY_TLS=false
+
     deploy:
       mode: replicated
       replicas: 3

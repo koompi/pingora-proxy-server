@@ -346,6 +346,27 @@ fn main() {
         }
     }
 
+    // Initialize the TCP Proxy service for databases
+    let enable_tcp_proxy = std::env::var("ENABLE_TCP_PROXY")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(true); // Enable by default
+
+    if enable_tcp_proxy {
+        println!("Initializing TCP Proxy service for database connections");
+
+        // By default, enable TLS if SSL is enabled for the main proxy
+        let tcp_proxy_tls = std::env::var("TCP_PROXY_TLS")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(!disable_ssl);
+
+        // Create and add the TCP proxy service
+        let tcp_proxy_service =
+            proxy::tcp::TcpProxyService::new(config_store.clone(), tcp_proxy_tls);
+
+        server.add_service(tcp_proxy_service);
+        println!("TCP Proxy service added for database connections");
+    }
+
     // Add more detailed logging before server start
     println!("Starting server with the following configuration:");
     println!("- SSL Enabled: {}", !disable_ssl);
