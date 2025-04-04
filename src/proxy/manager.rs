@@ -1285,64 +1285,46 @@ impl ProxyHttp for ManagerProxy {
             return self.handle_health_check(session).await;
         }
 
-        // Add IP rules handling - Check for either direct path or API path pattern
-        if path_segments.len() >= 3
-            && (path_segments[0] == "databases"
-                || (path_segments.len() >= 4
-                    && path_segments[0] == "api"
-                    && path_segments[1] == "v1"
-                    && path_segments[2] == "databases"))
-        {
-            // Extract database and check if it contains ip-rules
-            let db_index = if path_segments[0] == "databases" {
-                1
-            } else {
-                3
-            };
-            let rules_index = if path_segments[0] == "databases" {
-                2
-            } else {
-                4
-            };
-
-            if db_index < path_segments.len()
-                && rules_index < path_segments.len()
-                && path_segments[rules_index] == "ip-rules"
+        // NEW APPROACH: Use a dedicated ip-rules prefix to avoid conflicts
+        // Match paths like /ip-rules/[database] or /api/v1/ip-rules/[database]
+        if path_segments.len() >= 2 {
+            let base_index = if path_segments.len() >= 3
+                && path_segments[0] == "api"
+                && path_segments[1].starts_with("v")
             {
-                // Construct a simplified path for the handler
-                let simplified_segments = vec![
-                    "databases".to_string(),
-                    path_segments[db_index].clone(),
-                    "ip-rules".to_string(),
-                ];
+                2 // Skip /api/v1 prefix
+            } else {
+                0
+            };
 
-                // Add the IP if present (for DELETE operations)
-                if path_segments.len() > rules_index + 1 {
-                    let mut segments = simplified_segments.clone();
-                    segments.push(path_segments[rules_index + 1].clone());
-                    return self.handle_ip_rules(session, &method, &segments).await;
+            if base_index < path_segments.len() && path_segments[base_index] == "ip-rules" {
+                // We have a dedicated IP rules endpoint
+                if base_index + 1 < path_segments.len() {
+                    // Construct a normalized path for the handler
+                    let db_name = path_segments[base_index + 1].clone();
+
+                    let mut simplified_segments =
+                        vec!["databases".to_string(), db_name, "ip-rules".to_string()];
+
+                    // Add IP address for DELETE operations if present
+                    if base_index + 2 < path_segments.len() {
+                        simplified_segments.push(path_segments[base_index + 2].clone());
+                    }
+
+                    return self
+                        .handle_ip_rules(session, &method, &simplified_segments)
+                        .await;
+                } else {
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::BAD_REQUEST,
+                            Self::error_response("Missing database parameter"),
+                        )
+                        .await;
                 }
-
-                return self
-                    .handle_ip_rules(session, &method, &simplified_segments)
-                    .await;
             }
         }
-
-        // Check for API version prefix and adjust path segments accordingly
-        let actual_segments = if path_segments.len() >= 2
-            && path_segments[0] == "api"
-            && path_segments[1].starts_with("v")
-        {
-            // Skip the API version prefix
-            path_segments
-                .iter()
-                .skip(2)
-                .cloned()
-                .collect::<Vec<String>>()
-        } else {
-            path_segments.clone()
-        };
 
         // Prepare response data before any await points
         let response_data = match method.as_str() {
@@ -1363,10 +1345,10 @@ impl ProxyHttp for ManagerProxy {
                         .await;
                 }
 
-                self.handle_add_update_mapping(&method, &actual_segments)
+                self.handle_add_update_mapping(&method, &path_segments)
                     .await
             }
-            "DELETE" => self.handle_delete_mapping(&actual_segments).await,
+            "DELETE" => self.handle_delete_mapping(&path_segments).await,
             "GET" => {
                 // Important: We need to drop the MutexGuard before the await point
                 // Create mappings vector while holding the lock, then drop the lock
