@@ -179,17 +179,40 @@ impl TcpProxyService {
         let target_addr = format!("{}:{}", target_host, target_port);
 
         info!(
-            "Starting TCP proxy for {} on {}, forwarding to {}",
-            domain_name, listen_addr, target_addr
+            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {}, forwarding to {}",
+            domain_name, db_type, listen_addr, target_addr
         );
 
         let listener = match TcpListener::bind(&listen_addr).await {
-            Ok(l) => l,
+            Ok(l) => {
+                info!("TCP Proxy: Successfully bound to {}", listen_addr);
+                l
+            }
             Err(e) => {
-                error!("Failed to bind to {}: {}", listen_addr, e);
+                error!("TCP Proxy: Failed to bind to {}: {}", listen_addr, e);
                 return Err(Box::new(e));
             }
         };
+
+        // Log current stats periodically
+        let stats_clone = Arc::clone(&stats);
+        let domain_clone = domain_name.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Ok(stats) = stats_clone.lock() {
+                    info!(
+                        "TCP Proxy Stats for {}: Active: {}, Total: {}, Bytes In: {}, Bytes Out: {}",
+                        domain_clone,
+                        stats.active_connections,
+                        stats.total_connections,
+                        stats.bytes_in,
+                        stats.bytes_out
+                    );
+                }
+            }
+        });
 
         // Update stats
         {
@@ -263,10 +286,26 @@ impl TcpProxyService {
 
 // Function to handle a single proxied connection
 async fn proxy_connection(
-    inbound: TcpStream,
-    outbound: TcpStream,
+    mut inbound: TcpStream,
+    mut outbound: TcpStream,
     stats: Arc<Mutex<ConnectionStats>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Log connection details at start
+    let peer_addr = inbound
+        .peer_addr()
+        .map_or("unknown".to_string(), |addr| addr.to_string());
+    let local_addr = inbound
+        .local_addr()
+        .map_or("unknown".to_string(), |addr| addr.to_string());
+    let target_addr = outbound
+        .peer_addr()
+        .map_or("unknown".to_string(), |addr| addr.to_string());
+
+    info!(
+        "TCP Proxy: New connection established - Client: {} -> Proxy: {} -> Target: {}",
+        peer_addr, local_addr, target_addr
+    );
+
     // Split the streams
     let (mut ri, mut wi) = tokio::io::split(inbound);
     let (mut ro, mut wo) = tokio::io::split(outbound);
@@ -275,43 +314,56 @@ async fn proxy_connection(
     let (client_done_tx, mut client_done_rx) = mpsc::channel::<()>(1);
     let (server_done_tx, mut server_done_rx) = mpsc::channel::<()>(1);
 
-    // Forward data from client to server
+    // Forward data from client to server with enhanced logging
     let stats_clone1 = Arc::clone(&stats);
+    let client_addr = peer_addr.clone();
+    let target_addr_clone = target_addr.clone();
     let client_to_server = tokio::spawn(async move {
-        let mut buffer = [0; 8192]; // Larger buffer for better performance
+        let mut buffer = [0; 8192];
         let mut total_bytes = 0;
+        let mut last_log = std::time::Instant::now();
 
         loop {
             match ri.read(&mut buffer).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    info!("TCP Proxy: Client {} disconnected", client_addr);
+                    break;
+                }
                 Ok(n) => {
                     match wo.write_all(&buffer[0..n]).await {
                         Ok(_) => {
                             total_bytes += n;
-                            // Optionally update stats periodically for better performance
-                            if total_bytes > 1_000_000 {
-                                // Update every ~1MB
-                                if let Ok(mut stats_guard) = stats_clone1.lock() {
-                                    stats_guard.bytes_in += total_bytes;
-                                    total_bytes = 0;
-                                }
+                            // Log traffic stats every 30 seconds
+                            if last_log.elapsed() >= Duration::from_secs(30) {
+                                info!(
+                                    "TCP Proxy: Traffic from {} to {} - {} bytes transferred",
+                                    client_addr, target_addr_clone, total_bytes
+                                );
+                                last_log = std::time::Instant::now();
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            error!(
+                                "TCP Proxy: Write error to target {}: {}",
+                                target_addr_clone, e
+                            );
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    error!("TCP Proxy: Read error from client {}: {}", client_addr, e);
+                    break;
+                }
             }
         }
 
-        // Final stats update
-        if total_bytes > 0 {
-            if let Ok(mut stats_guard) = stats_clone1.lock() {
-                stats_guard.bytes_in += total_bytes;
-            }
+        // Update final stats
+        if let Ok(mut stats_guard) = stats_clone1.lock() {
+            stats_guard.bytes_in += total_bytes;
+            stats_guard.active_connections = stats_guard.active_connections.saturating_sub(1);
         }
 
-        // Signal that this direction is done
         let _ = client_done_tx.send(()).await;
     });
 
@@ -357,16 +409,20 @@ async fn proxy_connection(
 
     // Wait for either direction to complete
     tokio::select! {
-        _ = client_done_rx.recv() => {},
-        _ = server_done_rx.recv() => {},
+        _ = client_done_rx.recv() => {
+            info!("TCP Proxy: Client -> Server direction completed for {}", peer_addr);
+        }
+        _ = server_done_rx.recv() => {
+            info!("TCP Proxy: Server -> Client direction completed for {}", peer_addr);
+        }
     }
 
-    // Update connection stats
-    if let Ok(mut stats_guard) = stats.lock() {
-        stats_guard.active_connections = stats_guard.active_connections.saturating_sub(1);
-    }
+    info!(
+        "TCP Proxy: Connection closed - Client: {} -> Target: {}",
+        peer_addr, target_addr
+    );
 
-    // Clean up the remaining task
+    // Clean up tasks
     client_to_server.abort();
     server_to_client.abort();
 
