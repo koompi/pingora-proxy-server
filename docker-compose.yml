@@ -34,6 +34,7 @@ services:
       - /mnt/gluster/pingora-proxy/cert-reload:/pingora-proxy/cert-reload:rw
       - /mnt/gluster/cert_limits:/pingora-proxy/cert_limits:rw
       - /mnt/gluster/proxy-config:/app/config:rw
+      - /mnt/gluster/pingora-proxy/storage:/pingora-proxy/storage:rw # Add this line for IP rules storage
       # Use tmpfs mount for local locks
       - type: tmpfs
         target: /pingora-proxy/local-locks
@@ -243,3 +244,9 @@ volumes:
       type: none
       o: bind
       device: /mnt/gluster/pingora-proxy/cert-reload
+  ip_rules_storage:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/gluster/pingora-proxy/storage

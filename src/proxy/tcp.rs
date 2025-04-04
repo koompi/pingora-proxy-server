@@ -14,6 +14,7 @@ use tokio::time::Duration;
 use crate::config::model::ConfigStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use tokio::fs;
 
 // Database type enum
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,7 +88,7 @@ pub enum IpRuleType {
 }
 
 // Store IP rules per database
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseIpRules {
     // Key: database_name, Value: Set of IP rules
     pub rules: HashMap<String, HashSet<IpRule>>,
@@ -100,22 +101,70 @@ impl DatabaseIpRules {
         }
     }
 
+    // Add this method for initializing with storage load
+    pub async fn new_with_storage() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut rules = Self::new();
+        rules.load_from_storage().await?;
+        Ok(rules)
+    }
+
     // Add rule for specific database
-    pub fn add_rule(&mut self, database: &str, rule: IpRule) {
+    pub async fn add_rule(
+        &mut self,
+        database: &str,
+        rule: IpRule,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.rules
             .entry(database.to_string())
             .or_insert_with(HashSet::new)
             .insert(rule);
+
+        // Save to shared storage
+        self.save_to_storage().await?;
+
+        // Notify other nodes
+        let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
+        if let Some(parent) = reload_path.parent() {
+            if !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        // Write timestamp to trigger other nodes
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        fs::write(reload_path, now.to_string()).await?;
+
+        Ok(())
     }
 
     // Remove rule for specific database
-    pub fn remove_rule(&mut self, database: &str, ip: &str) -> bool {
+    pub async fn remove_rule(
+        &mut self,
+        database: &str,
+        ip: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut changed = false;
         if let Some(db_rules) = self.rules.get_mut(database) {
             let before_len = db_rules.len();
             db_rules.retain(|rule| rule.ip != ip);
-            return before_len != db_rules.len();
+            changed = before_len != db_rules.len();
+
+            if changed {
+                self.save_to_storage().await?;
+
+                // Notify other nodes
+                let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                fs::write(reload_path, now.to_string()).await?;
+            }
         }
-        false
+        Ok(changed)
     }
 
     // Check if IP is allowed for specific database
@@ -147,6 +196,44 @@ impl DatabaseIpRules {
     // Get all rules for specific database
     pub fn get_rules(&self, database: &str) -> Option<HashSet<IpRule>> {
         self.rules.get(database).cloned()
+    }
+
+    async fn save_to_storage(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Create storage directory if it doesn't exist
+        let storage_path = std::path::Path::new("/pingora-proxy/storage");
+        if let Some(parent) = storage_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Convert rules to JSON
+        let json = serde_json::to_string(&self.rules)?;
+
+        // Write to file atomically using a temporary file
+        let file_path = storage_path.join("ip_rules.json");
+        let temp_path = file_path.with_extension("tmp");
+
+        // Write to temporary file first
+        fs::write(&temp_path, json).await?;
+
+        // Rename temporary file to actual file (atomic operation)
+        tokio::fs::rename(&temp_path, &file_path).await?;
+
+        Ok(())
+    }
+
+    pub async fn load_from_storage(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let file_path = std::path::Path::new("/pingora-proxy/storage/ip_rules.json");
+
+        if file_path.exists() {
+            let content = fs::read_to_string(file_path).await?;
+            self.rules = serde_json::from_str(&content)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -375,6 +462,28 @@ impl TcpProxyService {
         }
 
         Ok(())
+    }
+
+    // Modified reload check to include file watching
+    async fn check_reload_needed(&self) -> bool {
+        let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
+
+        if reload_path.exists() {
+            if let Ok(content) = fs::read_to_string(reload_path).await {
+                if let Ok(timestamp) = content.trim().parse::<u64>() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    // Reload if the file was modified in the last 5 seconds
+                    if now - timestamp < 5 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 

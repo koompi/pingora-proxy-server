@@ -1198,27 +1198,27 @@ impl ManagerProxy {
                 let success = {
                     // Acquire the lock asynchronously
                     let mut ip_rules = self.ip_rules.lock().await;
-                    ip_rules.remove_rule(&database, &ip)
+                    ip_rules.remove_rule(&database, &ip).await
                 }; // MutexGuard is dropped here at end of scope
 
                 // Prepare response based on success
-                let response = if success {
-                    ApiResponse {
+                let success_result = success;
+                let response = match success_result {
+                    Ok(true) => ApiResponse {
                         status: "success".to_string(),
                         error: None,
                         message: Some("IP rule deleted successfully".to_string()),
                         mappings: None,
                         ip_rules: None,
                         health: None,
-                    }
-                } else {
-                    Self::error_response("IP rule not found")
+                    },
+                    _ => Self::error_response("IP rule not found"),
                 };
 
                 // Now send the response without holding the lock
                 self.send_json_response(
                     session,
-                    if success {
+                    if success_result.unwrap_or(false) {
                         http::StatusCode::OK
                     } else {
                         http::StatusCode::NOT_FOUND
@@ -1236,6 +1236,26 @@ impl ManagerProxy {
                 .await
             }
         }
+    }
+
+    async fn check_reload_needed(&self) -> bool {
+        let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
+
+        if reload_path.exists() {
+            // Using std::path::Path::exists() which is synchronous
+            if let Ok(content) = tokio::fs::read_to_string(reload_path).await {
+                if let Ok(timestamp) = content.trim().parse::<u64>() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    // Reload if the file was modified in the last 5 seconds
+                    return now - timestamp < 5;
+                }
+            }
+        }
+        false
     }
 }
 
