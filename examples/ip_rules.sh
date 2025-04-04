@@ -1,0 +1,1 @@
+curl -X GET "http://localhost:81/databases/default/ip-rules"

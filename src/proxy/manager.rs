@@ -1285,14 +1285,64 @@ impl ProxyHttp for ManagerProxy {
             return self.handle_health_check(session).await;
         }
 
-        // Add IP rules handling
+        // Add IP rules handling - Check for either direct path or API path pattern
         if path_segments.len() >= 3
-            && path_segments[0] == "databases"
-            && path_segments.contains(&"ip-rules".to_string())
+            && (path_segments[0] == "databases"
+                || (path_segments.len() >= 4
+                    && path_segments[0] == "api"
+                    && path_segments[1] == "v1"
+                    && path_segments[2] == "databases"))
         {
-            // No need to pre-check the lock with tokio mutex - it's async and doesn't return Result
-            return self.handle_ip_rules(session, &method, &path_segments).await;
+            // Extract database and check if it contains ip-rules
+            let db_index = if path_segments[0] == "databases" {
+                1
+            } else {
+                3
+            };
+            let rules_index = if path_segments[0] == "databases" {
+                2
+            } else {
+                4
+            };
+
+            if db_index < path_segments.len()
+                && rules_index < path_segments.len()
+                && path_segments[rules_index] == "ip-rules"
+            {
+                // Construct a simplified path for the handler
+                let simplified_segments = vec![
+                    "databases".to_string(),
+                    path_segments[db_index].clone(),
+                    "ip-rules".to_string(),
+                ];
+
+                // Add the IP if present (for DELETE operations)
+                if path_segments.len() > rules_index + 1 {
+                    let mut segments = simplified_segments.clone();
+                    segments.push(path_segments[rules_index + 1].clone());
+                    return self.handle_ip_rules(session, &method, &segments).await;
+                }
+
+                return self
+                    .handle_ip_rules(session, &method, &simplified_segments)
+                    .await;
+            }
         }
+
+        // Check for API version prefix and adjust path segments accordingly
+        let actual_segments = if path_segments.len() >= 2
+            && path_segments[0] == "api"
+            && path_segments[1].starts_with("v")
+        {
+            // Skip the API version prefix
+            path_segments
+                .iter()
+                .skip(2)
+                .cloned()
+                .collect::<Vec<String>>()
+        } else {
+            path_segments.clone()
+        };
 
         // Prepare response data before any await points
         let response_data = match method.as_str() {
@@ -1313,10 +1363,10 @@ impl ProxyHttp for ManagerProxy {
                         .await;
                 }
 
-                self.handle_add_update_mapping(&method, &path_segments)
+                self.handle_add_update_mapping(&method, &actual_segments)
                     .await
             }
-            "DELETE" => self.handle_delete_mapping(&path_segments).await,
+            "DELETE" => self.handle_delete_mapping(&actual_segments).await,
             "GET" => {
                 // Important: We need to drop the MutexGuard before the await point
                 // Create mappings vector while holding the lock, then drop the lock
