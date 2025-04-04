@@ -8,10 +8,12 @@ use pingora::server::{Fds, ShutdownWatch};
 use pingora::services::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::Duration;
 
 use crate::config::model::ConfigStore;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // Database type enum
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,11 +72,90 @@ struct DatabaseMapping {
     stats: Arc<Mutex<ConnectionStats>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
+pub struct IpRule {
+    pub ip: String,
+    pub rule_type: IpRuleType,
+    pub description: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
+pub enum IpRuleType {
+    Whitelist,
+    Blacklist,
+}
+
+// Store IP rules per database
+#[derive(Debug, Clone)]
+pub struct DatabaseIpRules {
+    // Key: database_name, Value: Set of IP rules
+    pub rules: HashMap<String, HashSet<IpRule>>,
+}
+
+impl DatabaseIpRules {
+    pub fn new() -> Self {
+        Self {
+            rules: HashMap::new(),
+        }
+    }
+
+    // Add rule for specific database
+    pub fn add_rule(&mut self, database: &str, rule: IpRule) {
+        self.rules
+            .entry(database.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(rule);
+    }
+
+    // Remove rule for specific database
+    pub fn remove_rule(&mut self, database: &str, ip: &str) -> bool {
+        if let Some(db_rules) = self.rules.get_mut(database) {
+            let before_len = db_rules.len();
+            db_rules.retain(|rule| rule.ip != ip);
+            return before_len != db_rules.len();
+        }
+        false
+    }
+
+    // Check if IP is allowed for specific database
+    pub fn is_ip_allowed(&self, database: &str, ip: &str) -> bool {
+        if let Some(db_rules) = self.rules.get(database) {
+            // Check if IP is explicitly blacklisted for this database
+            if db_rules
+                .iter()
+                .any(|rule| rule.rule_type == IpRuleType::Blacklist && rule.ip == ip)
+            {
+                return false;
+            }
+
+            // If there are any whitelist rules for this database, IP must be in whitelist
+            let has_whitelist = db_rules
+                .iter()
+                .any(|rule| rule.rule_type == IpRuleType::Whitelist);
+            if has_whitelist {
+                return db_rules
+                    .iter()
+                    .any(|rule| rule.rule_type == IpRuleType::Whitelist && rule.ip == ip);
+            }
+        }
+
+        // If no rules exist for this database or no whitelist rules, allow by default
+        true
+    }
+
+    // Get all rules for specific database
+    pub fn get_rules(&self, database: &str) -> Option<HashSet<IpRule>> {
+        self.rules.get(database).cloned()
+    }
+}
+
 // TCP Proxy Service
 pub struct TcpProxyService {
     servers: Arc<Mutex<ConfigStore>>,
     db_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
     enable_tls: bool,
+    ip_rules: DatabaseIpRules,
 }
 
 impl TcpProxyService {
@@ -83,6 +164,7 @@ impl TcpProxyService {
             servers,
             db_mappings: Arc::new(Mutex::new(HashMap::new())),
             enable_tls,
+            ip_rules: DatabaseIpRules::new(),
         }
     }
 
@@ -236,8 +318,20 @@ impl TcpProxyService {
                 accept_result = accept_future => {
                     match accept_result {
                         Ok((inbound, client_addr)) => {
-                            info!("New connection from {} to {} ({})",
-                                  client_addr, domain_name, db_type as u8);
+                            // Check if the client IP is allowed for this specific database
+                            let client_ip = client_addr.ip().to_string();
+                            if !self.ip_rules.is_ip_allowed(&domain_name, &client_ip) {
+                                error!(
+                                    "TCP Proxy: Connection rejected - unauthorized IP {} for database {}",
+                                    client_ip, domain_name
+                                );
+                                continue;
+                            }
+
+                            info!(
+                                "TCP Proxy: Authorized connection from {} to {} (type: {:?})",
+                                client_addr, domain_name, db_type
+                            );
 
                             // Update connection stats
                             {
@@ -467,6 +561,7 @@ impl Service for TcpProxyService {
                 servers: Arc::clone(&self.servers),
                 db_mappings: Arc::clone(&self.db_mappings),
                 enable_tls,
+                ip_rules: self.ip_rules.clone(),
             };
 
             tokio::spawn(async move {
@@ -554,6 +649,7 @@ impl Clone for TcpProxyService {
             servers: Arc::clone(&self.servers),
             db_mappings: Arc::clone(&self.db_mappings),
             enable_tls: self.enable_tls,
+            ip_rules: self.ip_rules.clone(),
         }
     }
 }

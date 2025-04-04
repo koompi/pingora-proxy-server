@@ -1,5 +1,6 @@
 use anyhow::Result;
 use log::{error, warn};
+use proxy::tcp::DatabaseIpRules;
 use services::letsencrypt::LetsEncryptService;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +147,7 @@ fn main() {
         ManagerProxy {
             servers: config_store.clone(),
             https_proxy: None,
+            ip_rules: Arc::new(DatabaseIpRules::new().into()),
         },
     );
 
@@ -284,6 +286,7 @@ fn main() {
                                     ManagerProxy {
                                         servers: config_store.clone(),
                                         https_proxy: Some((*shared_proxy).clone()),
+                                        ip_rules: Arc::new(DatabaseIpRules::new().into()),
                                     },
                                 );
 

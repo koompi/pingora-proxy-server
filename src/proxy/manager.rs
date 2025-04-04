@@ -9,14 +9,14 @@ use std::{
 use bytes::Bytes;
 use log::{error, info}; // Removed 'warn' as it's unused
 use pingora::{http, prelude::HttpPeer, Result};
-// Removed pingora_error import as it's no longer used
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
-use serde::Serialize; // Removed 'Deserialize' as it's unused
+use serde::{Deserialize, Serialize}; // Removed 'Deserialize' as it's unused
 
 use crate::config::model::{ConfigStore, MappingOrigin, ServerMapping};
 use crate::metrics::PROXY_METRICS;
 use crate::proxy::https::HttpsProxy;
+use crate::proxy::tcp::{DatabaseIpRules, IpRule, IpRuleType};
 use crate::{
     cert::certbot,
     config::file_manager::{create_mappings_from_store, update_config},
@@ -36,6 +36,8 @@ struct ApiResponse {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mappings: Option<Vec<DomainMapping>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_rules: Option<Vec<IpRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthStatus>,
 }
@@ -65,10 +67,20 @@ struct ComponentHealth {
 }
 
 /// Manager Proxy for configuration endpoints
-#[derive(Clone)]
 pub struct ManagerProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
     pub https_proxy: Option<HttpsProxy>,
+    pub ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+}
+
+impl ManagerProxy {
+    pub fn new(servers: Arc<Mutex<ConfigStore>>) -> Self {
+        Self {
+            servers,
+            ip_rules: Arc::new(tokio::sync::Mutex::new(DatabaseIpRules::new())),
+            https_proxy: None,
+        }
+    }
 }
 
 /// Manager for handling proxy configuration and certificate operations.
@@ -139,6 +151,7 @@ impl ManagerProxy {
             error: None,
             message: None,
             mappings: None,
+            ip_rules: None,
             health: None,
         }
     }
@@ -150,6 +163,7 @@ impl ManagerProxy {
             error: Some(message.to_string()),
             message: None,
             mappings: None,
+            ip_rules: None,
             health: None,
         }
     }
@@ -240,6 +254,7 @@ impl ManagerProxy {
                                 message: None,
                                 mappings: None,
                                 health: None,
+                                ip_rules: None,
                             },
                         )
                         .await;
@@ -258,6 +273,7 @@ impl ManagerProxy {
                     message: Some("Certificate reload completed successfully. All nodes will pick up changes within 15 seconds.".to_string()),
                     mappings: Some(mappings),
                     health: None,
+                    ip_rules: None,
                 },
             ).await;
         } else {
@@ -274,6 +290,7 @@ impl ManagerProxy {
                         ),
                         mappings: None,
                         health: None,
+                        ip_rules: None,
                     },
                 )
                 .await;
@@ -569,7 +586,6 @@ impl ManagerProxy {
         }
     }
 
-    // Handle adding or updating domain mapping
     // Handle adding or updating domain mapping
     async fn handle_add_update_mapping(
         &self,
@@ -877,6 +893,7 @@ impl ManagerProxy {
                         message: None,
                         mappings: Some(mappings),
                         health: None,
+                        ip_rules: None,
                     },
                 )
             }
@@ -926,6 +943,7 @@ impl ManagerProxy {
             message: Some("Health check completed".to_string()),
             health: Some(health_status),
             mappings: None,
+            ip_rules: None,
         };
 
         self.send_json_response(
@@ -1048,6 +1066,177 @@ impl ManagerProxy {
             Err(format!("Failed to connect to backend: {}", backend))
         }
     }
+
+    // Add this new method to handle IP rules requests
+    async fn handle_ip_rules(
+        &self,
+        session: &mut Session,
+        method: &str,
+        path_segments: &[String],
+    ) -> Result<bool> {
+        if path_segments.len() < 3
+            || path_segments[0] != "databases"
+            || path_segments[2] != "ip-rules"
+        {
+            return self
+                .send_json_response(
+                    session,
+                    http::StatusCode::BAD_REQUEST,
+                    Self::error_response("Invalid IP rules path"),
+                )
+                .await;
+        }
+
+        let database = path_segments[1].clone();
+
+        match method {
+            "GET" => {
+                // Get the rules using tokio mutex
+                let rules = {
+                    // Acquire the lock asynchronously
+                    let ip_rules = self.ip_rules.lock().await;
+                    match ip_rules.get_rules(&database) {
+                        Some(rules) => rules.into_iter().collect(),
+                        None => Vec::new(),
+                    }
+                }; // MutexGuard is dropped here at end of scope
+
+                // Now send the response without holding the lock
+                self.send_json_response(
+                    session,
+                    http::StatusCode::OK,
+                    ApiResponse {
+                        status: "success".to_string(),
+                        error: None,
+                        message: None,
+                        mappings: None,
+                        ip_rules: Some(rules),
+                        health: None,
+                    },
+                )
+                .await
+            }
+            "POST" => {
+                let mut body = Vec::new();
+                loop {
+                    match session.downstream_session.read_request_body().await {
+                        Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        Err(e) => {
+                            return self
+                                .send_json_response(
+                                    session,
+                                    http::StatusCode::BAD_REQUEST,
+                                    Self::error_response(&format!(
+                                        "Failed to read request body: {}",
+                                        e
+                                    )),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
+                let rule: AddIpRuleRequest = match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return self
+                            .send_json_response(
+                                session,
+                                http::StatusCode::BAD_REQUEST,
+                                Self::error_response(&format!("Invalid request format: {}", e)),
+                            )
+                            .await;
+                    }
+                };
+
+                let new_rule = IpRule {
+                    ip: rule.ip.clone(),                   // Clone for response
+                    rule_type: rule.rule_type.clone(),     // Clone for response
+                    description: rule.description.clone(), // Clone for response
+                    created_at: chrono::Utc::now(),
+                };
+
+                let response_rule = new_rule.clone();
+
+                // Add the rule with tokio mutex
+                {
+                    // Acquire the lock asynchronously
+                    let mut ip_rules = self.ip_rules.lock().await;
+                    ip_rules.add_rule(&database, new_rule);
+                } // MutexGuard is dropped here at end of scope
+
+                // Now send the response without holding the lock
+                self.send_json_response(
+                    session,
+                    http::StatusCode::OK,
+                    ApiResponse {
+                        status: "success".to_string(),
+                        error: None,
+                        message: Some("IP rule added successfully".to_string()),
+                        mappings: None,
+                        ip_rules: Some(vec![response_rule]),
+                        health: None,
+                    },
+                )
+                .await
+            }
+            "DELETE" => {
+                if path_segments.len() != 4 {
+                    return self
+                        .send_json_response(
+                            session,
+                            http::StatusCode::BAD_REQUEST,
+                            Self::error_response("Missing IP address"),
+                        )
+                        .await;
+                }
+
+                let ip = path_segments[3].clone();
+
+                // Remove the rule with tokio mutex
+                let success = {
+                    // Acquire the lock asynchronously
+                    let mut ip_rules = self.ip_rules.lock().await;
+                    ip_rules.remove_rule(&database, &ip)
+                }; // MutexGuard is dropped here at end of scope
+
+                // Prepare response based on success
+                let response = if success {
+                    ApiResponse {
+                        status: "success".to_string(),
+                        error: None,
+                        message: Some("IP rule deleted successfully".to_string()),
+                        mappings: None,
+                        ip_rules: None,
+                        health: None,
+                    }
+                } else {
+                    Self::error_response("IP rule not found")
+                };
+
+                // Now send the response without holding the lock
+                self.send_json_response(
+                    session,
+                    if success {
+                        http::StatusCode::OK
+                    } else {
+                        http::StatusCode::NOT_FOUND
+                    },
+                    response,
+                )
+                .await
+            }
+            _ => {
+                self.send_json_response(
+                    session,
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    Self::error_response("Method not allowed for IP rules endpoint"),
+                )
+                .await
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1094,6 +1283,15 @@ impl ProxyHttp for ManagerProxy {
         // Handle health check directly
         if path.starts_with("/health") {
             return self.handle_health_check(session).await;
+        }
+
+        // Add IP rules handling
+        if path_segments.len() >= 3
+            && path_segments[0] == "databases"
+            && path_segments.contains(&"ip-rules".to_string())
+        {
+            // No need to pre-check the lock with tokio mutex - it's async and doesn't return Result
+            return self.handle_ip_rules(session, &method, &path_segments).await;
         }
 
         // Prepare response data before any await points
@@ -1170,6 +1368,7 @@ impl ProxyHttp for ManagerProxy {
                             message: None,
                             mappings: Some(mappings),
                             health: None,
+                            ip_rules: None,
                         },
                     )
                 }
@@ -1195,4 +1394,12 @@ impl ProxyHttp for ManagerProxy {
         let res = HttpPeer::new("127.0.0.1:80", false, "".to_string());
         Ok(Box::new(res))
     }
+}
+
+// Add request struct for IP rules
+#[derive(Deserialize)]
+struct AddIpRuleRequest {
+    ip: String,
+    rule_type: IpRuleType,
+    description: Option<String>,
 }
