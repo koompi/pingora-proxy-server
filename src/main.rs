@@ -2,6 +2,7 @@ use anyhow::Result;
 use log::{error, warn};
 use proxy::tcp::DatabaseIpRules;
 use services::letsencrypt::LetsEncryptService;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
@@ -195,77 +196,79 @@ fn main() {
     if !disable_ssl {
         // Create a standard HttpsProxy instance
         let https_proxy = HttpsProxy::new(config_store.clone());
-
-        // Create a shared reference to the proxy for our watcher service
         let shared_proxy = Arc::new(https_proxy.clone());
 
-        // Preload certificates
-        runtime.block_on(async {
-            if let Err(e) = shared_proxy.reload_certificates().await {
-                println!("Error initial loading of certificates: {:?}", e);
+        // Initialize certificates directory
+        let live_dir = PathBuf::from("/certbot/letsencrypt/live");
+
+        // Load all available certificates
+        let mut certificate_configs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&live_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Ok(domain) = entry.file_name().into_string() {
+                    let cert_path = live_dir.join(&domain).join("fullchain.pem");
+                    let key_path = live_dir.join(&domain).join("privkey.pem");
+
+                    if cert_path.exists() && key_path.exists() {
+                        println!("Found certificate for domain: {}", domain);
+                        certificate_configs.push((
+                            domain,
+                            cert_path.to_string_lossy().to_string(),
+                            key_path.to_string_lossy().to_string(),
+                        ));
+                    }
+                }
             }
-        });
+        }
 
-        // Get domains from config store
-        let domains = match config_store.lock() {
-            Ok(store) => store.keys().cloned().collect::<Vec<String>>(),
-            Err(e) => {
-                println!("Failed to lock config store: {:?}", e);
-                Vec::new()
-            }
-        };
-
-        // Find certificates
-        let certs = cert::certbot::find_certbot_certs(&domains);
-
-        // Create the service with the standard (non-Arc) instance
+        // Create HTTPS service with all certificates
         let mut https_service =
             pingora_proxy::http_proxy_service(&server.configuration, https_proxy);
 
-        if !certs.is_empty() {
-            // Use the first certificate for the main TLS binding
-            let first_cert = &certs[0];
-
-            if Path::new(&first_cert.cert_path).exists() && Path::new(&first_cert.key_path).exists()
-            {
-                // Simply bind with the first certificate
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Use the basic add_tls method with the primary certificate
-                    https_service.add_tls(
-                        "0.0.0.0:443",
-                        &first_cert.cert_path,
-                        &first_cert.key_path,
+        if !certificate_configs.is_empty() {
+            // Bind to HTTPS port with the first certificate as primary
+            let (primary_domain, primary_cert, primary_key) = &certificate_configs[0];
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                https_service.add_tls("0.0.0.0:443", primary_cert, primary_key);
+            })) {
+                Ok(_) => {
+                    println!(
+                        "HTTPS service configured with primary certificate for {}",
+                        primary_domain
                     );
-                })) {
-                    Ok(_) => {
-                        println!(
-                            "HTTPS service configured with primary certificate for {}",
-                            first_cert.domain
-                        );
 
-                        // Add the service
-                        server.add_service(https_service);
-                        println!("HTTPS service added to server");
+                    // Preload all certificates
+                    runtime.block_on(async {
+                        if let Err(e) = shared_proxy.reload_certificates().await {
+                            println!("Error loading certificates: {:?}", e);
+                        }
+                    });
 
-                        // Create and add the certificate watcher service
-                        let cert_watcher = services::cert_watcher::CertWatcherService::new(
-                            shared_proxy.clone(),
-                            15, // Check every 15 seconds
-                        );
-                        server.add_service(cert_watcher);
-                        println!("Certificate watcher service added");
-                    }
-                    Err(e) => {
-                        println!("Error binding to port 443: {:?}", e);
-                        println!("HTTPS service could not be initialized");
-                    }
+                    // Add the service
+                    server.add_service(https_service);
+
+                    // Create and add certificate watcher with configurable interval
+                    let check_interval = std::env::var("CERT_CHECK_INTERVAL")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(15); // Default 15 seconds
+
+                    let cert_watcher = services::cert_watcher::CertWatcherService::new(
+                        shared_proxy.clone(),
+                        check_interval,
+                    );
+                    server.add_service(cert_watcher);
+                    println!(
+                        "Certificate watcher service added (check interval: {}s)",
+                        check_interval
+                    );
                 }
-            } else {
-                println!("Primary certificate files are missing");
-                println!("HTTPS service could not be initialized");
+                Err(e) => {
+                    println!("Failed to bind HTTPS service: {:?}", e);
+                }
             }
         } else {
-            println!("No certificates found, HTTPS service will not be available");
+            println!("No valid certificates found in {}", live_dir.display());
         }
     } else {
         println!("SSL disabled by configuration");
