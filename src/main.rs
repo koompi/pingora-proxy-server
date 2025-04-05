@@ -1,16 +1,22 @@
 use anyhow::Result;
 use log::{error, warn};
+use openssl::ssl::{NameType, SniError, SslAlert, SslContext, SslFiletype, SslMethod, SslRef};
+use pingora::listeners::tls::TlsSettings;
+use pingora::server::Server;
+use proxy::https::HttpsProxy;
 use proxy::tcp::DatabaseIpRules;
 use services::letsencrypt::LetsEncryptService;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 use config::file_manager::get_config;
 use config::model::{ConfigStore, MappingOrigin};
-use pingora::server::Server;
-use proxy::https::HttpsProxy;
+use pingora::server::ListenFds;
+use pingora::services::listening::Service as ListeningService;
+use pingora::services::Service;
+use pingora_core::server::ShutdownWatch;
 
 mod cert;
 mod config;
@@ -24,9 +30,8 @@ use crate::services::metrics_service::MetricsService;
 const MAX_RETRIES: u32 = 3;
 
 async fn get_config_with_retry() -> Result<ConfigStore> {
-    let retries = 0;
+    let mut retries = 0;
     let mut last_error = None;
-
     while retries < MAX_RETRIES {
         match get_config().await {
             config_store => {
@@ -62,15 +67,50 @@ async fn load_fallback_config() -> Result<ConfigStore> {
     Ok(config)
 }
 
+struct CertificateInfo {
+    domain: String,
+    cert_path: String,
+    key_path: String,
+    ssl_context: SslContext,
+}
+
+struct Certificates {
+    certs: Vec<CertificateInfo>,
+}
+
+impl Certificates {
+    fn new(configs: &[(String, String, String)]) -> Result<Self> {
+        let mut certs = Vec::new();
+        for (domain, cert_path, key_path) in configs {
+            let ssl_context = Self::create_ssl_context(cert_path, key_path)?;
+            certs.push(CertificateInfo {
+                domain: domain.clone(),
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                ssl_context,
+            });
+        }
+        Ok(Self { certs })
+    }
+
+    fn create_ssl_context(cert_path: &str, key_path: &str) -> Result<SslContext> {
+        let mut builder = SslContext::builder(SslMethod::tls())?;
+        builder.set_certificate_chain_file(cert_path)?;
+        builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+        Ok(builder.build())
+    }
+
+    fn find_ssl_context(&self, server_name: &str) -> Option<&SslContext> {
+        self.certs
+            .iter()
+            .find(|cert| cert.domain == server_name)
+            .map(|cert| &cert.ssl_context)
+    }
+}
+
 fn main() {
     // Initialize logging
     crate::logging::setup_logging();
-
-    // IMPORTANT: Install the default CryptoProvider before anything else
-    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        eprintln!("Failed to install CryptoProvider: {:?}", e);
-        std::process::exit(1);
-    }
 
     // Fix the configuration file first
     config::utils::fix_config_file();
@@ -194,11 +234,9 @@ fn main() {
     }
 
     if !disable_ssl {
-        // Create a standard HttpsProxy instance
         let https_proxy = HttpsProxy::new(config_store.clone());
         let shared_proxy = Arc::new(https_proxy.clone());
 
-        // Initialize certificates directory
         let live_dir = PathBuf::from("/certbot/letsencrypt/live");
 
         // Load all available certificates
@@ -221,41 +259,58 @@ fn main() {
             }
         }
 
-        // Create HTTPS service with all certificates
-        let mut https_service =
-            pingora_proxy::http_proxy_service(&server.configuration, https_proxy);
-
         if !certificate_configs.is_empty() {
-            // Bind to HTTPS port with the first certificate as primary
-            let (primary_domain, primary_cert, primary_key) = &certificate_configs[0];
+            // Initialize certificates with all found configurations
+            let certificates = match Certificates::new(&certificate_configs) {
+                Ok(certs) => Arc::new(Mutex::new(certs)),
+                Err(e) => {
+                    println!("Failed to initialize certificates: {:?}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Create HTTPS service with SNI support
+            let mut https_service =
+                pingora_proxy::http_proxy_service(&server.configuration, https_proxy.clone());
+
+            // Use the first certificate as default
+            let (_, primary_cert, primary_key) = &certificate_configs[0];
+
+            // Configure TLS settings with SNI callback
+            let certificates_clone = certificates.clone();
+            let mut tls_settings = TlsSettings::intermediate(primary_cert, primary_key)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to create TLS settings: {}", e);
+                    std::process::exit(1);
+                });
+
+            tls_settings.enable_h2();
+            // Build the TLS acceptor
+            let mut acceptor = tls_settings.build();
+
+            // Use the first certificate as default
+            let (_, primary_cert, primary_key) = &certificate_configs[0];
+            // Create HTTPS service with the configured TLS settings
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 https_service.add_tls("0.0.0.0:443", primary_cert, primary_key);
             })) {
                 Ok(_) => {
                     println!(
-                        "HTTPS service configured with primary certificate for {}",
-                        primary_domain
+                        "HTTPS service configured with SNI support for {} domains",
+                        certificate_configs.len()
                     );
-
-                    // Preload all certificates
-                    runtime.block_on(async {
-                        if let Err(e) = shared_proxy.reload_certificates().await {
-                            println!("Error loading certificates: {:?}", e);
-                        }
-                    });
-
-                    // Add the service
                     server.add_service(https_service);
 
-                    // Create and add certificate watcher with configurable interval
+                    // Add certificate watcher service
                     let check_interval = std::env::var("CERT_CHECK_INTERVAL")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(15); // Default 15 seconds
+                        .unwrap_or(15);
 
                     let cert_watcher = services::cert_watcher::CertWatcherService::new(
                         shared_proxy.clone(),
                         check_interval,
+                        certificates.clone(),
                     );
                     server.add_service(cert_watcher);
                     println!(
@@ -273,6 +328,7 @@ fn main() {
     } else {
         println!("SSL disabled by configuration");
     }
+
     // Set up Swarm discovery if enabled
     let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
         .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
