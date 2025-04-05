@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::Path,
     str,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,58 +22,53 @@ use crate::{
 };
 
 use super::utils::extract_hostname;
-use log::{error, info};
+use log::{error, info, warn};
 
 // Add Debug implementation for HttpsProxy
 #[derive(Debug, Clone)]
 pub struct HttpsProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
     pub cert_cache: Arc<Mutex<HashMap<String, (Vec<u8>, Vec<u8>, u64)>>>, // (cert, key, timestamp)
+    pub domain_map: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ResolvesServerCert for HttpsProxy {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        // Extract the SNI name from the client hello
         let server_name = match client_hello.server_name() {
             Some(name) => {
                 info!("SNI request for domain: {}", name);
                 name
             }
             None => {
-                // If no SNI is provided, we can't determine which certificate to use
-                error!("No SNI provided in client hello, cannot select certificate");
+                error!("No SNI provided in client hello");
                 return None;
             }
         };
 
-        // Log more debugging info
-        info!("Processing SNI request for domain: {}", server_name);
+        // Normalize and log domain
+        let normalized_domain = server_name.to_lowercase();
+        info!(
+            "Processing SNI request for normalized domain: {}",
+            normalized_domain
+        );
 
-        // Try to get certificate for this domain
-        match self.get_certificate(server_name) {
-            Some((cert_data, key_data)) => {
-                info!("Found certificate for domain: {}", server_name);
-                match self.create_certified_key(cert_data, key_data) {
-                    Ok(cert_key) => {
-                        info!("Successfully created certified key for: {}", server_name);
-                        Some(cert_key)
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create certified key for {}: {:?}",
-                            server_name, e
-                        );
-                        None
-                    }
+        // Attempt to get certificate with enhanced lookup
+        match self.get_certificate(&normalized_domain) {
+            Some((cert_data, key_data)) => match self.create_certified_key(cert_data, key_data) {
+                Ok(cert_key) => {
+                    info!(
+                        "Successfully created certified key for: {}",
+                        normalized_domain
+                    );
+                    Some(cert_key)
                 }
-            }
+                Err(e) => {
+                    error!("Failed to create certified key: {:?}", e);
+                    None
+                }
+            },
             None => {
-                error!("No certificate found for domain: {}", server_name);
-                // Log available certificates
-                if let Ok(cache) = self.cert_cache.lock() {
-                    let available = cache.keys().cloned().collect::<Vec<_>>();
-                    info!("Available certificates: {:?}", available);
-                }
+                error!("No certificate found for domain: {}", normalized_domain);
                 None
             }
         }
@@ -85,6 +80,7 @@ impl HttpsProxy {
         Self {
             servers,
             cert_cache: Arc::new(Mutex::new(HashMap::new())),
+            domain_map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -142,7 +138,8 @@ impl HttpsProxy {
                 Ok(cert_data) => match std::fs::read(&cert.key_path) {
                     Ok(key_data) => {
                         info!("Successfully loaded certificate for: {}", cert.domain);
-                        cache_guard.insert(normalized_domain, (cert_data, key_data, timestamp));
+                        cache_guard
+                            .insert(normalized_domain.clone(), (cert_data, key_data, timestamp));
                     }
                     Err(e) => {
                         error!("Failed to read key file for {}: {:?}", cert.domain, e);
@@ -174,50 +171,52 @@ impl HttpsProxy {
             error!("Failed to write reload status: {}", e);
         }
 
+        // Update domain map
+        {
+            // Remove .await here since we're using a write lock directly
+            let mut domain_map = self.domain_map.write().unwrap();
+            domain_map.clear();
+
+            // Build a more explicit mapping
+            for normalized_domain in cache_guard.keys() {
+                domain_map.insert(normalized_domain.clone(), normalized_domain.clone());
+            }
+        }
+
         Ok(())
     }
 
     pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-        // Normalize domain to lowercase for consistency
         let normalized_domain = domain.to_lowercase();
-        info!(
-            "Attempting to get certificate for domain: {}",
-            normalized_domain
-        );
 
-        let cache = match self.cert_cache.lock() {
-            Ok(cache) => cache,
-            Err(e) => {
-                error!("Failed to lock cert cache: {:?}", e);
-                return None;
-            }
+        // First, check the domain map for exact match
+        let canonical_domain = {
+            let domain_map = self.domain_map.read().unwrap();
+            domain_map.get(&normalized_domain).cloned()
         };
 
-        // Try exact match with normalized domain
-        if let Some((cert, key, _)) = cache.get(&normalized_domain) {
-            info!("Found exact certificate match for: {}", normalized_domain);
-            return Some((cert.clone(), key.clone()));
-        }
-
-        // Also try with the original domain as a fallback
-        if normalized_domain != domain {
-            if let Some((cert, key, _)) = cache.get(domain) {
-                info!(
-                    "Found certificate match for original domain case: {}",
-                    domain
-                );
+        if let Some(canonical_domain) = canonical_domain {
+            let cache = self.cert_cache.lock().unwrap();
+            if let Some((cert, key, _)) = cache.get(&canonical_domain) {
                 return Some((cert.clone(), key.clone()));
             }
         }
 
-        // Print available certificates for debugging
-        let available_domains = cache.keys().cloned().collect::<Vec<_>>().join(", ");
+        // Fallback to more flexible matching
+        let cache = self.cert_cache.lock().unwrap();
+
+        // Try exact match
+        if let Some((cert, key, _)) = cache.get(&normalized_domain) {
+            return Some((cert.clone(), key.clone()));
+        }
+
+        // Log available certificates for debugging
+        let available_domains: Vec<String> = cache.keys().cloned().collect();
         error!(
-            "No certificate found for {}. Available certificates: {}",
+            "No certificate found for {}. Available certificates: {:?}",
             normalized_domain, available_domains
         );
 
-        // Important: Do NOT fall back to any random certificate! Return None instead.
         None
     }
 
