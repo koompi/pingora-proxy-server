@@ -5,6 +5,7 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use proxy::https::HttpsProxy;
 use proxy::tcp::DatabaseIpRules;
+use services::cert_watcher::CertWatcherService;
 use services::letsencrypt::LetsEncryptService;
 use std::fs;
 use std::path::Path;
@@ -198,24 +199,7 @@ fn main() {
         let live_dir = PathBuf::from("/certbot/letsencrypt/live");
 
         // Load all available certificates
-        let mut certificate_configs = Vec::new();
-        if let Ok(entries) = fs::read_dir(&live_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                if let Ok(domain) = entry.file_name().into_string() {
-                    let cert_path = live_dir.join(&domain).join("fullchain.pem");
-                    let key_path = live_dir.join(&domain).join("privkey.pem");
-
-                    if cert_path.exists() && key_path.exists() {
-                        println!("Found certificate for domain: {}", domain);
-                        certificate_configs.push((
-                            domain,
-                            cert_path.to_string_lossy().to_string(),
-                            key_path.to_string_lossy().to_string(),
-                        ));
-                    }
-                }
-            }
-        }
+        let certificate_configs = load_certificates_from_directory("/certbot/letsencrypt/live");
 
         if !certificate_configs.is_empty() {
             // Initialize certificates with all found configurations
@@ -248,9 +232,36 @@ fn main() {
                 }
             });
 
-            // Add TLS binding
+            // Set ALPN callback to prefer HTTP/2
+            tls_settings.set_alpn_select_callback(tls::prefer_h2);
+
+            // Add TLS binding with settings
             https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+
+            // Add HTTPS service
             server.add_service(https_service);
+
+            // Initialize the manager proxy with the HTTPS proxy
+            let mut manager_proxy = proxy::manager::ManagerProxy::new(config_store.clone());
+            manager_proxy.https_proxy = Some((*shared_proxy).clone());
+
+            // Create manager service
+            let mut manager_service =
+                pingora_proxy::http_proxy_service(&server.configuration, manager_proxy);
+            manager_service.add_tcp("0.0.0.0:81");
+
+            // Add the service to the server
+            server.add_service(manager_service);
+
+            // Add certificate watcher service
+            let cert_watcher = CertWatcherService::new(
+                shared_proxy,
+                certificates.clone(),
+                15, // Check every 15 seconds
+            );
+            server.add_service(cert_watcher);
+
+            println!("HTTPS service configured with SNI support");
         } else {
             println!("No valid certificates found in {}", live_dir.display());
         }

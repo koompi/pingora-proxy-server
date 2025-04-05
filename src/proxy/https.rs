@@ -100,53 +100,32 @@ impl HttpsProxy {
     }
 
     // Enhance reload_certificates to handle multiple domains
+    // Reload certificates method
     pub async fn reload_certificates(&self) -> Result<()> {
-        info!("Starting multi-domain certificate reload process...");
+        info!("Reloading certificates");
 
-        // Get current timestamp for cache invalidation
-        let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs(),
-            Err(err) => {
-                error!("Failed to get system time: {:?}", err);
-                return Err(Error::new(ErrorType::ConnectRefused));
-            }
-        };
-
-        // Get domains from servers configuration
+        // Get all domains from config
         let domains = {
-            let servers_guard = match self.servers.lock() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    error!("Failed to lock servers: {:?}", err);
-                    return Err(Error::new(ErrorType::ConnectRefused));
+            let store = match self.servers.lock() {
+                Ok(store) => store,
+                Err(e) => {
+                    error!("Failed to lock config store: {:?}", e);
+                    return Err(Error::new(ErrorType::InternalError));
                 }
             };
-            servers_guard.keys().cloned().collect::<Vec<String>>()
+
+            store.keys().cloned().collect::<Vec<String>>()
         };
 
-        info!("Reloading certificates for {} domains", domains.len());
-
+        // Find all available certificates
         let certs = certbot::find_certbot_certs(&domains);
-
-        // More detailed logging
-        info!(
-            "Found {} certificates for domains: {:?}",
-            certs.len(),
-            domains
-        );
-        for cert in &certs {
-            println!(
-                "Certificate details: Domain={}, Cert Path={}, Key Path={}",
-                cert.domain, cert.cert_path, cert.key_path
-            );
-        }
 
         // Lock cert cache for update
         let mut cache_guard = match self.cert_cache.lock() {
             Ok(guard) => guard,
             Err(e) => {
                 error!("Failed to lock cert cache: {:?}", e);
-                return Err(Error::new(ErrorType::ConnectRefused));
+                return Err(Error::new(ErrorType::InternalError));
             }
         };
 
@@ -165,6 +144,15 @@ impl HttpsProxy {
                 (Ok(cert_data), Ok(key_data)) => {
                     info!("Successfully loaded certificate for: {}", cert.domain);
 
+                    // Get current timestamp
+                    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(err) => {
+                            error!("Failed to get system time: {:?}", err);
+                            0
+                        }
+                    };
+
                     // Store with lowercase domain for consistent lookup
                     cache_guard.insert(
                         cert.domain.to_lowercase(),
@@ -173,10 +161,8 @@ impl HttpsProxy {
 
                     // If this is a wildcard certificate, also add wildcard entry
                     if cert.domain.starts_with("*.") {
-                        cache_guard.insert(
-                            cert.domain.to_lowercase(),
-                            (cert_data.clone(), key_data.clone(), timestamp),
-                        );
+                        cache_guard
+                            .insert(cert.domain.to_lowercase(), (cert_data, key_data, timestamp));
                     }
                 }
                 _ => {
