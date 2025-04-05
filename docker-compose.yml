@@ -74,7 +74,7 @@ services:
       endpoint_mode: vip
       placement:
         constraints:
-          - node.role == selendra-01
+          - node.hostname == selendra-01
         max_replicas_per_node: 1
     configs:
       - source: proxy-security-policy
