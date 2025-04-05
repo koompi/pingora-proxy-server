@@ -35,23 +35,34 @@ impl ResolvesServerCert for HttpsProxy {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         // Extract the SNI name from the client hello
         let server_name = match client_hello.server_name() {
-            Some(name) => name,
+            Some(name) => {
+                info!("SNI request for domain: {}", name);
+                name
+            }
             None => {
-                error!("No SNI name provided in client hello");
+                // If no SNI is provided, we can't determine which certificate to use
+                error!("No SNI provided in client hello, cannot select certificate");
                 return None;
             }
         };
 
-        info!("SNI request for domain: {}", server_name);
-
         // Get certificate for this domain
-        if let Some((cert_data, key_data)) = self.get_certificate(server_name) {
-            if let Ok(cert_key) = self.create_certified_key(cert_data, key_data) {
-                return Some(cert_key);
+        match self.get_certificate(server_name) {
+            Some((cert_data, key_data)) => match self.create_certified_key(cert_data, key_data) {
+                Ok(cert_key) => Some(cert_key),
+                Err(e) => {
+                    error!(
+                        "Failed to create certified key for {}: {:?}",
+                        server_name, e
+                    );
+                    None
+                }
+            },
+            None => {
+                error!("No certificate found for domain: {}", server_name);
+                None
             }
         }
-
-        None
     }
 }
 
@@ -150,7 +161,13 @@ impl HttpsProxy {
     }
 
     pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-        let cache = self.cert_cache.lock().ok()?;
+        let cache = match self.cert_cache.lock() {
+            Ok(cache) => cache,
+            Err(e) => {
+                error!("Failed to lock cert cache: {:?}", e);
+                return None;
+            }
+        };
 
         // Try exact match first
         if let Some((cert, key, _)) = cache.get(domain) {
@@ -180,13 +197,14 @@ impl HttpsProxy {
             return Some((cert.clone(), key.clone()));
         }
 
-        // Optional: Add debug output to help troubleshoot
+        // Log all available certificates for debugging
+        let available_domains = cache.keys().cloned().collect::<Vec<_>>().join(", ");
         info!(
-            "No certificate found for {}. Available certificates: {:?}",
-            domain,
-            cache.keys().collect::<Vec<_>>()
+            "No certificate found for {}. Available certificates: {}",
+            domain, available_domains
         );
 
+        // IMPORTANT: Do NOT fall back to any random certificate!
         None
     }
 
