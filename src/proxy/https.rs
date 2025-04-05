@@ -37,17 +37,7 @@ impl ResolvesServerCert for HttpsProxy {
         let server_name = match client_hello.server_name() {
             Some(name) => name,
             None => {
-                // If no SNI is provided, use the first certificate as fallback
-                if let Ok(cache) = self.cert_cache.lock() {
-                    if !cache.is_empty() {
-                        let (_, (cert_data, key_data, _)) = cache.iter().next().unwrap();
-                        if let Ok(cert_key) =
-                            self.create_certified_key(cert_data.clone(), key_data.clone())
-                        {
-                            return Some(cert_key);
-                        }
-                    }
-                }
+                error!("No SNI name provided in client hello");
                 return None;
             }
         };
@@ -164,6 +154,7 @@ impl HttpsProxy {
 
         // Try exact match first
         if let Some((cert, key, _)) = cache.get(domain) {
+            info!("Found exact certificate match for: {}", domain);
             return Some((cert.clone(), key.clone()));
         }
 
@@ -171,6 +162,10 @@ impl HttpsProxy {
         if domain.starts_with("www.") {
             let base_domain = &domain[4..];
             if let Some((cert, key, _)) = cache.get(base_domain) {
+                info!(
+                    "Found certificate match for {} using base domain: {}",
+                    domain, base_domain
+                );
                 return Some((cert.clone(), key.clone()));
             }
         }
@@ -178,18 +173,19 @@ impl HttpsProxy {
         // Try with "www." prefix added if not already present
         let www_domain = format!("www.{}", domain);
         if let Some((cert, key, _)) = cache.get(&www_domain) {
-            return Some((cert.clone(), key.clone()));
-        }
-
-        // Default to the first certificate as fallback (not ideal but better than nothing)
-        if !cache.is_empty() {
-            let (first_domain, (cert, key, _)) = cache.iter().next().unwrap();
             info!(
-                "No exact cert match for {}, using {} certificate",
-                domain, first_domain
+                "Found certificate match for {} using www domain: {}",
+                domain, www_domain
             );
             return Some((cert.clone(), key.clone()));
         }
+
+        // Optional: Add debug output to help troubleshoot
+        info!(
+            "No certificate found for {}. Available certificates: {:?}",
+            domain,
+            cache.keys().collect::<Vec<_>>()
+        );
 
         None
     }
