@@ -66,7 +66,7 @@ impl HttpsProxy {
         }
     }
 
-    // New method to find exact certificate match
+    // Enhanced certificate matching
     fn find_certificate_for_domain(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         let cache_guard = match self.cert_cache.lock() {
             Ok(guard) => guard,
@@ -76,7 +76,11 @@ impl HttpsProxy {
             }
         };
 
-        // Try direct lookup
+        // Logging to understand matching process
+        println!("Searching exact certificate for domain: {}", domain);
+        println!("Available certificates: {:?}", cache_guard.keys());
+
+        // Try direct lookup with exact match
         if let Some((cert, key, _)) = cache_guard.get(domain) {
             match self.create_certified_key(cert.clone(), key.clone()) {
                 Ok(cert_key) => {
@@ -89,10 +93,28 @@ impl HttpsProxy {
             }
         }
 
+        // If no exact match, try more flexible matching
+        for (cert_domain, (cert, key, _)) in cache_guard.iter() {
+            // Check if the certificate domain matches or covers this domain
+            if domain.ends_with(cert_domain) || cert_domain.starts_with("*.") {
+                match self.create_certified_key(cert.clone(), key.clone()) {
+                    Ok(cert_key) => {
+                        info!("Found matching certificate for {}: {}", domain, cert_domain);
+                        return Some(cert_key);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create certified key for {}: {:?}",
+                            cert_domain, e
+                        );
+                    }
+                }
+            }
+        }
+
         None
     }
 
-    // New method to find wildcard certificate
     fn find_wildcard_certificate(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         let cache_guard = match self.cert_cache.lock() {
             Ok(guard) => guard,
@@ -102,14 +124,15 @@ impl HttpsProxy {
             }
         };
 
-        // Split domain to extract base domain for wildcard matching
+        // More advanced wildcard certificate matching
         let parts: Vec<&str> = domain.split('.').collect();
-        if parts.len() < 2 {
-            return None;
-        }
 
-        // Try finding a wildcard certificate
+        // Try exact wildcard match first
         let wildcard_domain = format!("*.{}", parts[1..].join("."));
+
+        println!("Searching wildcard certificate for domain: {}", domain);
+        println!("Potential wildcard domain: {}", wildcard_domain);
+        println!("Available certificates: {:?}", cache_guard.keys());
 
         if let Some((cert, key, _)) = cache_guard.get(&wildcard_domain) {
             match self.create_certified_key(cert.clone(), key.clone()) {
@@ -156,9 +179,20 @@ impl HttpsProxy {
 
         info!("Reloading certificates for {} domains", domains.len());
 
-        // Find certificates for domains
         let certs = certbot::find_certbot_certs(&domains);
-        info!("Found {} certificates", certs.len());
+
+        // More detailed logging
+        info!(
+            "Found {} certificates for domains: {:?}",
+            certs.len(),
+            domains
+        );
+        for cert in &certs {
+            println!(
+                "Certificate details: Domain={}, Cert Path={}, Key Path={}",
+                cert.domain, cert.cert_path, cert.key_path
+            );
+        }
 
         // Lock cert cache for update
         let mut cache_guard = match self.cert_cache.lock() {
