@@ -37,7 +37,7 @@ impl ResolvesServerCert for HttpsProxy {
         let server_name = match client_hello.server_name() {
             Some(name) => {
                 info!("SNI request for domain: {}", name);
-                name
+                name.to_lowercase()
             }
             None => {
                 error!("No SNI provided in client hello");
@@ -45,33 +45,15 @@ impl ResolvesServerCert for HttpsProxy {
             }
         };
 
-        // Normalize and log domain
-        let normalized_domain = server_name.to_lowercase();
-        info!(
-            "Processing SNI request for normalized domain: {}",
-            normalized_domain
-        );
+        // First, try exact match
+        let mut matching_cert = self.find_certificate_for_domain(&server_name);
 
-        // Attempt to get certificate with enhanced lookup
-        match self.get_certificate(&normalized_domain) {
-            Some((cert_data, key_data)) => match self.create_certified_key(cert_data, key_data) {
-                Ok(cert_key) => {
-                    info!(
-                        "Successfully created certified key for: {}",
-                        normalized_domain
-                    );
-                    Some(cert_key)
-                }
-                Err(e) => {
-                    error!("Failed to create certified key: {:?}", e);
-                    None
-                }
-            },
-            None => {
-                error!("No certificate found for domain: {}", normalized_domain);
-                None
-            }
+        // If no exact match, try wildcard matching
+        if matching_cert.is_none() {
+            matching_cert = self.find_wildcard_certificate(&server_name);
         }
+
+        matching_cert
     }
 }
 
@@ -84,9 +66,72 @@ impl HttpsProxy {
         }
     }
 
-    /// Handles certificate loading and caching
+    // New method to find exact certificate match
+    fn find_certificate_for_domain(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+        let cache_guard = match self.cert_cache.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock cert cache: {:?}", e);
+                return None;
+            }
+        };
+
+        // Try direct lookup
+        if let Some((cert, key, _)) = cache_guard.get(domain) {
+            match self.create_certified_key(cert.clone(), key.clone()) {
+                Ok(cert_key) => {
+                    info!("Found exact certificate for: {}", domain);
+                    return Some(cert_key);
+                }
+                Err(e) => {
+                    error!("Failed to create certified key for {}: {:?}", domain, e);
+                }
+            }
+        }
+
+        None
+    }
+
+    // New method to find wildcard certificate
+    fn find_wildcard_certificate(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+        let cache_guard = match self.cert_cache.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock cert cache: {:?}", e);
+                return None;
+            }
+        };
+
+        // Split domain to extract base domain for wildcard matching
+        let parts: Vec<&str> = domain.split('.').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        // Try finding a wildcard certificate
+        let wildcard_domain = format!("*.{}", parts[1..].join("."));
+
+        if let Some((cert, key, _)) = cache_guard.get(&wildcard_domain) {
+            match self.create_certified_key(cert.clone(), key.clone()) {
+                Ok(cert_key) => {
+                    info!("Found wildcard certificate for: {}", wildcard_domain);
+                    return Some(cert_key);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create certified key for {}: {:?}",
+                        wildcard_domain, e
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    // Enhance reload_certificates to handle multiple domains
     pub async fn reload_certificates(&self) -> Result<()> {
-        info!("Starting certificate reload process...");
+        info!("Starting multi-domain certificate reload process...");
 
         // Get current timestamp for cache invalidation
         let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -97,7 +142,7 @@ impl HttpsProxy {
             }
         };
 
-        // Domains to check for certificates
+        // Get domains from servers configuration
         let domains = {
             let servers_guard = match self.servers.lock() {
                 Ok(guard) => guard,
@@ -131,23 +176,30 @@ impl HttpsProxy {
         for cert in certs {
             info!("Processing certificate for domain: {}", cert.domain);
 
-            // Store with lowercase domain for consistent lookup
-            let normalized_domain = cert.domain.to_lowercase();
+            // Try to read certificate and key
+            match (
+                std::fs::read(&cert.cert_path),
+                std::fs::read(&cert.key_path),
+            ) {
+                (Ok(cert_data), Ok(key_data)) => {
+                    info!("Successfully loaded certificate for: {}", cert.domain);
 
-            match std::fs::read(&cert.cert_path) {
-                Ok(cert_data) => match std::fs::read(&cert.key_path) {
-                    Ok(key_data) => {
-                        info!("Successfully loaded certificate for: {}", cert.domain);
-                        cache_guard
-                            .insert(normalized_domain.clone(), (cert_data, key_data, timestamp));
+                    // Store with lowercase domain for consistent lookup
+                    cache_guard.insert(
+                        cert.domain.to_lowercase(),
+                        (cert_data.clone(), key_data.clone(), timestamp),
+                    );
+
+                    // If this is a wildcard certificate, also add wildcard entry
+                    if cert.domain.starts_with("*.") {
+                        cache_guard.insert(
+                            cert.domain.to_lowercase(),
+                            (cert_data.clone(), key_data.clone(), timestamp),
+                        );
                     }
-                    Err(e) => {
-                        error!("Failed to read key file for {}: {:?}", cert.domain, e);
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read cert file for {}: {:?}", cert.domain, e);
+                }
+                _ => {
+                    error!("Failed to read certificate files for {}", cert.domain);
                     continue;
                 }
             }
@@ -158,28 +210,13 @@ impl HttpsProxy {
             cache_guard.len()
         );
 
-        // Write reload status to shared volume for other nodes
-        let reload_status_path = Path::new("/pingora-proxy/cert-reload/last_reload");
-        if let Some(parent) = reload_status_path.parent() {
-            if !parent.exists() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
-
-        let reload_info = format!("{}:{}", timestamp, domains.len());
-        if let Err(e) = std::fs::write(reload_status_path, reload_info) {
-            error!("Failed to write reload status: {}", e);
-        }
-
-        // Update domain map
+        // Update domain map with lowercase domains
         {
-            // Remove .await here since we're using a write lock directly
             let mut domain_map = self.domain_map.write().unwrap();
             domain_map.clear();
 
-            // Build a more explicit mapping
-            for normalized_domain in cache_guard.keys() {
-                domain_map.insert(normalized_domain.clone(), normalized_domain.clone());
+            for domain in cache_guard.keys() {
+                domain_map.insert(domain.clone(), domain.clone());
             }
         }
 
