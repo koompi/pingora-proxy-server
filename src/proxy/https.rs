@@ -76,10 +76,6 @@ impl HttpsProxy {
             }
         };
 
-        // Logging to understand matching process
-        println!("Searching exact certificate for domain: {}", domain);
-        println!("Available certificates: {:?}", cache_guard.keys());
-
         // Try direct lookup with exact match
         if let Some((cert, key, _)) = cache_guard.get(domain) {
             match self.create_certified_key(cert.clone(), key.clone()) {
@@ -556,12 +552,11 @@ impl ProxyHttp for HttpsProxy {
         let start_time_header = session.req_header().headers.get("x-request-start-time");
         if let Some(start_time_str) = start_time_header {
             if let Ok(start_time) = str::from_utf8(start_time_str.as_ref()) {
-                if let Ok(start_time_secs) = start_time.parse::<f64>() {
-                    let duration = start_time_secs;
+                if let Ok(start_time_secs) = str::parse::<f64>(start_time) {
                     PROXY_METRICS
                         .request_duration
                         .with_label_values(&[hostname.as_deref().unwrap_or("")])
-                        .observe(duration);
+                        .observe(start_time_secs);
                 }
             }
         }

@@ -19,9 +19,6 @@ mod proxy;
 mod services;
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::metrics_service::MetricsService;
-use proxy::http::HttpProxy;
-use proxy::manager::ManagerProxy;
-use rustls::crypto::ring::default_provider;
 
 const MAX_RETRIES: u32 = 3;
 
@@ -69,7 +66,7 @@ fn main() {
     crate::logging::setup_logging();
 
     // IMPORTANT: Install the default CryptoProvider before anything else
-    if let Err(e) = default_provider().install_default() {
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         eprintln!("Failed to install CryptoProvider: {:?}", e);
         std::process::exit(1);
     }
@@ -128,7 +125,7 @@ fn main() {
     // Create HTTP proxy service (for redirects and ACME challenges)
     let mut http_service = pingora_proxy::http_proxy_service(
         &server.configuration,
-        HttpProxy {
+        proxy::http::HttpProxy {
             servers: config_store.clone(),
             disable_ssl,
         },
@@ -141,7 +138,7 @@ fn main() {
     // Create manager service for configuration management
     let mut manager_service = pingora_proxy::http_proxy_service(
         &server.configuration,
-        ManagerProxy {
+        proxy::manager::ManagerProxy {
             servers: config_store.clone(),
             https_proxy: None,
             ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
@@ -249,21 +246,6 @@ fn main() {
                         // Add the service
                         server.add_service(https_service);
                         println!("HTTPS service added to server");
-
-                        // Create a new manager service with https_proxy
-                        let mut manager_service = pingora_proxy::http_proxy_service(
-                            &server.configuration,
-                            ManagerProxy {
-                                servers: config_store.clone(),
-                                https_proxy: Some((*shared_proxy).clone()),
-                                ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
-                            },
-                        );
-
-                        // Add TCP binding
-                        manager_service.add_tcp("0.0.0.0:81");
-                        server.add_service(manager_service);
-                        println!("Manager service updated with HTTPS proxy access");
 
                         // Create and add the certificate watcher service
                         let cert_watcher = services::cert_watcher::CertWatcherService::new(
