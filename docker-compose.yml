@@ -19,7 +19,7 @@ services:
       - "27017:27017" # MongoDB
       - "5432:5432" # PostgreSQL
       - "3306:3306" # MySQL/MariaDB
-      - "6379:6379" # Redis
+      # - "6379:6379" # Redis
     networks:
       - proxy-network
     volumes:
@@ -71,7 +71,7 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      endpoint_mode: dnsrr
+      endpoint_mode: vip
       placement:
         max_replicas_per_node: 1
     configs:
