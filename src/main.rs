@@ -231,8 +231,9 @@ fn main() {
 
             if Path::new(&first_cert.cert_path).exists() && Path::new(&first_cert.key_path).exists()
             {
-                // Bind to 443 with the primary certificate
+                // Simply bind with the first certificate
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Use the basic add_tls method with the primary certificate
                     https_service.add_tls(
                         "0.0.0.0:443",
                         &first_cert.cert_path,

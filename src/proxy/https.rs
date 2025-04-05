@@ -40,24 +40,28 @@ impl ResolvesServerCert for HttpsProxy {
                 name
             }
             None => {
-                // If no SNI is provided, we can't determine which certificate to use
                 error!("No SNI provided in client hello, cannot select certificate");
                 return None;
             }
         };
 
+        info!("Processing SNI request for {}", server_name);
+
         // Get certificate for this domain
         match self.get_certificate(server_name) {
-            Some((cert_data, key_data)) => match self.create_certified_key(cert_data, key_data) {
-                Ok(cert_key) => Some(cert_key),
-                Err(e) => {
-                    error!(
-                        "Failed to create certified key for {}: {:?}",
-                        server_name, e
-                    );
-                    None
+            Some((cert_data, key_data)) => {
+                info!("Found certificate for: {}", server_name);
+                match self.create_certified_key(cert_data, key_data) {
+                    Ok(cert_key) => Some(cert_key),
+                    Err(e) => {
+                        error!(
+                            "Failed to create certified key for {}: {:?}",
+                            server_name, e
+                        );
+                        None
+                    }
                 }
-            },
+            }
             None => {
                 error!("No certificate found for domain: {}", server_name);
                 None
