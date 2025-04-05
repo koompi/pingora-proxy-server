@@ -1,3 +1,4 @@
+use std::path::Path;
 // src/services/cert_watcher.rs
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -17,8 +18,8 @@ use crate::Mutex;
 
 pub struct CertWatcherService {
     https_proxy: Arc<HttpsProxy>,
-    check_interval: Duration,
     certificates: Arc<Mutex<Certificates>>,
+    check_interval: Duration,
 }
 
 impl CertWatcherService {
@@ -54,24 +55,32 @@ impl CertWatcherService {
 #[async_trait]
 impl Service for CertWatcherService {
     async fn start_service(&mut self, _fds: Option<ListenFds>, mut shutdown: ShutdownWatch) {
-        info!("Starting Certificate Watcher service...");
+        println!("Starting Certificate Watcher service...");
 
         let mut interval = time::interval(self.check_interval);
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if self.check_for_changes().await {
-                        info!("Reloading certificates due to notification...");
-                        if let Err(e) = self.https_proxy.reload_certificates().await {
-                            info!("Failed to reload certificates: {}", e);
+                    // Check for certificate changes
+                    let reload_path = Path::new("/pingora-proxy/cert-reload/last_reload");
+                    if reload_path.exists() {
+                        if let Ok(metadata) = fs::metadata(reload_path).await {
+                            if let Ok(modified) = metadata.modified() {
+                                if SystemTime::now().duration_since(modified).unwrap_or_default() < Duration::from_secs(60) {
+                                    println!("Reloading certificates...");
+                                    if let Err(e) = self.https_proxy.reload_certificates().await {
+                                        println!("Failed to reload certificates: {}", e);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
                 Ok(_) = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        info!("Shutdown signal received, stopping Certificate Watcher service");
+                        println!("Stopping Certificate Watcher service");
                         break;
                     }
                 }
@@ -81,9 +90,5 @@ impl Service for CertWatcherService {
 
     fn name(&self) -> &'static str {
         "certificate_watcher_service"
-    }
-
-    fn threads(&self) -> Option<usize> {
-        Some(1)
     }
 }

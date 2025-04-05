@@ -1826,6 +1826,7 @@ dependencies = [
  "log",
  "once_cell",
  "openssl",
+ "parking_lot",
  "pingora",
  "pingora-core",
  "pingora-error",

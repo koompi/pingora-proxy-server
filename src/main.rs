@@ -7,16 +7,14 @@ use proxy::https::HttpsProxy;
 use proxy::tcp::DatabaseIpRules;
 use services::letsencrypt::LetsEncryptService;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tls::Certificates;
 use tokio::sync::Mutex as TokioMutex;
 
 use config::file_manager::get_config;
 use config::model::{ConfigStore, MappingOrigin};
-use pingora::server::ListenFds;
-use pingora::services::listening::Service as ListeningService;
-use pingora::services::Service;
-use pingora_core::server::ShutdownWatch;
 
 mod cert;
 mod config;
@@ -24,6 +22,7 @@ mod logging;
 mod metrics;
 mod proxy;
 mod services;
+mod tls;
 use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::metrics_service::MetricsService;
 
@@ -65,47 +64,6 @@ async fn load_fallback_config() -> Result<ConfigStore> {
         ("127.0.0.1:8080".to_string(), MappingOrigin::Manual),
     );
     Ok(config)
-}
-
-struct CertificateInfo {
-    domain: String,
-    cert_path: String,
-    key_path: String,
-    ssl_context: SslContext,
-}
-
-struct Certificates {
-    certs: Vec<CertificateInfo>,
-}
-
-impl Certificates {
-    fn new(configs: &[(String, String, String)]) -> Result<Self> {
-        let mut certs = Vec::new();
-        for (domain, cert_path, key_path) in configs {
-            let ssl_context = Self::create_ssl_context(cert_path, key_path)?;
-            certs.push(CertificateInfo {
-                domain: domain.clone(),
-                cert_path: cert_path.clone(),
-                key_path: key_path.clone(),
-                ssl_context,
-            });
-        }
-        Ok(Self { certs })
-    }
-
-    fn create_ssl_context(cert_path: &str, key_path: &str) -> Result<SslContext> {
-        let mut builder = SslContext::builder(SslMethod::tls())?;
-        builder.set_certificate_chain_file(cert_path)?;
-        builder.set_private_key_file(key_path, SslFiletype::PEM)?;
-        Ok(builder.build())
-    }
-
-    fn find_ssl_context(&self, server_name: &str) -> Option<&SslContext> {
-        self.certs
-            .iter()
-            .find(|cert| cert.domain == server_name)
-            .map(|cert| &cert.ssl_context)
-    }
 }
 
 fn main() {
@@ -261,13 +219,9 @@ fn main() {
 
         if !certificate_configs.is_empty() {
             // Initialize certificates with all found configurations
-            let certificates = match Certificates::new(&certificate_configs) {
-                Ok(certs) => Arc::new(Mutex::new(certs)),
-                Err(e) => {
-                    println!("Failed to initialize certificates: {:?}", e);
-                    std::process::exit(1);
-                }
-            };
+            let certificates = Arc::new(Mutex::new(
+                Certificates::new(&certificate_configs).expect("Failed to initialize certificates"),
+            ));
 
             // Create HTTPS service with SNI support
             let mut https_service =
@@ -279,49 +233,24 @@ fn main() {
             // Configure TLS settings with SNI callback
             let certificates_clone = certificates.clone();
             let mut tls_settings = TlsSettings::intermediate(primary_cert, primary_key)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to create TLS settings: {}", e);
-                    std::process::exit(1);
-                });
+                .expect("Failed to create TLS settings");
 
             tls_settings.enable_h2();
-            // Build the TLS acceptor
-            // let mut acceptor = tls_settings.build().into_keeper();
 
-            // Use the first certificate as default
-            let (_, primary_cert, primary_key) = &certificate_configs[0];
-            // Create HTTPS service with the configured TLS settings
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                https_service.add_tls("0.0.0.0:443", primary_cert, primary_key);
-            })) {
-                Ok(_) => {
-                    println!(
-                        "HTTPS service configured with SNI support for {} domains",
-                        certificate_configs.len()
-                    );
-                    server.add_service(https_service);
-
-                    // Add certificate watcher service
-                    let check_interval = std::env::var("CERT_CHECK_INTERVAL")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(15);
-
-                    let cert_watcher = services::cert_watcher::CertWatcherService::new(
-                        shared_proxy.clone(),
-                        check_interval,
-                        certificates.clone(),
-                    );
-                    server.add_service(cert_watcher);
-                    println!(
-                        "Certificate watcher service added (check interval: {}s)",
-                        check_interval
-                    );
+            // Set SNI callback
+            tls_settings.set_servername_callback(move |ssl_ref, ssl_alert| {
+                // We need to handle the lock here
+                if let Ok(certs) = certificates_clone.lock() {
+                    certs.server_name_callback(ssl_ref, ssl_alert)
+                } else {
+                    // Fallback if lock fails
+                    Ok(())
                 }
-                Err(e) => {
-                    println!("Failed to bind HTTPS service: {:?}", e);
-                }
-            }
+            });
+
+            // Add TLS binding
+            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+            server.add_service(https_service);
         } else {
             println!("No valid certificates found in {}", live_dir.display());
         }
@@ -386,4 +315,29 @@ fn main() {
     // Start the server with run_forever
     println!("Starting server with configured services");
     server.run_forever();
+}
+
+// Function to load certificates from a directory
+fn load_certificates_from_directory(base_path: &str) -> Vec<(String, String, String)> {
+    let mut configs = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(base_path) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(domain) = entry.file_name().into_string() {
+                let cert_path = Path::new(base_path).join(&domain).join("fullchain.pem");
+                let key_path = Path::new(base_path).join(&domain).join("privkey.pem");
+
+                if cert_path.exists() && key_path.exists() {
+                    println!("Found certificate for domain: {}", domain);
+                    configs.push((
+                        domain,
+                        cert_path.to_string_lossy().to_string(),
+                        key_path.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    configs
 }
