@@ -62,7 +62,7 @@ services:
 
     deploy:
       mode: replicated
-      replicas: 3
+      replicas: 1
       update_config:
         parallelism: 1
         delay: 10s
@@ -73,6 +73,8 @@ services:
         delay: 5s
       endpoint_mode: vip
       placement:
+        constraints:
+          - node.hostname == selendra-01
         max_replicas_per_node: 1
     configs:
       - source: proxy-security-policy

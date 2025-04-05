@@ -73,6 +73,29 @@ struct DatabaseMapping {
     stats: Arc<Mutex<ConnectionStats>>,
 }
 
+impl DatabaseMapping {
+    pub fn new(domain: String, target: String) -> Self {
+        let db_type = DatabaseType::detect_from_domain(&domain);
+        let parts: Vec<&str> = target.split(':').collect();
+        let (target_host, target_port) = if parts.len() > 1 {
+            (
+                parts[0].to_string(),
+                parts[1].parse::<u16>().unwrap_or(db_type.default_port()),
+            )
+        } else {
+            (parts[0].to_string(), db_type.default_port())
+        };
+
+        DatabaseMapping {
+            public_port: db_type.default_port(), // All MongoDB instances can use 27017
+            target_host,
+            target_port,
+            db_type,
+            stats: Arc::new(Mutex::new(ConnectionStats::default())),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
 pub struct IpRule {
     pub ip: String,
@@ -339,7 +362,6 @@ impl TcpProxyService {
         Ok(())
     }
 
-    // Run a regular TCP proxy for the given mapping
     async fn run_tcp_proxy(
         &self,
         domain_name: String,
@@ -349,109 +371,74 @@ impl TcpProxyService {
         db_type: DatabaseType,
         stats: Arc<Mutex<ConnectionStats>>,
         mut shutdown_rx: mpsc::Receiver<()>,
+        db_mappings_arc: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+        ip_rules: DatabaseIpRules,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listen_addr = format!("0.0.0.0:{}", public_port);
-        let target_addr = format!("{}:{}", target_host, target_port);
 
         info!(
-            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {}, forwarding to {}",
-            domain_name, db_type, listen_addr, target_addr
+            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {}",
+            domain_name, db_type, listen_addr
         );
 
-        let listener = match TcpListener::bind(&listen_addr).await {
-            Ok(l) => {
-                info!("TCP Proxy: Successfully bound to {}", listen_addr);
-                l
-            }
-            Err(e) => {
-                error!("TCP Proxy: Failed to bind to {}: {}", listen_addr, e);
-                return Err(Box::new(e));
-            }
-        };
-
-        // Log current stats periodically
-        let stats_clone = Arc::clone(&stats);
-        let domain_clone = domain_name.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                if let Ok(stats) = stats_clone.lock() {
-                    info!(
-                        "TCP Proxy Stats for {}: Active: {}, Total: {}, Bytes In: {}, Bytes Out: {}",
-                        domain_clone,
-                        stats.active_connections,
-                        stats.total_connections,
-                        stats.bytes_in,
-                        stats.bytes_out
-                    );
-                }
-            }
-        });
-
-        // Update stats
-        {
-            let mut stats_guard = stats.lock().unwrap();
-            stats_guard.active_connections = 0;
-            stats_guard.total_connections = 0;
-        }
+        let listener = TcpListener::bind(&listen_addr).await?;
 
         loop {
-            // Check for shutdown signal
-            if let Ok(()) = shutdown_rx.try_recv() {
-                info!("Shutting down TCP proxy for {}", domain_name);
-                break;
-            }
-
-            // Accept with timeout to allow shutdown checks
-            let accept_future = listener.accept();
-            let timeout = tokio::time::sleep(Duration::from_secs(1));
-
             tokio::select! {
-                accept_result = accept_future => {
+                accept_result = listener.accept() => {
                     match accept_result {
                         Ok((inbound, client_addr)) => {
-                            // Check if the client IP is allowed for this specific database
+                            let host = match get_connection_hostname(&inbound) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    error!("Failed to get hostname: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            // Get the mapping information before any await points
+                            let (backend, stats_arc) = {
+                                let db_mappings = db_mappings_arc.lock().unwrap();
+                                if let Some(mapping) = db_mappings.get(&host) {
+                                    (
+                                        format!("{}:{}", mapping.target_host, mapping.target_port),
+                                        Arc::clone(&mapping.stats)
+                                    )
+                                } else {
+                                    error!("No backend mapping found for host: {}", host);
+                                    continue;
+                                }
+                            }; // MutexGuard is dropped here
+
+                            // Check IP rules
                             let client_ip = client_addr.ip().to_string();
-                            if !self.ip_rules.is_ip_allowed(&domain_name, &client_ip) {
+                            if !ip_rules.is_ip_allowed(&host, &client_ip) {
                                 error!(
                                     "TCP Proxy: Connection rejected - unauthorized IP {} for database {}",
-                                    client_ip, domain_name
+                                    client_ip, host
                                 );
                                 continue;
                             }
 
-                            info!(
-                                "TCP Proxy: Authorized connection from {} to {} (type: {:?})",
-                                client_addr, domain_name, db_type
-                            );
-
                             // Update connection stats
                             {
-                                let mut stats_guard = stats.lock().unwrap();
+                                let mut stats_guard = stats_arc.lock().unwrap();
                                 stats_guard.active_connections += 1;
                                 stats_guard.total_connections += 1;
                             }
 
                             // Connect to the target
-                            match TcpStream::connect(&target_addr).await {
+                            match TcpStream::connect(&backend).await {
                                 Ok(outbound) => {
-                                    // Clone stats for the connection
-                                    let conn_stats = Arc::clone(&stats);
-
-                                    // Start proxying data
+                                    let conn_stats = Arc::clone(&stats_arc);
                                     tokio::spawn(async move {
                                         let _ = proxy_connection(inbound, outbound, conn_stats).await;
                                     });
-                                },
+                                }
                                 Err(e) => {
-                                    error!("Failed to connect to target {}: {}", target_addr, e);
-
-                                    // Update stats on failure
-                                    {
-                                        let mut stats_guard = stats.lock().unwrap();
-                                        stats_guard.active_connections -= 1;
-                                    }
+                                    error!("Failed to connect to target {}: {}", backend, e);
+                                    let mut stats_guard = stats_arc.lock().unwrap();
+                                    stats_guard.active_connections -= 1;
                                 }
                             }
                         }
@@ -460,9 +447,9 @@ impl TcpProxyService {
                         }
                     }
                 }
-                _ = timeout => {
-                    // Timeout, check for shutdown again
-                    continue;
+                _ = shutdown_rx.recv() => {
+                    info!("Shutting down TCP proxy for {}", domain_name);
+                    break;
                 }
             }
         }
@@ -668,21 +655,27 @@ impl Service for TcpProxyService {
             let (tx, rx) = mpsc::channel::<()>(1);
             shutdown_channels.push(tx);
 
+            // Clone only what we need for the new task
             let domain_clone = domain.clone();
             let enable_tls = self.enable_tls;
-
-            // Clone the service data for the task
-            let service_clone = TcpProxyService {
-                servers: Arc::clone(&self.servers),
-                db_mappings: Arc::clone(&self.db_mappings),
-                enable_tls,
-                ip_rules: self.ip_rules.clone(),
-            };
+            let servers = Arc::clone(&self.servers);
+            let db_mappings = Arc::clone(&self.db_mappings);
+            let ip_rules = self.ip_rules.clone();
+            let db_mappings_clone = Arc::clone(&db_mappings);
+            let ip_rules_clone = ip_rules.clone();
 
             tokio::spawn(async move {
+                // Create a new service instance without holding any mutex guards
+                let service = TcpProxyService {
+                    servers,
+                    db_mappings,
+                    enable_tls,
+                    ip_rules,
+                };
+
                 // Run either TLS or regular TCP proxy based on configuration
                 if enable_tls {
-                    if let Err(e) = service_clone
+                    if let Err(e) = service
                         .run_tls_proxy(
                             domain_clone.clone(),
                             mapping.public_port,
@@ -697,7 +690,7 @@ impl Service for TcpProxyService {
                         error!("TLS proxy for {} failed: {}", domain_clone, e);
                     }
                 } else {
-                    if let Err(e) = service_clone
+                    if let Err(e) = service
                         .run_tcp_proxy(
                             domain_clone.clone(),
                             mapping.public_port,
@@ -706,6 +699,8 @@ impl Service for TcpProxyService {
                             mapping.db_type,
                             mapping.stats.clone(),
                             rx,
+                            db_mappings_clone, // Pass the arc
+                            ip_rules_clone,    // Pass the clone
                         )
                         .await
                     {
@@ -767,4 +762,20 @@ impl Clone for TcpProxyService {
             ip_rules: self.ip_rules.clone(),
         }
     }
+}
+
+// Add this helper function to extract hostname
+fn get_connection_hostname(
+    stream: &TcpStream,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // For TLS connections, you would use SNI (Server Name Indication)
+    // For now, we'll use a simple DNS reverse lookup as an example
+    if let Ok(addr) = stream.peer_addr() {
+        if let Ok(hostnames) = dns_lookup::lookup_addr(&addr.ip()) {
+            return Ok(hostnames);
+        }
+    }
+
+    // Fallback to IP address if no hostname found
+    Ok(stream.peer_addr()?.ip().to_string())
 }

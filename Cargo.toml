@@ -24,7 +24,7 @@ serde = "1.0.219"
 serde_json = "1.0.140"
 serde_yaml = "0.9.34"
 tokio = { version = "1.44.0", features = ["full"] }
-
+dns-lookup = "2.0"
 
 # Remove or comment these out
 # openssl = "0.23.23"
