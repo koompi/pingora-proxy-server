@@ -275,6 +275,9 @@ impl TcpProxyService {
                     || domain.contains(".mysql.")
                     || domain.contains(".redis.")
                     || domain.contains(".sql.")
+                    || domain.contains(".postgresql.")
+                    || domain.contains(".database.")
+                    || domain.contains(".db.")
                 {
                     let db_type = DatabaseType::detect_from_domain(domain);
                     if db_type == DatabaseType::Unknown {
