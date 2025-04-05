@@ -109,6 +109,11 @@ impl Certificates {
 }
 
 fn main() {
+    // Initialize rustls crypto provider
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
+
     // Initialize logging
     crate::logging::setup_logging();
 
