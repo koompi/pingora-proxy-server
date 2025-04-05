@@ -86,8 +86,18 @@ impl DatabaseMapping {
             (parts[0].to_string(), db_type.default_port())
         };
 
+        // Generate a unique port based on domain name hash
+        let domain_hash = calculate_hash(&domain);
+        let public_port = match db_type {
+            DatabaseType::MongoDB => 27017 + (domain_hash % 1000),
+            DatabaseType::PostgreSQL => 5432 + (domain_hash % 1000),
+            DatabaseType::MySQL => 3306 + (domain_hash % 1000),
+            DatabaseType::Redis => 6379 + (domain_hash % 1000),
+            DatabaseType::Unknown => db_type.default_port(),
+        };
+
         DatabaseMapping {
-            public_port: db_type.default_port(), // All MongoDB instances can use 27017
+            public_port, // Use the unique port
             target_host,
             target_port,
             db_type,
@@ -302,40 +312,18 @@ impl TcpProxyService {
                     || domain.contains(".database.")
                     || domain.contains(".db.")
                 {
-                    let db_type = DatabaseType::detect_from_domain(domain);
-                    if db_type == DatabaseType::Unknown {
-                        continue;
-                    }
-
-                    // Parse target backend (host:port)
-                    let parts: Vec<&str> = backend.split(':').collect();
-                    let (target_host, target_port) = if parts.len() > 1 {
-                        (
-                            parts[0].to_string(),
-                            parts[1].parse::<u16>().unwrap_or(db_type.default_port()),
-                        )
-                    } else {
-                        (parts[0].to_string(), db_type.default_port())
-                    };
-
-                    // Determine public port (same as target port by default)
-                    let public_port = target_port;
+                    let mapping = DatabaseMapping::new(domain.clone(), backend.clone());
 
                     info!(
-                        "Adding database mapping: {} -> {}:{} (type: {:?})",
-                        domain, target_host, target_port, db_type
+                        "Adding database mapping: {} -> {}:{} (type: {:?}) - Connect to port: {}",
+                        domain,
+                        mapping.target_host,
+                        mapping.target_port,
+                        mapping.db_type,
+                        mapping.public_port
                     );
 
-                    db_mappings.insert(
-                        domain.clone(),
-                        DatabaseMapping {
-                            public_port,
-                            target_host,
-                            target_port,
-                            db_type,
-                            stats: Arc::new(Mutex::new(ConnectionStats::default())),
-                        },
-                    );
+                    db_mappings.insert(domain.clone(), mapping);
                 }
             }
         }
@@ -377,8 +365,8 @@ impl TcpProxyService {
         let listen_addr = format!("0.0.0.0:{}", public_port);
 
         info!(
-            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {}",
-            domain_name, db_type, listen_addr
+            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {} -> {}:{}",
+            domain_name, db_type, listen_addr, target_host, target_port
         );
 
         let listener = TcpListener::bind(&listen_addr).await?;
@@ -388,56 +376,35 @@ impl TcpProxyService {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((inbound, client_addr)) => {
-                            let host = match get_connection_hostname(&inbound) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    error!("Failed to get hostname: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            // Get the mapping information before any await points
-                            let (backend, stats_arc) = {
-                                let db_mappings = db_mappings_arc.lock().unwrap();
-                                if let Some(mapping) = db_mappings.get(&host) {
-                                    (
-                                        format!("{}:{}", mapping.target_host, mapping.target_port),
-                                        Arc::clone(&mapping.stats)
-                                    )
-                                } else {
-                                    error!("No backend mapping found for host: {}", host);
-                                    continue;
-                                }
-                            }; // MutexGuard is dropped here
-
-                            // Check IP rules
+                            // Check IP rules using domain_name directly since we know it from the port
                             let client_ip = client_addr.ip().to_string();
-                            if !ip_rules.is_ip_allowed(&host, &client_ip) {
+                            if !ip_rules.is_ip_allowed(&domain_name, &client_ip) {
                                 error!(
                                     "TCP Proxy: Connection rejected - unauthorized IP {} for database {}",
-                                    client_ip, host
+                                    client_ip, domain_name
                                 );
                                 continue;
                             }
 
                             // Update connection stats
                             {
-                                let mut stats_guard = stats_arc.lock().unwrap();
+                                let mut stats_guard = stats.lock().unwrap();
                                 stats_guard.active_connections += 1;
                                 stats_guard.total_connections += 1;
                             }
 
                             // Connect to the target
+                            let backend = format!("{}:{}", target_host, target_port);
                             match TcpStream::connect(&backend).await {
                                 Ok(outbound) => {
-                                    let conn_stats = Arc::clone(&stats_arc);
+                                    let conn_stats = Arc::clone(&stats);
                                     tokio::spawn(async move {
                                         let _ = proxy_connection(inbound, outbound, conn_stats).await;
                                     });
                                 }
                                 Err(e) => {
                                     error!("Failed to connect to target {}: {}", backend, e);
-                                    let mut stats_guard = stats_arc.lock().unwrap();
+                                    let mut stats_guard = stats.lock().unwrap();
                                     stats_guard.active_connections -= 1;
                                 }
                             }
@@ -764,18 +731,11 @@ impl Clone for TcpProxyService {
     }
 }
 
-// Add this helper function to extract hostname
-fn get_connection_hostname(
-    stream: &TcpStream,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // For TLS connections, you would use SNI (Server Name Indication)
-    // For now, we'll use a simple DNS reverse lookup as an example
-    if let Ok(addr) = stream.peer_addr() {
-        if let Ok(hostnames) = dns_lookup::lookup_addr(&addr.ip()) {
-            return Ok(hostnames);
-        }
+// Add this helper function to calculate a simple hash
+fn calculate_hash(s: &str) -> u16 {
+    let mut hash: u32 = 0;
+    for b in s.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
     }
-
-    // Fallback to IP address if no hostname found
-    Ok(stream.peer_addr()?.ip().to_string())
+    (hash % 1000) as u16
 }
