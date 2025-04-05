@@ -161,6 +161,8 @@ impl HttpsProxy {
     }
 
     pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        info!("Attempting to get certificate for domain: {}", domain);
+
         let cache = match self.cert_cache.lock() {
             Ok(cache) => cache,
             Err(e) => {
@@ -175,36 +177,14 @@ impl HttpsProxy {
             return Some((cert.clone(), key.clone()));
         }
 
-        // Try with "www." prefix removed if the domain starts with "www."
-        if domain.starts_with("www.") {
-            let base_domain = &domain[4..];
-            if let Some((cert, key, _)) = cache.get(base_domain) {
-                info!(
-                    "Found certificate match for {} using base domain: {}",
-                    domain, base_domain
-                );
-                return Some((cert.clone(), key.clone()));
-            }
-        }
-
-        // Try with "www." prefix added if not already present
-        let www_domain = format!("www.{}", domain);
-        if let Some((cert, key, _)) = cache.get(&www_domain) {
-            info!(
-                "Found certificate match for {} using www domain: {}",
-                domain, www_domain
-            );
-            return Some((cert.clone(), key.clone()));
-        }
-
-        // Log all available certificates for debugging
+        // Print available certificates for debugging
         let available_domains = cache.keys().cloned().collect::<Vec<_>>().join(", ");
         info!(
             "No certificate found for {}. Available certificates: {}",
             domain, available_domains
         );
 
-        // IMPORTANT: Do NOT fall back to any random certificate!
+        // Important: Do NOT fall back to any random certificate! Return None instead.
         None
     }
 
