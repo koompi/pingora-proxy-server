@@ -36,44 +36,28 @@ impl ResolvesServerCert for HttpsProxy {
         // Extract the SNI name from the client hello
         let server_name = match client_hello.server_name() {
             Some(name) => name,
-            None => return None,
+            None => {
+                // If no SNI is provided, use the first certificate as fallback
+                if let Ok(cache) = self.cert_cache.lock() {
+                    if !cache.is_empty() {
+                        let (_, (cert_data, key_data, _)) = cache.iter().next().unwrap();
+                        if let Ok(cert_key) =
+                            self.create_certified_key(cert_data.clone(), key_data.clone())
+                        {
+                            return Some(cert_key);
+                        }
+                    }
+                }
+                return None;
+            }
         };
 
         info!("SNI request for domain: {}", server_name);
 
-        // Try to find the certificate in our cache
-        if let Ok(cache) = self.cert_cache.lock() {
-            // First try exact match
-            if let Some((cert_data, key_data, _)) = cache.get(server_name) {
-                if let Ok(cert_key) = self.create_certified_key(cert_data.clone(), key_data.clone())
-                {
-                    return Some(cert_key);
-                }
-            }
-
-            // Try with "www." prefix removed
-            if server_name.starts_with("www.") {
-                let base_domain = &server_name[4..];
-                if let Some((cert_data, key_data, _)) = cache.get(base_domain) {
-                    if let Ok(cert_key) =
-                        self.create_certified_key(cert_data.clone(), key_data.clone())
-                    {
-                        return Some(cert_key);
-                    }
-                }
-            }
-
-            // If we have no match but have other certs, use the first one as fallback
-            if !cache.is_empty() {
-                let (first_domain, (cert_data, key_data, _)) = cache.iter().next().unwrap();
-                info!(
-                    "No exact cert match for {}, using {} certificate",
-                    server_name, first_domain
-                );
-                if let Ok(cert_key) = self.create_certified_key(cert_data.clone(), key_data.clone())
-                {
-                    return Some(cert_key);
-                }
+        // Get certificate for this domain
+        if let Some((cert_data, key_data)) = self.get_certificate(server_name) {
+            if let Ok(cert_key) = self.create_certified_key(cert_data, key_data) {
+                return Some(cert_key);
             }
         }
 
@@ -177,9 +161,37 @@ impl HttpsProxy {
 
     pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
         let cache = self.cert_cache.lock().ok()?;
-        cache
-            .get(domain)
-            .map(|(cert, key, _)| (cert.clone(), key.clone()))
+
+        // Try exact match first
+        if let Some((cert, key, _)) = cache.get(domain) {
+            return Some((cert.clone(), key.clone()));
+        }
+
+        // Try with "www." prefix removed if the domain starts with "www."
+        if domain.starts_with("www.") {
+            let base_domain = &domain[4..];
+            if let Some((cert, key, _)) = cache.get(base_domain) {
+                return Some((cert.clone(), key.clone()));
+            }
+        }
+
+        // Try with "www." prefix added if not already present
+        let www_domain = format!("www.{}", domain);
+        if let Some((cert, key, _)) = cache.get(&www_domain) {
+            return Some((cert.clone(), key.clone()));
+        }
+
+        // Default to the first certificate as fallback (not ideal but better than nothing)
+        if !cache.is_empty() {
+            let (first_domain, (cert, key, _)) = cache.iter().next().unwrap();
+            info!(
+                "No exact cert match for {}, using {} certificate",
+                domain, first_domain
+            );
+            return Some((cert.clone(), key.clone()));
+        }
+
+        None
     }
 
     pub async fn reload_certificate_for_domain(&self, domain: &str) -> Result<()> {

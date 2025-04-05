@@ -195,7 +195,6 @@ fn main() {
         println!("Let's Encrypt certificate service added");
     }
 
-    // Instead of using with_callbacks which doesn't accept arguments in your version
     if !disable_ssl {
         // Create a standard HttpsProxy instance
         let https_proxy = HttpsProxy::new(config_store.clone());
@@ -232,56 +231,49 @@ fn main() {
 
             if Path::new(&first_cert.cert_path).exists() && Path::new(&first_cert.key_path).exists()
             {
-                match pingora::listeners::tls::TlsSettings::intermediate(
-                    &first_cert.cert_path,
-                    &first_cert.key_path,
-                ) {
-                    Ok(tls_settings) => {
-                        // Bind to 443 with the primary certificate
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
-                        })) {
-                            Ok(_) => {
-                                println!(
-                                    "HTTPS service configured with primary certificate for {}",
-                                    first_cert.domain
-                                );
+                // Bind to 443 with the primary certificate
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    https_service.add_tls(
+                        "0.0.0.0:443",
+                        &first_cert.cert_path,
+                        &first_cert.key_path,
+                    );
+                })) {
+                    Ok(_) => {
+                        println!(
+                            "HTTPS service configured with primary certificate for {}",
+                            first_cert.domain
+                        );
 
-                                // Add the service
-                                server.add_service(https_service);
-                                println!("HTTPS service added to server");
+                        // Add the service
+                        server.add_service(https_service);
+                        println!("HTTPS service added to server");
 
-                                // Create a new manager service with https_proxy
-                                let mut manager_service = pingora_proxy::http_proxy_service(
-                                    &server.configuration,
-                                    ManagerProxy {
-                                        servers: config_store.clone(),
-                                        https_proxy: Some((*shared_proxy).clone()),
-                                        ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
-                                    },
-                                );
+                        // Create a new manager service with https_proxy
+                        let mut manager_service = pingora_proxy::http_proxy_service(
+                            &server.configuration,
+                            ManagerProxy {
+                                servers: config_store.clone(),
+                                https_proxy: Some((*shared_proxy).clone()),
+                                ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
+                            },
+                        );
 
-                                // Add TCP binding
-                                manager_service.add_tcp("0.0.0.0:81");
-                                server.add_service(manager_service);
-                                println!("Manager service updated with HTTPS proxy access");
+                        // Add TCP binding
+                        manager_service.add_tcp("0.0.0.0:81");
+                        server.add_service(manager_service);
+                        println!("Manager service updated with HTTPS proxy access");
 
-                                // Create and add the certificate watcher service
-                                let cert_watcher = services::cert_watcher::CertWatcherService::new(
-                                    shared_proxy.clone(),
-                                    15, // Check every 15 seconds
-                                );
-                                server.add_service(cert_watcher);
-                                println!("Certificate watcher service added");
-                            }
-                            Err(e) => {
-                                println!("Error binding to port 443: {:?}", e);
-                                println!("HTTPS service could not be initialized");
-                            }
-                        }
+                        // Create and add the certificate watcher service
+                        let cert_watcher = services::cert_watcher::CertWatcherService::new(
+                            shared_proxy.clone(),
+                            15, // Check every 15 seconds
+                        );
+                        server.add_service(cert_watcher);
+                        println!("Certificate watcher service added");
                     }
                     Err(e) => {
-                        println!("Error creating TLS settings: {}", e);
+                        println!("Error binding to port 443: {:?}", e);
                         println!("HTTPS service could not be initialized");
                     }
                 }
@@ -295,7 +287,6 @@ fn main() {
     } else {
         println!("SSL disabled by configuration");
     }
-
     // Set up Swarm discovery if enabled
     let docker_endpoint = std::env::var("DOCKER_ENDPOINT")
         .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
