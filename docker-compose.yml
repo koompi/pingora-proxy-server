@@ -62,7 +62,7 @@ services:
 
     deploy:
       mode: replicated
-      replicas: 3
+      replicas: 1
       update_config:
         parallelism: 1
         delay: 10s
