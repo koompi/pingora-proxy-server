@@ -119,6 +119,37 @@ impl ManagerProxy {
 /// Configuration changes are persisted to disk and managed through thread-safe
 /// concurrent access using mutex locks.
 impl ManagerProxy {
+    async fn handle_debug_certificates(&self, session: &mut Session) -> Result<bool> {
+        info!("Certificate debugging requested");
+
+        let certificates = {
+            if let Some(https_proxy) = &self.https_proxy {
+                if let Ok(cache) = https_proxy.cert_cache.lock() {
+                    cache.keys().cloned().collect::<Vec<_>>()
+                } else {
+                    vec!["Failed to lock cert cache".to_string()]
+                }
+            } else {
+                vec!["HTTPS proxy not initialized".to_string()]
+            }
+        };
+
+        let response = serde_json::json!({
+            "status": "success",
+            "certificates": certificates,
+        });
+
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        let mut resp = ResponseHeader::build(http::StatusCode::OK, None)?;
+        resp.insert_header("content-type", "application/json")?;
+
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(json)), true)
+            .await?;
+
+        Ok(true)
+    }
     // Helper method to send JSON responses
     async fn send_json_response(
         &self,
@@ -1291,6 +1322,10 @@ impl ProxyHttp for ManagerProxy {
         if path == "/admin/reload_certs" || path == "/admin/reload_certs/" {
             info!("Handling exact admin certificate reload request");
             return self.handle_reload_certificates(session).await;
+        }
+
+        if path == "/debug/certificates" {
+            return self.handle_debug_certificates(session).await;
         }
 
         // Handle certificate-related requests

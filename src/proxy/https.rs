@@ -135,11 +135,14 @@ impl HttpsProxy {
         for cert in certs {
             info!("Processing certificate for domain: {}", cert.domain);
 
+            // Store with lowercase domain for consistent lookup
+            let normalized_domain = cert.domain.to_lowercase();
+
             match std::fs::read(&cert.cert_path) {
                 Ok(cert_data) => match std::fs::read(&cert.key_path) {
                     Ok(key_data) => {
                         info!("Successfully loaded certificate for: {}", cert.domain);
-                        cache_guard.insert(cert.domain.clone(), (cert_data, key_data, timestamp));
+                        cache_guard.insert(normalized_domain, (cert_data, key_data, timestamp));
                     }
                     Err(e) => {
                         error!("Failed to read key file for {}: {:?}", cert.domain, e);
@@ -175,7 +178,12 @@ impl HttpsProxy {
     }
 
     pub fn get_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-        info!("Attempting to get certificate for domain: {}", domain);
+        // Normalize domain to lowercase for consistency
+        let normalized_domain = domain.to_lowercase();
+        info!(
+            "Attempting to get certificate for domain: {}",
+            normalized_domain
+        );
 
         let cache = match self.cert_cache.lock() {
             Ok(cache) => cache,
@@ -185,17 +193,28 @@ impl HttpsProxy {
             }
         };
 
-        // Try exact match first
-        if let Some((cert, key, _)) = cache.get(domain) {
-            info!("Found exact certificate match for: {}", domain);
+        // Try exact match with normalized domain
+        if let Some((cert, key, _)) = cache.get(&normalized_domain) {
+            info!("Found exact certificate match for: {}", normalized_domain);
             return Some((cert.clone(), key.clone()));
+        }
+
+        // Also try with the original domain as a fallback
+        if normalized_domain != domain {
+            if let Some((cert, key, _)) = cache.get(domain) {
+                info!(
+                    "Found certificate match for original domain case: {}",
+                    domain
+                );
+                return Some((cert.clone(), key.clone()));
+            }
         }
 
         // Print available certificates for debugging
         let available_domains = cache.keys().cloned().collect::<Vec<_>>().join(", ");
-        info!(
+        error!(
             "No certificate found for {}. Available certificates: {}",
-            domain, available_domains
+            normalized_domain, available_domains
         );
 
         // Important: Do NOT fall back to any random certificate! Return None instead.
