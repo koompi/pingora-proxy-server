@@ -40,19 +40,24 @@ impl ResolvesServerCert for HttpsProxy {
                 name
             }
             None => {
+                // If no SNI is provided, we can't determine which certificate to use
                 error!("No SNI provided in client hello, cannot select certificate");
                 return None;
             }
         };
 
-        info!("Processing SNI request for {}", server_name);
+        // Log more debugging info
+        info!("Processing SNI request for domain: {}", server_name);
 
-        // Get certificate for this domain
+        // Try to get certificate for this domain
         match self.get_certificate(server_name) {
             Some((cert_data, key_data)) => {
-                info!("Found certificate for: {}", server_name);
+                info!("Found certificate for domain: {}", server_name);
                 match self.create_certified_key(cert_data, key_data) {
-                    Ok(cert_key) => Some(cert_key),
+                    Ok(cert_key) => {
+                        info!("Successfully created certified key for: {}", server_name);
+                        Some(cert_key)
+                    }
                     Err(e) => {
                         error!(
                             "Failed to create certified key for {}: {:?}",
@@ -64,6 +69,11 @@ impl ResolvesServerCert for HttpsProxy {
             }
             None => {
                 error!("No certificate found for domain: {}", server_name);
+                // Log available certificates
+                if let Ok(cache) = self.cert_cache.lock() {
+                    let available = cache.keys().cloned().collect::<Vec<_>>();
+                    info!("Available certificates: {:?}", available);
+                }
                 None
             }
         }

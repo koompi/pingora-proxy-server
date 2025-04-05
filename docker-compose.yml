@@ -71,7 +71,7 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      endpoint_mode: vip
+      endpoint_mode: dnsrr
       placement:
         max_replicas_per_node: 1
     configs:
