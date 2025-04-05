@@ -135,23 +135,8 @@ fn main() {
     http_service.add_tcp("0.0.0.0:80");
     println!("HTTP service configured on port 80");
 
-    // Create manager service for configuration management
-    let mut manager_service = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        proxy::manager::ManagerProxy {
-            servers: config_store.clone(),
-            https_proxy: None,
-            ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
-        },
-    );
-
-    // Add TCP binding - this will panic internally if it fails
-    manager_service.add_tcp("0.0.0.0:81");
-    println!("Manager service (HTTP) configured on port 81");
-
     // Add the HTTP and manager services to the server
     server.add_service(http_service);
-    server.add_service(manager_service);
 
     // Initialize Let's Encrypt service
     let certbot_dir = PathBuf::from("/certbot/letsencrypt");
