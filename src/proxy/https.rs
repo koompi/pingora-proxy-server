@@ -1,18 +1,16 @@
 use std::{
     collections::HashMap,
-    path::Path,
     str,
     sync::{Arc, Mutex, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use pingora::{prelude::HttpPeer, Error, ErrorType, Result};
+use log::{error, info};
+use openssl::error::ErrorStack;
+use openssl::ssl::{SslContext, SslContextBuilder, SslMethod};
+use pingora::upstreams::peer::HttpPeer;
+use pingora::{Error, ErrorType, Result};
 use pingora_proxy::{ProxyHttp, Session};
-use rustls::crypto::ring::sign::any_supported_type;
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
 
 use crate::{
     cert::certbot,
@@ -22,7 +20,6 @@ use crate::{
 };
 
 use super::utils::extract_hostname;
-use log::{error, info, warn};
 
 // Add Debug implementation for HttpsProxy
 #[derive(Debug, Clone)]
@@ -30,31 +27,6 @@ pub struct HttpsProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
     pub cert_cache: Arc<Mutex<HashMap<String, (Vec<u8>, Vec<u8>, u64)>>>, // (cert, key, timestamp)
     pub domain_map: Arc<RwLock<HashMap<String, String>>>,
-}
-
-impl ResolvesServerCert for HttpsProxy {
-    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        let server_name = match client_hello.server_name() {
-            Some(name) => {
-                info!("SNI request for domain: {}", name);
-                name.to_lowercase()
-            }
-            None => {
-                error!("No SNI provided in client hello");
-                return None;
-            }
-        };
-
-        // First, try exact match
-        let mut matching_cert = self.find_certificate_for_domain(&server_name);
-
-        // If no exact match, try wildcard matching
-        if matching_cert.is_none() {
-            matching_cert = self.find_wildcard_certificate(&server_name);
-        }
-
-        matching_cert
-    }
 }
 
 impl HttpsProxy {
@@ -66,8 +38,25 @@ impl HttpsProxy {
         }
     }
 
+    // Find and return SSL context for a domain
+    pub fn get_ssl_context(&self, domain: &str) -> Option<SslContext> {
+        let normalized_domain = domain.to_lowercase();
+
+        if let Some((cert, key)) = self.get_certificate(&normalized_domain) {
+            match self.create_ssl_context(cert, key) {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    error!("Failed to create SSL context for {}: {:?}", domain, e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
     // Enhanced certificate matching
-    fn find_certificate_for_domain(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+    fn find_certificate_for_domain(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
         let cache_guard = match self.cert_cache.lock() {
             Ok(guard) => guard,
             Err(e) => {
@@ -78,40 +67,20 @@ impl HttpsProxy {
 
         // Try direct lookup with exact match
         if let Some((cert, key, _)) = cache_guard.get(domain) {
-            match self.create_certified_key(cert.clone(), key.clone()) {
-                Ok(cert_key) => {
-                    info!("Found exact certificate for: {}", domain);
-                    return Some(cert_key);
-                }
-                Err(e) => {
-                    error!("Failed to create certified key for {}: {:?}", domain, e);
-                }
-            }
+            return Some((cert.clone(), key.clone()));
         }
 
         // If no exact match, try more flexible matching
         for (cert_domain, (cert, key, _)) in cache_guard.iter() {
-            // Check if the certificate domain matches or covers this domain
             if domain.ends_with(cert_domain) || cert_domain.starts_with("*.") {
-                match self.create_certified_key(cert.clone(), key.clone()) {
-                    Ok(cert_key) => {
-                        info!("Found matching certificate for {}: {}", domain, cert_domain);
-                        return Some(cert_key);
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create certified key for {}: {:?}",
-                            cert_domain, e
-                        );
-                    }
-                }
+                return Some((cert.clone(), key.clone()));
             }
         }
 
         None
     }
 
-    fn find_wildcard_certificate(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+    fn find_wildcard_certificate(&self, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
         let cache_guard = match self.cert_cache.lock() {
             Ok(guard) => guard,
             Err(e) => {
@@ -120,32 +89,14 @@ impl HttpsProxy {
             }
         };
 
-        // More advanced wildcard certificate matching
         let parts: Vec<&str> = domain.split('.').collect();
-
-        // Try exact wildcard match first
         let wildcard_domain = format!("*.{}", parts[1..].join("."));
 
-        println!("Searching wildcard certificate for domain: {}", domain);
-        println!("Potential wildcard domain: {}", wildcard_domain);
-        println!("Available certificates: {:?}", cache_guard.keys());
-
         if let Some((cert, key, _)) = cache_guard.get(&wildcard_domain) {
-            match self.create_certified_key(cert.clone(), key.clone()) {
-                Ok(cert_key) => {
-                    info!("Found wildcard certificate for: {}", wildcard_domain);
-                    return Some(cert_key);
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to create certified key for {}: {:?}",
-                        wildcard_domain, e
-                    );
-                }
-            }
+            Some((cert.clone(), key.clone()))
+        } else {
+            None
         }
-
-        None
     }
 
     // Enhance reload_certificates to handle multiple domains
@@ -330,71 +281,44 @@ impl HttpsProxy {
         }
     }
 
-    // Helper method to create a CertifiedKey for rustls
-    fn create_certified_key(
-        &self,
-        cert_data: Vec<u8>,
-        key_data: Vec<u8>,
-    ) -> Result<Arc<CertifiedKey>> {
-        // Parse certificates
-        let mut cert_cursor = std::io::Cursor::new(cert_data);
-        let mut certs = Vec::new();
+    // Helper method to create SSL context from certificate and key data
+    fn create_ssl_context(&self, cert_data: Vec<u8>, key_data: Vec<u8>) -> Result<SslContext> {
+        // Create a new SSL context using TLS method
+        let mut ctx = SslContextBuilder::new(SslMethod::tls())
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        // rustls_pemfile::certs returns an iterator, not a Result
-        for cert_result in rustls_pemfile::certs(&mut cert_cursor) {
-            match cert_result {
-                Ok(cert) => certs.push(cert),
-                Err(_) => return Err(Error::new(ErrorType::ConnectRefused)),
-            }
-        }
+        // Load certificate from memory
+        let cert = openssl::x509::X509::from_pem(&cert_data)
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
+        ctx.set_certificate(&cert)
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        if certs.is_empty() {
-            return Err(Error::new(ErrorType::ConnectRefused));
-        }
+        // Load private key from memory
+        let pkey = openssl::pkey::PKey::private_key_from_pem(&key_data)
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
+        ctx.set_private_key(&pkey)
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        // Parse private key - first try PKCS8
-        let mut key_cursor = std::io::Cursor::new(key_data.clone());
-        let mut private_key = None;
+        // Verify private key
+        ctx.check_private_key()
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        // rustls_pemfile::pkcs8_private_keys returns an iterator, not a Result
-        for key_result in rustls_pemfile::pkcs8_private_keys(&mut key_cursor) {
-            match key_result {
-                Ok(key) => {
-                    private_key = Some(PrivateKeyDer::Pkcs8(key));
-                    break;
-                }
-                Err(_) => continue,
-            }
-        }
+        // Enable HTTP/2 support
+        ctx.set_alpn_protos(b"\x02h2\x08http/1.1")
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        // If PKCS8 failed, try RSA
-        if private_key.is_none() {
-            let mut key_cursor = std::io::Cursor::new(key_data);
-            for key_result in rustls_pemfile::rsa_private_keys(&mut key_cursor) {
-                match key_result {
-                    Ok(key) => {
-                        private_key = Some(PrivateKeyDer::Pkcs1(key));
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
+        // Apply modern cipher suites and options
+        ctx.set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
+            .map_err(|e| Error::new(ErrorType::InternalError))?;
 
-        // If we couldn't parse the key, return an error
-        let private_key = match private_key {
-            Some(key) => key,
-            None => return Err(Error::new(ErrorType::ConnectRefused)),
-        };
+        ctx.set_options(
+            openssl::ssl::SslOptions::NO_SSLV2
+                | openssl::ssl::SslOptions::NO_SSLV3
+                | openssl::ssl::SslOptions::NO_TLSV1
+                | openssl::ssl::SslOptions::NO_TLSV1_1,
+        );
 
-        // Create signing key
-        let signing_key = match any_supported_type(&private_key) {
-            Ok(key) => key,
-            Err(_) => return Err(Error::new(ErrorType::ConnectRefused)),
-        };
-
-        // Return the certified key
-        Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+        Ok(ctx.build())
     }
 }
 
@@ -551,7 +475,7 @@ impl ProxyHttp for HttpsProxy {
         // Record request duration
         let start_time_header = session.req_header().headers.get("x-request-start-time");
         if let Some(start_time_str) = start_time_header {
-            if let Ok(start_time) = str::from_utf8(start_time_str.as_ref()) {
+            if let Ok(start_time) = std::str::from_utf8(start_time_str.as_ref()) {
                 if let Ok(start_time_secs) = str::parse::<f64>(start_time) {
                     PROXY_METRICS
                         .request_duration

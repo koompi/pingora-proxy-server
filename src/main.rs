@@ -109,11 +109,6 @@ impl Certificates {
 }
 
 fn main() {
-    // Initialize rustls crypto provider
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .unwrap();
-
     // Initialize logging
     crate::logging::setup_logging();
 
@@ -291,7 +286,7 @@ fn main() {
 
             tls_settings.enable_h2();
             // Build the TLS acceptor
-            let mut acceptor = tls_settings.build();
+            // let mut acceptor = tls_settings.build().into_keeper();
 
             // Use the first certificate as default
             let (_, primary_cert, primary_key) = &certificate_configs[0];
