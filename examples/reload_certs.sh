@@ -1,0 +1,1 @@
+curl -X POST "http://localhost:81/admin/reload_certs"

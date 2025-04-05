@@ -8,6 +8,11 @@ use std::{
 
 use pingora::{prelude::HttpPeer, Error, ErrorType, Result};
 use pingora_proxy::{ProxyHttp, Session};
+use rustls::crypto::ring::sign::any_supported_type;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 
 use crate::{
     cert::certbot,
@@ -19,11 +24,61 @@ use crate::{
 use super::utils::extract_hostname;
 use log::{error, info};
 
-/// HTTPS Proxy implementation
-#[derive(Clone)]
+// Add Debug implementation for HttpsProxy
+#[derive(Debug, Clone)]
 pub struct HttpsProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
     pub cert_cache: Arc<Mutex<HashMap<String, (Vec<u8>, Vec<u8>, u64)>>>, // (cert, key, timestamp)
+}
+
+impl ResolvesServerCert for HttpsProxy {
+    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        // Extract the SNI name from the client hello
+        let server_name = match client_hello.server_name() {
+            Some(name) => name,
+            None => return None,
+        };
+
+        info!("SNI request for domain: {}", server_name);
+
+        // Try to find the certificate in our cache
+        if let Ok(cache) = self.cert_cache.lock() {
+            // First try exact match
+            if let Some((cert_data, key_data, _)) = cache.get(server_name) {
+                if let Ok(cert_key) = self.create_certified_key(cert_data.clone(), key_data.clone())
+                {
+                    return Some(cert_key);
+                }
+            }
+
+            // Try with "www." prefix removed
+            if server_name.starts_with("www.") {
+                let base_domain = &server_name[4..];
+                if let Some((cert_data, key_data, _)) = cache.get(base_domain) {
+                    if let Ok(cert_key) =
+                        self.create_certified_key(cert_data.clone(), key_data.clone())
+                    {
+                        return Some(cert_key);
+                    }
+                }
+            }
+
+            // If we have no match but have other certs, use the first one as fallback
+            if !cache.is_empty() {
+                let (first_domain, (cert_data, key_data, _)) = cache.iter().next().unwrap();
+                info!(
+                    "No exact cert match for {}, using {} certificate",
+                    server_name, first_domain
+                );
+                if let Ok(cert_key) = self.create_certified_key(cert_data.clone(), key_data.clone())
+                {
+                    return Some(cert_key);
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl HttpsProxy {
@@ -168,6 +223,73 @@ impl HttpsProxy {
             error!("No certificate found for {}", domain);
             Err(Error::new(ErrorType::ConnectRefused))
         }
+    }
+
+    // Helper method to create a CertifiedKey for rustls
+    fn create_certified_key(
+        &self,
+        cert_data: Vec<u8>,
+        key_data: Vec<u8>,
+    ) -> Result<Arc<CertifiedKey>> {
+        // Parse certificates
+        let mut cert_cursor = std::io::Cursor::new(cert_data);
+        let mut certs = Vec::new();
+
+        // rustls_pemfile::certs returns an iterator, not a Result
+        for cert_result in rustls_pemfile::certs(&mut cert_cursor) {
+            match cert_result {
+                Ok(cert) => certs.push(cert),
+                Err(_) => return Err(Error::new(ErrorType::ConnectRefused)),
+            }
+        }
+
+        if certs.is_empty() {
+            return Err(Error::new(ErrorType::ConnectRefused));
+        }
+
+        // Parse private key - first try PKCS8
+        let mut key_cursor = std::io::Cursor::new(key_data.clone());
+        let mut private_key = None;
+
+        // rustls_pemfile::pkcs8_private_keys returns an iterator, not a Result
+        for key_result in rustls_pemfile::pkcs8_private_keys(&mut key_cursor) {
+            match key_result {
+                Ok(key) => {
+                    private_key = Some(PrivateKeyDer::Pkcs8(key));
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // If PKCS8 failed, try RSA
+        if private_key.is_none() {
+            let mut key_cursor = std::io::Cursor::new(key_data);
+            for key_result in rustls_pemfile::rsa_private_keys(&mut key_cursor) {
+                match key_result {
+                    Ok(key) => {
+                        private_key = Some(PrivateKeyDer::Pkcs1(key));
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        // If we couldn't parse the key, return an error
+        let private_key = match private_key {
+            Some(key) => key,
+            None => return Err(Error::new(ErrorType::ConnectRefused)),
+        };
+
+        // Create signing key
+        let signing_key = match any_supported_type(&private_key) {
+            Ok(key) => key,
+            Err(_) => return Err(Error::new(ErrorType::ConnectRefused)),
+        };
+
+        // Return the certified key
+        Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
     }
 }
 
@@ -322,7 +444,6 @@ impl ProxyHttp for HttpsProxy {
         let hostname_str = hostname.as_deref().unwrap_or("");
 
         // Record request duration
-
         let start_time_header = session.req_header().headers.get("x-request-start-time");
         if let Some(start_time_str) = start_time_header {
             if let Ok(start_time) = str::from_utf8(start_time_str.as_ref()) {
@@ -352,7 +473,7 @@ impl ProxyHttp for HttpsProxy {
             }
         }
 
-        if let Some(err) = error {
+        if let Some(_) = error {
             PROXY_METRICS
                 .backend_failures
                 .with_label_values(&[hostname_str, "connection_error"])

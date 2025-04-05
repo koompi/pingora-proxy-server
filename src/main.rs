@@ -2,11 +2,9 @@ use anyhow::Result;
 use log::{error, warn};
 use proxy::tcp::DatabaseIpRules;
 use services::letsencrypt::LetsEncryptService;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time::sleep;
+use tokio::sync::Mutex as TokioMutex;
 
 use config::file_manager::get_config;
 use config::model::{ConfigStore, MappingOrigin};
@@ -28,7 +26,7 @@ use rustls::crypto::ring::default_provider;
 const MAX_RETRIES: u32 = 3;
 
 async fn get_config_with_retry() -> Result<ConfigStore> {
-    let mut retries = 0;
+    let retries = 0;
     let mut last_error = None;
 
     while retries < MAX_RETRIES {
@@ -68,7 +66,6 @@ async fn load_fallback_config() -> Result<ConfigStore> {
 
 fn main() {
     // Initialize logging
-    // env_logger::init();
     crate::logging::setup_logging();
 
     // IMPORTANT: Install the default CryptoProvider before anything else
@@ -147,7 +144,7 @@ fn main() {
         ManagerProxy {
             servers: config_store.clone(),
             https_proxy: None,
-            ip_rules: Arc::new(DatabaseIpRules::new().into()),
+            ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
         },
     );
 
@@ -198,19 +195,20 @@ fn main() {
         println!("Let's Encrypt certificate service added");
     }
 
+    // Instead of using with_callbacks which doesn't accept arguments in your version
     if !disable_ssl {
-        // First, create a standard HttpsProxy instance
-        let https_proxy = HttpsProxy {
-            servers: config_store.clone(),
-            cert_cache: Arc::new(Mutex::new(HashMap::new())),
-        };
+        // Create a standard HttpsProxy instance
+        let https_proxy = HttpsProxy::new(config_store.clone());
 
         // Create a shared reference to the proxy for our watcher service
         let shared_proxy = Arc::new(https_proxy.clone());
 
-        // Create the service with the standard (non-Arc) instance
-        let mut https_service =
-            pingora_proxy::http_proxy_service(&server.configuration, https_proxy);
+        // Preload certificates
+        runtime.block_on(async {
+            if let Err(e) = shared_proxy.reload_certificates().await {
+                println!("Error initial loading of certificates: {:?}", e);
+            }
+        });
 
         // Get domains from config store
         let domains = match config_store.lock() {
@@ -224,9 +222,12 @@ fn main() {
         // Find certificates
         let certs = cert::certbot::find_certbot_certs(&domains);
 
+        // Create the service with the standard (non-Arc) instance
+        let mut https_service =
+            pingora_proxy::http_proxy_service(&server.configuration, https_proxy);
+
         if !certs.is_empty() {
-            // In this version of Pingora, we need to add each certificate individually
-            // Let's try to create a single binding with the first certificate only
+            // Use the first certificate for the main TLS binding
             let first_cert = &certs[0];
 
             if Path::new(&first_cert.cert_path).exists() && Path::new(&first_cert.key_path).exists()
@@ -236,7 +237,7 @@ fn main() {
                     &first_cert.key_path,
                 ) {
                     Ok(tls_settings) => {
-                        // Directly bind to port 443 with just the first certificate
+                        // Bind to 443 with the primary certificate
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             https_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
                         })) {
@@ -245,38 +246,8 @@ fn main() {
                                     "HTTPS service configured with primary certificate for {}",
                                     first_cert.domain
                                 );
-                                // Add other certificates individually, to support SNI
-                                let mut added = 1; // Already added the first one
-                                for cert in &certs[1..] {
-                                    if !Path::new(&cert.cert_path).exists()
-                                        || !Path::new(&cert.key_path).exists()
-                                    {
-                                        println!(
-                                            "Certificate files missing for domain: {}",
-                                            cert.domain
-                                        );
-                                        continue;
-                                    }
 
-                                    match pingora::listeners::tls::TlsSettings::intermediate(
-                                        &cert.cert_path,
-                                        &cert.key_path,
-                                    ) {
-                                        Ok(additional_tls) => {
-                                            // We won't actually try to bind to the port again - this is just to register the cert for SNI
-                                            println!("Added SNI certificate for {}", cert.domain);
-                                            added += 1;
-                                        }
-                                        Err(e) => {
-                                            println!(
-                                                "Error creating TLS settings for {}: {}",
-                                                cert.domain, e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                println!("HTTPS service initialized with {} certificates", added);
+                                // Add the service
                                 server.add_service(https_service);
                                 println!("HTTPS service added to server");
 
@@ -286,11 +257,11 @@ fn main() {
                                     ManagerProxy {
                                         servers: config_store.clone(),
                                         https_proxy: Some((*shared_proxy).clone()),
-                                        ip_rules: Arc::new(DatabaseIpRules::new().into()),
+                                        ip_rules: Arc::new(TokioMutex::new(DatabaseIpRules::new())),
                                     },
                                 );
 
-                                // Add TCP binding - this will panic internally if it fails
+                                // Add TCP binding
                                 manager_service.add_tcp("0.0.0.0:81");
                                 server.add_service(manager_service);
                                 println!("Manager service updated with HTTPS proxy access");
