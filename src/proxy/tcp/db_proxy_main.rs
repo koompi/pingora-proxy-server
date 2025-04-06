@@ -7,8 +7,8 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use crate::config::model::ConfigStore;
+use crate::proxy::tcp::tls_db_proxy::TlsDatabaseProxy;
 use crate::proxy::tcp::{DatabaseIpRules, DatabaseMapping, DatabaseType};
-use crate::proxy::tls_db_proxy::TlsDatabaseProxy;
 
 /// Main entry point for creating and managing database proxies with SNI
 pub async fn setup_db_proxies(

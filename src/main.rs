@@ -1,6 +1,5 @@
 use anyhow::Result;
 use log::{error, warn};
-use openssl::ssl::{NameType, SniError, SslAlert, SslContext, SslFiletype, SslMethod, SslRef};
 use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use proxy::https::HttpsProxy;
@@ -12,7 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tls::Certificates;
-use tokio::sync::Mutex as TokioMutex;
 
 use config::file_manager::get_config;
 use config::model::{ConfigStore, MappingOrigin};
