@@ -292,14 +292,13 @@ async fn handle_tls_connection(
     ip_rules: DatabaseIpRules,
     sni_manager: Arc<Mutex<SniContextManager>>,
 ) -> Result<(), IoError> {
-    // Extract SNI hostname from ClientHello
     let client_ip = client_addr.ip().to_string();
     info!(
         "New connection from {} to {:?} database port",
         client_ip, db_type
     );
 
-    // Use our SNI extraction utility from tcp.rs
+    // Use our SNI extraction utility
     let mut peek_buf = [0u8; 1024];
     let peek_size = client.peek(&mut peek_buf).await?;
 
@@ -310,11 +309,32 @@ async fn handle_tls_connection(
             hostname
         }
         None => {
-            warn!("No SNI hostname provided by client");
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "No SNI hostname provided",
-            ));
+            // For MongoDB, use default mapping when SNI is not provided
+            if db_type == DatabaseType::MongoDB {
+                // Get the first MongoDB mapping as default
+                let mappings = db_mappings.lock().await;
+                let default_mapping = mappings
+                    .iter()
+                    .find(|(k, v)| k.contains("mongodb"))
+                    .map(|(k, _)| k.clone());
+
+                if let Some(default_hostname) = default_mapping {
+                    info!("Using default MongoDB mapping: {}", default_hostname);
+                    default_hostname
+                } else {
+                    warn!("No default MongoDB mapping available");
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "No default MongoDB mapping available",
+                    ));
+                }
+            } else {
+                warn!("No SNI hostname provided by client");
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "No SNI hostname provided",
+                ));
+            }
         }
     };
 
