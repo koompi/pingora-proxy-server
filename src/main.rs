@@ -3,6 +3,7 @@ use log::{error, warn};
 use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use proxy::https::HttpsProxy;
+use proxy::tcp::is_database_domain;
 use proxy::tcp::DatabaseIpRules;
 use services::cert_watcher::CertWatcherService;
 use services::letsencrypt::LetsEncryptService;
@@ -284,27 +285,16 @@ fn main() {
     if enable_tcp_proxy {
         println!("Initializing TCP Proxy service for database connections");
 
-        // By default, enable TLS if SSL is enabled for the main proxy
         let tcp_proxy_tls = std::env::var("TCP_PROXY_TLS")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(!disable_ssl);
 
-        // Create database IP rules storage
-        let db_ip_rules = match runtime
-            .block_on(async { proxy::tcp::DatabaseIpRules::new_with_storage().await })
-        {
-            Ok(rules) => Arc::new(tokio::sync::Mutex::new(rules)),
-            Err(e) => {
-                println!("Error initializing IP rules: {}", e);
-                Arc::new(tokio::sync::Mutex::new(proxy::tcp::DatabaseIpRules::new()))
-            }
+        // Create and add the TCP proxy service only for database domains
+        let tokio_config_store = {
+            let std_config = config_store.lock().unwrap().clone();
+            Arc::new(tokio::sync::Mutex::new(std_config))
         };
 
-        // Create and add the TCP proxy service
-        let tokio_config_store = {
-            let std_config = config_store.lock().unwrap().clone(); // Get data from std mutex
-            Arc::new(tokio::sync::Mutex::new(std_config)) // Create new tokio mutex
-        };
         let tcp_proxy_service = runtime
             .block_on(proxy::tcp::TcpProxyService::new(
                 tokio_config_store,
@@ -313,32 +303,6 @@ fn main() {
             .unwrap();
 
         server.add_service(tcp_proxy_service);
-        println!("Setting up TLS database proxies with SRV support");
-
-        // Specify the certificate directory
-        let db_cert_dir = "/certbot/letsencrypt/live";
-
-        // Setup database proxies with SNI support
-        let proxy_shutdown_channels = runtime.block_on(async {
-            crate::proxy::tcp::db_proxy_main::setup_db_proxies(
-                config_store.clone(),
-                db_ip_rules.clone(),
-                db_cert_dir,
-                true, // Enable TLS
-            )
-            .await
-        });
-
-        // Store shutdown channels if needed for clean shutdown
-        if !proxy_shutdown_channels.is_empty() {
-            println!(
-                "Successfully set up {} TLS database proxies",
-                proxy_shutdown_channels.len()
-            );
-        } else {
-            println!("Warning: No TLS database proxies were set up");
-        }
-        println!("TCP Proxy service added for database connections");
     }
 
     // Add more detailed logging before server start

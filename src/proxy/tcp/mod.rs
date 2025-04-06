@@ -64,6 +64,35 @@ impl DatabaseType {
     }
 }
 
+/// Check if a domain is a database domain
+pub fn is_database_domain(domain: &str) -> bool {
+    // Database domains should match specific patterns
+    let db_patterns = [
+        ".mongodb.",    // MongoDB domains
+        ".postgresql.", // PostgreSQL domains
+        ".mysql.",      // MySQL domains
+        ".redis.",      // Redis domains
+    ];
+
+    // Check if domain contains any of the database patterns
+    db_patterns.iter().any(|pattern| domain.contains(pattern))
+}
+
+/// Get database type from domain
+pub fn get_database_type(domain: &str) -> Option<DatabaseType> {
+    if domain.contains(".mongodb.") {
+        Some(DatabaseType::MongoDB)
+    } else if domain.contains(".postgresql.") {
+        Some(DatabaseType::PostgreSQL)
+    } else if domain.contains(".mysql.") {
+        Some(DatabaseType::MySQL)
+    } else if domain.contains(".redis.") {
+        Some(DatabaseType::Redis)
+    } else {
+        None
+    }
+}
+
 // Connection statistics that can be serialized
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ConnectionStats {
