@@ -17,7 +17,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_openssl::SslStream as TokioSslStream;
 
+use crate::proxy::tcp::sni_utils::extract_hostname_from_uri;
 use crate::proxy::tcp::{DatabaseIpRules, DatabaseMapping, DatabaseType};
+
+use super::sni_utils::extract_mongo_uri;
 
 // Helper struct for SNI context selection
 pub struct SniContextManager {
@@ -324,69 +327,11 @@ async fn handle_tls_connection(
             hostname
         }
         None => {
-            // For MongoDB, use default mapping when SNI is not provided
+            // For MongoDB, use our improved mapping function
             if db_type == DatabaseType::MongoDB {
-                // Look for MongoDB URI pattern in the handshake
-                if let Some(uri) = extract_mongo_uri(&peek_buf[..peek_size]) {
-                    info!("Found MongoDB URI: {}", uri);
-
-                    // For mongodb+srv://, perform SRV resolution
-                    if uri.starts_with("mongodb+srv://") {
-                        match extract_hostname_from_uri(&uri) {
-                            Ok(srv_hostname) => {
-                                info!("Extracted SRV hostname: {}", srv_hostname);
-
-                                // Perform SRV resolution
-                                match resolve_mongodb_srv(&srv_hostname).await {
-                                    Ok(servers) if !servers.is_empty() => {
-                                        info!(
-                                            "Resolved SRV records for {}: {:?}",
-                                            srv_hostname, servers
-                                        );
-
-                                        // Connect directly to the resolved server
-                                        let target_host = servers[0].0.clone();
-                                        let target_port = servers[0].1;
-
-                                        let backend_addr =
-                                            format!("{}:{}", target_host, target_port);
-                                        info!(
-                                            "Connecting to SRV-resolved backend: {}",
-                                            backend_addr
-                                        );
-
-                                        let backend = match TcpStream::connect(&backend_addr).await
-                                        {
-                                            Ok(stream) => stream,
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to connect to backend {}: {}",
-                                                    backend_addr, e
-                                                );
-                                                return Err(e);
-                                            }
-                                        };
-
-                                        // Start proxying
-                                        return proxy_connection(client, backend, srv_hostname)
-                                            .await;
-                                    }
-                                    _ => {
-                                        info!("SRV resolution failed, falling back to mappings");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                info!("Failed to extract hostname from URI: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                // Use default MongoDB mapping as fallback
-                match find_default_mapping(db_mappings.clone(), db_type).await {
+                match find_default_mapping(db_mappings.clone(), db_type, &mut client).await {
                     Ok(domain) => {
-                        info!("Using default MongoDB mapping: {}", domain);
+                        info!("Selected MongoDB mapping: {}", domain);
                         domain
                     }
                     Err(e) => {
@@ -448,16 +393,106 @@ async fn handle_tls_connection(
 async fn find_default_mapping(
     db_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
     db_type: DatabaseType,
+    client_stream: &mut TcpStream,
 ) -> Result<String, IoError> {
-    let mappings = db_mappings.lock().await;
+    // For MongoDB connections, try to extract information from the protocol handshake
+    if db_type == DatabaseType::MongoDB {
+        let mut peek_buf = [0u8; 1024];
+        let peek_size = client_stream.peek(&mut peek_buf).await?;
 
-    // Find first matching mapping for the database type
-    for (domain, mapping) in mappings.iter() {
-        if mapping.db_type == db_type {
-            return Ok(domain.clone());
+        // Try to extract MongoDB URI first
+        if let Some(uri) = extract_mongo_uri(&peek_buf[..peek_size]) {
+            info!("Found MongoDB URI in handshake: {}", uri);
+
+            if let Ok(hostname) = extract_hostname_from_uri(&uri) {
+                info!("Extracted hostname from URI: {}", hostname);
+
+                // Check if we have a mapping for this hostname
+                let mappings = db_mappings.lock().await;
+
+                // Match hostname - either exact or by hostname pattern similarity
+                for (domain, _) in mappings.iter() {
+                    if domain == &hostname {
+                        // Found exact match
+                        return Ok(domain.clone());
+                    }
+
+                    // Check for partial match (the hostname is part of the domain or vice versa)
+                    if domain.contains(&hostname) || hostname.contains(domain) {
+                        info!(
+                            "Found partial hostname match: {} matches {}",
+                            hostname, domain
+                        );
+                        return Ok(domain.clone());
+                    }
+                }
+            }
+        }
+
+        // If we can't extract a URI or find a match, check the connection destination IP/port
+        if let Ok(local_addr) = client_stream.local_addr() {
+            info!("Client connected to local address: {}", local_addr);
+
+            // In Docker Swarm environment, the port might indicate which service they're targeting
+            let port = local_addr.port();
+
+            // Find a mapping whose target or pattern matches the destination
+            let mappings = db_mappings.lock().await;
+
+            // First try to match by port
+            let port_matches: Vec<_> = mappings
+                .iter()
+                .filter(|(_, mapping)| mapping.target_port == port)
+                .collect();
+
+            if !port_matches.is_empty() {
+                info!(
+                    "Found mapping matching port {}: {}",
+                    port, port_matches[0].0
+                );
+                return Ok(port_matches[0].0.clone());
+            }
+        }
+
+        // If we still don't have a match, pick a mapping using a more sophisticated strategy
+        // For example, you could use database access patterns, timestamps, or a round-robin approach
+        let mappings = db_mappings.lock().await;
+
+        // Find all MongoDB domains
+        let mongo_domains: Vec<_> = mappings
+            .iter()
+            .filter(|(_, mapping)| mapping.db_type == DatabaseType::MongoDB)
+            .map(|(domain, _)| domain.clone())
+            .collect();
+
+        if !mongo_domains.is_empty() {
+            // For illustration, we're using a strategy to distribute load by picking
+            // domains based on a simple hash of the client address
+            if let Ok(peer_addr) = client_stream.peer_addr() {
+                let addr_str = peer_addr.to_string();
+                let hash = addr_str
+                    .bytes()
+                    .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+                let index = (hash % mongo_domains.len() as u64) as usize;
+
+                let selected_domain = &mongo_domains[index];
+                info!(
+                    "Selected mapping based on client address hash: {}",
+                    selected_domain
+                );
+                return Ok(selected_domain.clone());
+            }
+
+            // Fallback to first MongoDB mapping if we can't hash the client address
+            info!(
+                "Using first available MongoDB mapping: {}",
+                mongo_domains[0]
+            );
+            return Ok(mongo_domains[0].clone());
         }
     }
 
+    // For other database types or if no MongoDB mappings were found
     Err(IoError::new(
         ErrorKind::NotFound,
         format!("No default mapping found for {:?}", db_type),

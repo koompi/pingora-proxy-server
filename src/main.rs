@@ -313,6 +313,31 @@ fn main() {
             .unwrap();
 
         server.add_service(tcp_proxy_service);
+        println!("Setting up TLS database proxies with SRV support");
+
+        // Specify the certificate directory
+        let db_cert_dir = "/certbot/letsencrypt/live";
+
+        // Setup database proxies with SNI support
+        let proxy_shutdown_channels = runtime.block_on(async {
+            crate::proxy::tcp::db_proxy_main::setup_db_proxies(
+                config_store.clone(),
+                db_ip_rules.clone(),
+                db_cert_dir,
+                true, // Enable TLS
+            )
+            .await
+        });
+
+        // Store shutdown channels if needed for clean shutdown
+        if !proxy_shutdown_channels.is_empty() {
+            println!(
+                "Successfully set up {} TLS database proxies",
+                proxy_shutdown_channels.len()
+            );
+        } else {
+            println!("Warning: No TLS database proxies were set up");
+        }
         println!("TCP Proxy service added for database connections");
     }
 

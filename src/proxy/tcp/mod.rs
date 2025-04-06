@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::config::model::ConfigStore;
+pub use db_proxy_main::setup_db_proxies;
 
 pub mod db_proxy_main;
 pub mod sni_utils;
