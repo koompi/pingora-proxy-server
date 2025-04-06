@@ -1,4 +1,3 @@
-// src/cert/issuer.rs
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -7,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
+use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -148,49 +148,9 @@ impl CertificateIssuer {
     pub async fn process_request(&self, request: CertificateRequest) -> CertificateStatus {
         let is_wildcard = request.wildcard.unwrap_or(false);
 
-        // First check if this is a renewal by seeing if certificate already exists
-        if let Some(mut status) = self.check_certificate(&request.domain) {
-            // Certificate exists, check if it's expiring soon (within 30 days)
-            if status.status == "valid" {
-                // Certificate is still valid, return immediately without further processing
-                println!(
-                    "Valid certificate found for {}, not issuing new one",
-                    request.domain
-                );
-                status.is_wildcard = Some(is_wildcard);
-                return status;
-            }
-            // Otherwise, proceed with renewal
-        } else {
-            // NEW ADDITION: Only issue new certificates if they resolve to our public IP
-            // or if force_renew is specified
-            let force_renew = request.force_renew.unwrap_or(false);
-
-            if !force_renew {
-                // First check if the domain resolves to our public IP
-                match self.validate_domain(&request.domain).await {
-                    Ok(_) => {
-                        // Validation successful, proceed with issuance
-                    }
-                    Err(e) => {
-                        // Domain doesn't point to our server, return error
-                        return CertificateStatus {
-                            domain: request.domain,
-                            status: "failed".to_string(),
-                            cert_path: None,
-                            key_path: None,
-                            expiry: None,
-                            error: Some(format!("Domain validation failed: {}. Domain must point to this server's IP address.", e)),
-                            is_wildcard: Some(is_wildcard),
-                        };
-                    }
-                }
-            }
-        }
-
         // For wildcard certificates, skip domain validation as it uses DNS challenge
         if !is_wildcard {
-            // 1. Validate domain points to our server (only for HTTP-01 challenges)
+            // Only validate domain for non-wildcard certificates
             let validation_result = self.validate_domain(&request.domain).await;
             if let Err(e) = validation_result {
                 return CertificateStatus {
@@ -356,6 +316,13 @@ impl CertificateIssuer {
         let staging = request.staging.unwrap_or(false);
         let is_wildcard = request.wildcard.unwrap_or(false);
 
+        // First check for any running certbot processes
+        if let Ok(output) = std::process::Command::new("pgrep").arg("certbot").output() {
+            if !output.stdout.is_empty() {
+                return Err(anyhow!("Another certbot process is already running. Please try again in a few minutes."));
+            }
+        }
+
         println!("Issuing certificate for: {}", domain);
 
         // Build certbot command based on authentication method
@@ -381,6 +348,14 @@ impl CertificateIssuer {
 
                 // Create temporary credentials file
                 let creds_file = self.create_temp_credentials_file(credentials)?;
+
+                // Set up cleanup using scopeguard
+                let _cleanup_guard = scopeguard::guard(creds_file.clone(), |f| {
+                    if let Err(e) = std::fs::remove_file(&f) {
+                        eprintln!("Failed to remove credentials file: {}", e);
+                    }
+                });
+
                 cmd.arg(format!("--dns-{}-credentials", provider))
                     .arg(&creds_file);
 
@@ -390,7 +365,7 @@ impl CertificateIssuer {
                     .arg("-d")
                     .arg(format!("*.{}", domain));
             } else {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow!(
                     "DNS credentials required for wildcard certificates"
                 ));
             }
