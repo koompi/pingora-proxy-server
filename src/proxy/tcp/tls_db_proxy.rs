@@ -322,13 +322,14 @@ async fn handle_tls_connection(
 
     // Extract SNI hostname from TLS ClientHello
     let hostname = match extract_sni_hostname(&peek_buf[..peek_size]) {
-        Some(hostname) => {
+        Some(hostname) if !hostname.is_empty() => {
             info!("SNI hostname extracted: {}", hostname);
             hostname
         }
-        None => {
+        _ => {
             // For MongoDB, use our improved mapping function
             if db_type == DatabaseType::MongoDB {
+                info!("No SNI hostname provided, attempting to find default MongoDB mapping");
                 match find_default_mapping(db_mappings.clone(), db_type, &mut client).await {
                     Ok(domain) => {
                         info!("Selected MongoDB mapping: {}", domain);
@@ -349,6 +350,15 @@ async fn handle_tls_connection(
             }
         }
     };
+
+    // Additional validation to prevent empty hostname
+    if hostname.is_empty() {
+        error!("Empty hostname after SNI extraction and fallback");
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "Empty hostname after SNI extraction and fallback",
+        ));
+    }
 
     // Check IP rules
     if !ip_rules.is_ip_allowed(&hostname, &client_ip) {
@@ -410,92 +420,62 @@ async fn find_default_mapping(
                 // Check if we have a mapping for this hostname
                 let mappings = db_mappings.lock().await;
 
-                // Match hostname - either exact or by hostname pattern similarity
-                for (domain, _) in mappings.iter() {
-                    if domain == &hostname {
-                        // Found exact match
-                        return Ok(domain.clone());
-                    }
+                // Try exact match first
+                if mappings.contains_key(&hostname) {
+                    return Ok(hostname);
+                }
 
-                    // Check for partial match (the hostname is part of the domain or vice versa)
-                    if domain.contains(&hostname) || hostname.contains(domain) {
-                        info!(
-                            "Found partial hostname match: {} matches {}",
-                            hostname, domain
-                        );
-                        return Ok(domain.clone());
+                // If exact match fails, try to find the most specific matching domain
+                let mut best_match = None;
+                let mut best_match_parts = 0;
+
+                let hostname_parts: Vec<&str> = hostname.split('.').collect();
+
+                for domain in mappings.keys() {
+                    let domain_parts: Vec<&str> = domain.split('.').collect();
+
+                    // Check if this domain is a potential match
+                    if domain_parts.len() <= hostname_parts.len() {
+                        let matching = domain_parts
+                            .iter()
+                            .rev()
+                            .zip(hostname_parts.iter().rev())
+                            .take(domain_parts.len())
+                            .all(|(a, b)| a == b);
+
+                        if matching && domain_parts.len() > best_match_parts {
+                            best_match = Some(domain.clone());
+                            best_match_parts = domain_parts.len();
+                        }
                     }
                 }
+
+                if let Some(matched_domain) = best_match {
+                    info!("Found matching domain: {}", matched_domain);
+                    return Ok(matched_domain);
+                }
+
+                // If we got here, we found a hostname but no matching mapping
+                error!("No mapping found for MongoDB URI hostname: {}", hostname);
+                return Err(IoError::new(
+                    ErrorKind::NotFound,
+                    format!("No mapping found for MongoDB URI hostname: {}", hostname),
+                ));
             }
         }
 
-        // If we can't extract a URI or find a match, check the connection destination IP/port
-        if let Ok(local_addr) = client_stream.local_addr() {
-            info!("Client connected to local address: {}", local_addr);
-
-            // In Docker Swarm environment, the port might indicate which service they're targeting
-            let port = local_addr.port();
-
-            // Find a mapping whose target or pattern matches the destination
-            let mappings = db_mappings.lock().await;
-
-            // First try to match by port
-            let port_matches: Vec<_> = mappings
-                .iter()
-                .filter(|(_, mapping)| mapping.target_port == port)
-                .collect();
-
-            if !port_matches.is_empty() {
-                info!(
-                    "Found mapping matching port {}: {}",
-                    port, port_matches[0].0
-                );
-                return Ok(port_matches[0].0.clone());
-            }
-        }
-
-        // If we still don't have a match, pick a mapping using a more sophisticated strategy
-        // For example, you could use database access patterns, timestamps, or a round-robin approach
-        let mappings = db_mappings.lock().await;
-
-        // Find all MongoDB domains
-        let mongo_domains: Vec<_> = mappings
-            .iter()
-            .filter(|(_, mapping)| mapping.db_type == DatabaseType::MongoDB)
-            .map(|(domain, _)| domain.clone())
-            .collect();
-
-        if !mongo_domains.is_empty() {
-            // For illustration, we're using a strategy to distribute load by picking
-            // domains based on a simple hash of the client address
-            if let Ok(peer_addr) = client_stream.peer_addr() {
-                let addr_str = peer_addr.to_string();
-                let hash = addr_str
-                    .bytes()
-                    .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
-                let index = (hash % mongo_domains.len() as u64) as usize;
-
-                let selected_domain = &mongo_domains[index];
-                info!(
-                    "Selected mapping based on client address hash: {}",
-                    selected_domain
-                );
-                return Ok(selected_domain.clone());
-            }
-
-            // Fallback to first MongoDB mapping if we can't hash the client address
-            info!(
-                "Using first available MongoDB mapping: {}",
-                mongo_domains[0]
-            );
-            return Ok(mongo_domains[0].clone());
-        }
+        // If we can't extract a URI or find a match, return an error
+        error!("Could not extract valid hostname from MongoDB URI");
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "Could not extract valid hostname from MongoDB URI",
+        ));
     }
 
-    // For other database types or if no MongoDB mappings were found
+    // For non-MongoDB databases, return an error
     Err(IoError::new(
-        ErrorKind::NotFound,
-        format!("No default mapping found for {:?}", db_type),
+        ErrorKind::InvalidData,
+        "SNI hostname required for non-MongoDB connections",
     ))
 }
 
