@@ -379,11 +379,13 @@ impl CertificateIssuer {
                 let creds_file = self.create_temp_credentials_file(credentials)?;
 
                 // Create the cleanup guard with the owned path
-                let _cleanup_guard = scopeguard::guard(creds_file.clone(), |f| {
-                    if let Err(e) = std::fs::remove_file(&f) {
-                        eprintln!("Failed to remove credentials file: {}", e);
-                    }
-                });
+                // let _cleanup_guard = scopeguard::guard(creds_file.clone(), |f| {
+                //     if let Err(e) = std::fs::remove_file(&f) {
+                //         eprintln!("Failed to remove credentials file: {}", e);
+                //     }
+                // });
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
 
                 // Use the credentials file in the command
                 cmd.arg(format!("--dns-{}-credentials", provider))
