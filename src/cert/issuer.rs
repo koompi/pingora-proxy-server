@@ -24,7 +24,13 @@ pub struct CertificateRequest {
     pub wildcard: Option<bool>,
     pub dns_provider: Option<String>,         // e.g., "cloudflare"
     pub dns_credentials: Option<Credentials>, // Provider-specific credentials
-    pub auth_method: String,                  // Add this field
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String, // Make this optional with a default value
+}
+
+// Add this function to provide a default value
+fn default_auth_method() -> String {
+    "http-01".to_string()
 }
 
 // DNS provider credentials
