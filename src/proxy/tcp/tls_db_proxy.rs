@@ -50,13 +50,28 @@ impl SniContextManager {
             )
         })?;
 
-        // Set more permissive options for MongoDB compatibility
+        // Enhanced MongoDB compatibility settings
         builder.set_verify(SslVerifyMode::NONE);
 
-        // Build the context
+        // Set broader cipher list for MongoDB compatibility
+        builder
+            .set_cipher_list("HIGH:!aNULL:!MD5:!RC4:!3DES:@STRENGTH")
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("Cipher list error: {}", e)))?;
 
-        // Allow legacy renegotiation for older MongoDB clients
-        builder.clear_options(SslOptions::NO_RENEGOTIATION);
+        // Additional TLS options for better compatibility
+        let options =
+            SslOptions::NO_COMPRESSION | SslOptions::CIPHER_SERVER_PREFERENCE | SslOptions::ALL;
+        builder.set_options(options);
+
+        // Clear restrictive options
+        builder.clear_options(
+            SslOptions::NO_RENEGOTIATION
+                | SslOptions::NO_TLSV1
+                | SslOptions::NO_TLSV1_1
+                | SslOptions::NO_TICKET,
+        );
+
+        // Build the context
         let ctx = builder.build();
 
         Ok(Self {
@@ -94,7 +109,26 @@ impl SniContextManager {
             )
         })?;
 
+        // Enhanced MongoDB compatibility settings
         builder.set_verify(SslVerifyMode::NONE);
+
+        // Set broader cipher list
+        builder
+            .set_cipher_list("HIGH:!aNULL:!MD5:!RC4:!3DES:@STRENGTH")
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("Cipher list error: {}", e)))?;
+
+        // Additional TLS options
+        let options =
+            SslOptions::NO_COMPRESSION | SslOptions::CIPHER_SERVER_PREFERENCE | SslOptions::ALL;
+        builder.set_options(options);
+
+        // Clear restrictive options
+        builder.clear_options(
+            SslOptions::NO_RENEGOTIATION
+                | SslOptions::NO_TLSV1
+                | SslOptions::NO_TLSV1_1
+                | SslOptions::NO_TICKET,
+        );
 
         // Set SNI callback
         builder.set_servername_callback(|ssl_ref, _alert| {
@@ -104,8 +138,6 @@ impl SniContextManager {
             Ok(())
         });
 
-        builder.set_verify(SslVerifyMode::NONE);
-        builder.clear_options(SslOptions::NO_RENEGOTIATION);
         let ctx = builder.build();
 
         self.domain_contexts
