@@ -291,10 +291,25 @@ fn main() {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(!disable_ssl);
 
+        // Create database IP rules storage
+        let db_ip_rules = match runtime
+            .block_on(async { proxy::tcp::DatabaseIpRules::new_with_storage().await })
+        {
+            Ok(rules) => Arc::new(tokio::sync::Mutex::new(rules)),
+            Err(e) => {
+                println!("Error initializing IP rules: {}", e);
+                Arc::new(tokio::sync::Mutex::new(proxy::tcp::DatabaseIpRules::new()))
+            }
+        };
+
         // Create and add the TCP proxy service
+        let tokio_config_store = {
+            let std_config = config_store.lock().unwrap().clone(); // Get data from std mutex
+            Arc::new(tokio::sync::Mutex::new(std_config)) // Create new tokio mutex
+        };
         let tcp_proxy_service = runtime
             .block_on(proxy::tcp::TcpProxyService::new(
-                config_store.clone(),
+                tokio_config_store,
                 tcp_proxy_tls,
             ))
             .unwrap();

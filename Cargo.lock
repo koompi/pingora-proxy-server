@@ -1856,6 +1856,7 @@ dependencies = [
  "sha256",
  "thiserror 2.0.12",
  "tokio",
+ "tokio-openssl",
  "tower",
  "uuid",
  "x509-parser",

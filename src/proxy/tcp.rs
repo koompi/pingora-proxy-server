@@ -1,23 +1,27 @@
 // src/proxy/tcp.rs
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 use async_trait::async_trait;
-use log::{error, info};
+use log::{error, info, warn};
+use openssl::ssl::{
+    NameType, SslAcceptor, SslAcceptorBuilder, SslContext, SslFiletype, SslMethod, SslVerifyMode,
+};
 use pingora::server::{Fds, ShutdownWatch};
 use pingora::services::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 use crate::config::model::ConfigStore;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use tokio::fs;
+use chrono::prelude::*;
 
-// Database type enum
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Database type enum with serialization support
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DatabaseType {
     MongoDB,
     PostgreSQL,
@@ -38,6 +42,11 @@ impl DatabaseType {
         }
     }
 
+    // Get standard listen port (single port per database type)
+    pub fn listen_port(&self) -> u16 {
+        self.default_port() // Use the same standard ports
+    }
+
     // Detect database type from domain pattern
     pub fn detect_from_domain(domain: &str) -> Self {
         if domain.contains(".mongodb.") {
@@ -54,23 +63,32 @@ impl DatabaseType {
     }
 }
 
-// Connection statistics
-#[derive(Debug, Default, Clone)]
-struct ConnectionStats {
-    active_connections: usize,
-    total_connections: usize,
-    bytes_in: usize,
-    bytes_out: usize,
+// Connection statistics that can be serialized
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ConnectionStats {
+    pub active_connections: usize,
+    pub total_connections: usize,
+    pub bytes_in: usize,
+    pub bytes_out: usize,
 }
 
-// Database host mapping
-#[derive(Clone)]
-struct DatabaseMapping {
-    public_port: u16,
-    target_host: String,
-    target_port: u16,
-    db_type: DatabaseType,
-    stats: Arc<Mutex<ConnectionStats>>,
+// Database host mapping with serializable stats
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DatabaseMapping {
+    pub target_host: String,
+    pub target_port: u16,
+    pub db_type: DatabaseType,
+    pub tls_config: Option<TlsConfig>,
+    #[serde(skip)] // Skip serialization of the stats mutex
+    pub stats: Arc<Mutex<ConnectionStats>>,
+}
+
+// TLS configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub ca_path: Option<String>,
 }
 
 impl DatabaseMapping {
@@ -80,27 +98,17 @@ impl DatabaseMapping {
         let (target_host, target_port) = if parts.len() > 1 {
             (
                 parts[0].to_string(),
-                parts[1].parse::<u16>().unwrap_or(db_type.default_port()),
+                parts[1].parse().unwrap_or(db_type.default_port()),
             )
         } else {
             (parts[0].to_string(), db_type.default_port())
         };
 
-        // Generate a unique port based on domain name hash
-        let domain_hash = calculate_hash(&domain);
-        let public_port = match db_type {
-            DatabaseType::MongoDB => 27017 + (domain_hash % 1000),
-            DatabaseType::PostgreSQL => 5432 + (domain_hash % 1000),
-            DatabaseType::MySQL => 3306 + (domain_hash % 1000),
-            DatabaseType::Redis => 6379 + (domain_hash % 1000),
-            DatabaseType::Unknown => db_type.default_port(),
-        };
-
         DatabaseMapping {
-            public_port, // Use the unique port
             target_host,
             target_port,
             db_type,
+            tls_config: None,
             stats: Arc::new(Mutex::new(ConnectionStats::default())),
         }
     }
@@ -168,7 +176,7 @@ impl DatabaseIpRules {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        fs::write(reload_path, now.to_string()).await?;
+        tokio::fs::write(reload_path, now.to_string()).await?;
 
         Ok(())
     }
@@ -194,7 +202,7 @@ impl DatabaseIpRules {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                fs::write(reload_path, now.to_string()).await?;
+                tokio::fs::write(reload_path, now.to_string()).await?;
             }
         }
         Ok(changed)
@@ -248,7 +256,7 @@ impl DatabaseIpRules {
         let temp_path = file_path.with_extension("tmp");
 
         // Write to temporary file first
-        fs::write(&temp_path, json).await?;
+        tokio::fs::write(&temp_path, json).await?;
 
         // Rename temporary file to actual file (atomic operation)
         tokio::fs::rename(&temp_path, &file_path).await?;
@@ -262,7 +270,7 @@ impl DatabaseIpRules {
         let file_path = std::path::Path::new("/pingora-proxy/storage/ip_rules.json");
 
         if file_path.exists() {
-            let content = fs::read_to_string(file_path).await?;
+            let content = tokio::fs::read_to_string(file_path).await?;
             self.rules = serde_json::from_str(&content)?;
         }
 
@@ -270,17 +278,19 @@ impl DatabaseIpRules {
     }
 }
 
-// TCP Proxy Service
+// TCP Proxy Service with TLS SNI Support
 pub struct TcpProxyService {
-    servers: Arc<Mutex<ConfigStore>>,
+    servers: Arc<tokio::sync::Mutex<ConfigStore>>,
     db_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
     enable_tls: bool,
     ip_rules: DatabaseIpRules,
+    // Certificate store per database type
+    cert_contexts: Arc<Mutex<HashMap<DatabaseType, HashMap<String, SslContext>>>>,
 }
 
 impl TcpProxyService {
     pub async fn new(
-        servers: Arc<Mutex<ConfigStore>>,
+        servers: Arc<tokio::sync::Mutex<ConfigStore>>,
         enable_tls: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
@@ -288,6 +298,7 @@ impl TcpProxyService {
             db_mappings: Arc::new(Mutex::new(HashMap::new())),
             enable_tls,
             ip_rules: DatabaseIpRules::new_with_storage().await?,
+            cert_contexts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -296,11 +307,16 @@ impl TcpProxyService {
         info!("Initializing database mappings");
 
         // Lock the mappings for update
-        let mut db_mappings = self.db_mappings.lock().unwrap();
+        let mut db_mappings = match self.db_mappings.lock().await {
+            mappings => mappings,
+        };
         db_mappings.clear();
 
-        // Lock the server config store
-        if let Ok(servers) = self.servers.lock() {
+        // Get access to the server config store
+        if let mut servers = self.servers.lock().await {
+            // Group mappings by database type to properly set up SNI routing
+            let mut db_type_domains: HashMap<DatabaseType, Vec<(String, String)>> = HashMap::new();
+
             for (domain, (backend, _)) in servers.iter() {
                 // Check if this is a database domain pattern
                 if domain.contains(".mongodb.")
@@ -313,60 +329,147 @@ impl TcpProxyService {
                     || domain.contains(".db.")
                 {
                     let mapping = DatabaseMapping::new(domain.clone(), backend.clone());
+                    let db_type = mapping.db_type;
+
+                    // Group by database type
+                    db_type_domains
+                        .entry(db_type)
+                        .or_default()
+                        .push((domain.clone(), backend.clone()));
 
                     info!(
-                        "Adding database mapping: {} -> {}:{} (type: {:?}) - Connect to port: {}",
-                        domain,
-                        mapping.target_host,
-                        mapping.target_port,
-                        mapping.db_type,
-                        mapping.public_port
+                        "Adding database mapping: {} -> {}:{} (type: {:?})",
+                        domain, mapping.target_host, mapping.target_port, mapping.db_type
                     );
 
                     db_mappings.insert(domain.clone(), mapping);
                 }
             }
+
+            // Initialize TLS contexts for each database type if TLS is enabled
+            if self.enable_tls {
+                info!("Initializing TLS contexts for database connections");
+                self.initialize_tls_contexts(&db_type_domains).await;
+            }
         }
 
         info!("Initialized {} database mappings", db_mappings.len());
+        // db_mappings is dropped here, releasing the lock
     }
 
-    // Run a TLS-enabled TCP proxy for the given mapping
+    // Initialize TLS contexts for SNI routing
+    async fn initialize_tls_contexts(
+        &self,
+        db_type_domains: &HashMap<DatabaseType, Vec<(String, String)>>,
+    ) {
+        // Lock the cert contexts for update
+        let mut cert_contexts = match self.cert_contexts.lock().await {
+            contexts => contexts,
+        };
+
+        // For each database type, initialize the contexts
+        for (db_type, domains) in db_type_domains {
+            let mut type_contexts = HashMap::new();
+
+            for (domain, _) in domains {
+                // Look for certificates in common locations
+                let cert_path = format!("/certbot/letsencrypt/live/{}/fullchain.pem", domain);
+                let key_path = format!("/certbot/letsencrypt/live/{}/privkey.pem", domain);
+
+                if std::path::Path::new(&cert_path).exists()
+                    && std::path::Path::new(&key_path).exists()
+                {
+                    match self.create_ssl_context(&cert_path, &key_path) {
+                        Ok(context) => {
+                            info!("Created TLS context for database domain: {}", domain);
+                            type_contexts.insert(domain.clone(), context);
+                        }
+                        Err(e) => {
+                            error!("Failed to create TLS context for {}: {}", domain, e);
+                        }
+                    }
+                } else {
+                    info!("No certificate found for database domain: {}", domain);
+                }
+            }
+
+            // Store the contexts for this database type
+            if !type_contexts.is_empty() {
+                cert_contexts.insert(*db_type, type_contexts);
+            }
+        }
+    }
+
+    // Create SSL context from certificate and key files
+    fn create_ssl_context(
+        &self,
+        cert_path: &str,
+        key_path: &str,
+    ) -> Result<SslContext, Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
+
+        // Set up certificate and key
+        builder.set_certificate_file(cert_path, SslFiletype::PEM)?;
+        builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+        builder.check_private_key()?;
+
+        // Set up SNI callback
+        builder.set_servername_callback(|ssl_ref, _alert| {
+            if let Some(servername) = ssl_ref.servername(NameType::HOST_NAME) {
+                info!("SNI hostname received: {}", servername);
+            }
+            Ok(())
+        });
+
+        // Additional TLS settings
+        builder.set_verify(SslVerifyMode::NONE); // Don't verify client certificates
+
+        Ok(builder.build().into_context())
+    }
+
+    // Find SSL context based on SNI hostname
+    async fn find_ssl_context(&self, db_type: DatabaseType, hostname: &str) -> Option<SslContext> {
+        let cert_contexts = match self.cert_contexts.lock().await {
+            contexts => contexts,
+        };
+
+        if let Some(type_contexts) = cert_contexts.get(&db_type) {
+            // Try exact match first
+            if let Some(context) = type_contexts.get(hostname) {
+                return Some(context.clone());
+            }
+
+            // Try wildcard match if no exact match found
+            for (domain, context) in type_contexts.iter() {
+                if domain.starts_with("*.") {
+                    let wildcard_suffix = &domain[1..]; // Remove the "*"
+                    if hostname.ends_with(wildcard_suffix) {
+                        return Some(context.clone());
+                    }
+                }
+            }
+
+            // If no match found, return the first context as fallback
+            if let Some((_, context)) = type_contexts.iter().next() {
+                return Some(context.clone());
+            }
+        }
+
+        None
+    }
+
+    // Run a TLS-enabled TCP proxy for a specific database type
     async fn run_tls_proxy(
         &self,
-        domain: String,
-        _public_port: u16,
-        _target_host: String,
-        _target_port: u16,
-        _db_type: DatabaseType,
-        _stats: Arc<Mutex<ConnectionStats>>,
-        _shutdown_rx: mpsc::Receiver<()>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // For TLS implementation, you would need to:
-        // 1. Create a TLS acceptor with the domain's certificate
-        // 2. Accept TLS connections and handle them
-        // This is a placeholder for the TLS implementation
-        info!("TLS proxy for {} not implemented yet", domain);
-        Ok(())
-    }
-
-    async fn run_tcp_proxy(
-        &self,
-        domain_name: String,
-        public_port: u16,
-        target_host: String,
-        target_port: u16,
         db_type: DatabaseType,
-        stats: Arc<Mutex<ConnectionStats>>,
+        listen_port: u16,
         mut shutdown_rx: mpsc::Receiver<()>,
-        db_mappings_arc: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
-        ip_rules: DatabaseIpRules,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listen_addr = format!("0.0.0.0:{}", public_port);
+        let listen_addr = format!("0.0.0.0:{}", listen_port);
 
         info!(
-            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {} -> {}:{}",
-            domain_name, db_type, listen_addr, target_host, target_port
+            "Starting TLS Proxy for {:?} database connections on {}",
+            db_type, listen_addr
         );
 
         let listener = TcpListener::bind(&listen_addr).await?;
@@ -375,47 +478,36 @@ impl TcpProxyService {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
-                        Ok((inbound, client_addr)) => {
-                            // Check IP rules using domain_name directly since we know it from the port
-                            let client_ip = client_addr.ip().to_string();
-                            if !ip_rules.is_ip_allowed(&domain_name, &client_ip) {
-                                error!(
-                                    "TCP Proxy: Connection rejected - unauthorized IP {} for database {}",
-                                    client_ip, domain_name
-                                );
-                                continue;
-                            }
+                        Ok((client_stream, client_addr)) => {
+                            info!("Accepted connection from {} on {:?} port", client_addr, db_type);
 
-                            // Update connection stats
-                            {
-                                let mut stats_guard = stats.lock().unwrap();
-                                stats_guard.active_connections += 1;
-                                stats_guard.total_connections += 1;
-                            }
+                            // Clone required arc references
+                            let db_mappings = Arc::clone(&self.db_mappings);
+                            let cert_contexts = Arc::clone(&self.cert_contexts);
+                            let ip_rules = self.ip_rules.clone();
+                            let self_clone = self.clone();
 
-                            // Connect to the target
-                            let backend = format!("{}:{}", target_host, target_port);
-                            match TcpStream::connect(&backend).await {
-                                Ok(outbound) => {
-                                    let conn_stats = Arc::clone(&stats);
-                                    tokio::spawn(async move {
-                                        let _ = proxy_connection(inbound, outbound, conn_stats).await;
-                                    });
+                            // Spawn a new task to handle the TLS connection
+                            tokio::spawn(async move {
+                                if let Err(e) = self_clone.handle_tls_connection(
+                                    client_stream,
+                                    client_addr.ip().to_string(),
+                                    db_type,
+                                    db_mappings,
+                                    cert_contexts,
+                                    ip_rules,
+                                ).await {
+                                    error!("Error handling TLS connection: {}", e);
                                 }
-                                Err(e) => {
-                                    error!("Failed to connect to target {}: {}", backend, e);
-                                    let mut stats_guard = stats.lock().unwrap();
-                                    stats_guard.active_connections -= 1;
-                                }
-                            }
+                            });
                         }
                         Err(e) => {
-                            error!("Failed to accept connection: {}", e);
+                            error!("Error accepting connection: {}", e);
                         }
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Shutting down TCP proxy for {}", domain_name);
+                    info!("Shutting down TLS proxy for {:?}", db_type);
                     break;
                 }
             }
@@ -424,12 +516,176 @@ impl TcpProxyService {
         Ok(())
     }
 
+    // Handle a TLS connection with SNI routing
+    async fn handle_tls_connection(
+        &self,
+        mut client_stream: TcpStream,
+        client_ip: String,
+        db_type: DatabaseType,
+        db_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+        cert_contexts: Arc<Mutex<HashMap<DatabaseType, HashMap<String, SslContext>>>>,
+        ip_rules: DatabaseIpRules,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // First, we need to peek at the TLS ClientHello to extract SNI without consuming data
+        let mut peek_buf = [0u8; 1024];
+        let peek_size = client_stream.peek(&mut peek_buf).await?;
+
+        // Extract SNI hostname from ClientHello
+        let sni_hostname = match extract_sni_hostname(&peek_buf[..peek_size]) {
+            Some(hostname) => {
+                info!("SNI hostname extracted: {}", hostname);
+                hostname
+            }
+            None => {
+                error!("No SNI hostname found in TLS ClientHello");
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "No SNI hostname in TLS ClientHello",
+                )));
+            }
+        };
+
+        // Check IP rules for this domain
+        if !ip_rules.is_ip_allowed(&sni_hostname, &client_ip) {
+            error!(
+                "Connection rejected - unauthorized IP {} for database {}",
+                client_ip, sni_hostname
+            );
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "IP not authorized for this database",
+            )));
+        }
+
+        // Get mapping for this hostname
+        let mapping = {
+            let mappings = match db_mappings.lock().await {
+                m => m,
+            };
+
+            if let Some(mapping) = mappings.get(&sni_hostname) {
+                mapping.clone()
+            } else {
+                error!("No mapping found for hostname: {}", sni_hostname);
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No database mapping found for hostname",
+                )));
+            }
+        };
+
+        // Connect to the target backend database
+        let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
+        let mut backend_stream = match TcpStream::connect(&backend_addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to connect to backend {}: {}", backend_addr, e);
+                return Err(Box::new(e));
+            }
+        };
+
+        // Set up bidirectional proxy
+        let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+        let (mut backend_read, mut backend_write) = tokio::io::split(backend_stream);
+
+        // Update connection stats
+        {
+            let mut stats = mapping.stats.lock().await;
+            stats.active_connections += 1;
+            stats.total_connections += 1;
+        }
+
+        // Set up channels for signaling completion
+        let (client_done_tx, mut client_done_rx) = mpsc::channel::<()>(1);
+        let (backend_done_tx, mut backend_done_rx) = mpsc::channel::<()>(1);
+
+        // Clone stats for tasks
+        let stats_clone1 = mapping.stats.clone();
+        let stats_clone2 = mapping.stats.clone();
+
+        // Forward client -> backend
+        let client_to_backend = tokio::spawn(async move {
+            let mut buffer = [0u8; 8192];
+            let mut total_bytes = 0;
+
+            loop {
+                match client_read.read(&mut buffer).await {
+                    Ok(0) => break, // Connection closed
+                    Ok(n) => {
+                        if let Err(e) = backend_write.write_all(&buffer[..n]).await {
+                            error!("Error writing to backend: {}", e);
+                            break;
+                        }
+                        total_bytes += n;
+                    }
+                    Err(e) => {
+                        error!("Error reading from client: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Update stats
+            let mut stats = stats_clone1.lock().await;
+            stats.bytes_in += total_bytes;
+            stats.active_connections = stats.active_connections.saturating_sub(1);
+
+            let _ = client_done_tx.send(()).await;
+        });
+
+        // Forward backend -> client
+        let backend_to_client = tokio::spawn(async move {
+            let mut buffer = [0u8; 8192];
+            let mut total_bytes = 0;
+
+            loop {
+                match backend_read.read(&mut buffer).await {
+                    Ok(0) => break, // Connection closed
+                    Ok(n) => {
+                        if let Err(e) = client_write.write_all(&buffer[..n]).await {
+                            error!("Error writing to client: {}", e);
+                            break;
+                        }
+                        total_bytes += n;
+                    }
+                    Err(e) => {
+                        error!("Error reading from backend: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Update stats
+            let mut stats = stats_clone2.lock().await;
+            stats.bytes_out += total_bytes;
+
+            let _ = backend_done_tx.send(()).await;
+        });
+
+        // Wait for either direction to complete
+        tokio::select! {
+            _ = client_done_rx.recv() => {
+                info!("Client -> Backend completed for hostname: {}", sni_hostname);
+            }
+            _ = backend_done_rx.recv() => {
+                info!("Backend -> Client completed for hostname: {}", sni_hostname);
+            }
+        }
+
+        // Clean up tasks
+        client_to_backend.abort();
+        backend_to_client.abort();
+
+        info!("Connection closed for hostname: {}", sni_hostname);
+        Ok(())
+    }
+
     // Modified reload check to include file watching
     async fn check_reload_needed(&self) -> bool {
         let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
 
         if reload_path.exists() {
-            if let Ok(content) = fs::read_to_string(reload_path).await {
+            if let Ok(content) = tokio::fs::read_to_string(reload_path).await {
                 if let Ok(timestamp) = content.trim().parse::<u64>() {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -447,149 +703,111 @@ impl TcpProxyService {
     }
 }
 
-// Function to handle a single proxied connection
-async fn proxy_connection(
-    mut inbound: TcpStream,
-    mut outbound: TcpStream,
-    stats: Arc<Mutex<ConnectionStats>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Log connection details at start
-    let peer_addr = inbound
-        .peer_addr()
-        .map_or("unknown".to_string(), |addr| addr.to_string());
-    let local_addr = inbound
-        .local_addr()
-        .map_or("unknown".to_string(), |addr| addr.to_string());
-    let target_addr = outbound
-        .peer_addr()
-        .map_or("unknown".to_string(), |addr| addr.to_string());
-
-    info!(
-        "TCP Proxy: New connection established - Client: {} -> Proxy: {} -> Target: {}",
-        peer_addr, local_addr, target_addr
-    );
-
-    // Split the streams
-    let (mut ri, mut wi) = tokio::io::split(inbound);
-    let (mut ro, mut wo) = tokio::io::split(outbound);
-
-    // Create channels to communicate between tasks
-    let (client_done_tx, mut client_done_rx) = mpsc::channel::<()>(1);
-    let (server_done_tx, mut server_done_rx) = mpsc::channel::<()>(1);
-
-    // Forward data from client to server with enhanced logging
-    let stats_clone1 = Arc::clone(&stats);
-    let client_addr = peer_addr.clone();
-    let target_addr_clone = target_addr.clone();
-    let client_to_server = tokio::spawn(async move {
-        let mut buffer = [0; 8192];
-        let mut total_bytes = 0;
-        let mut last_log = std::time::Instant::now();
-
-        loop {
-            match ri.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("TCP Proxy: Client {} disconnected", client_addr);
-                    break;
-                }
-                Ok(n) => {
-                    match wo.write_all(&buffer[0..n]).await {
-                        Ok(_) => {
-                            total_bytes += n;
-                            // Log traffic stats every 30 seconds
-                            if last_log.elapsed() >= Duration::from_secs(30) {
-                                info!(
-                                    "TCP Proxy: Traffic from {} to {} - {} bytes transferred",
-                                    client_addr, target_addr_clone, total_bytes
-                                );
-                                last_log = std::time::Instant::now();
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "TCP Proxy: Write error to target {}: {}",
-                                target_addr_clone, e
-                            );
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("TCP Proxy: Read error from client {}: {}", client_addr, e);
-                    break;
-                }
-            }
-        }
-
-        // Update final stats
-        if let Ok(mut stats_guard) = stats_clone1.lock() {
-            stats_guard.bytes_in += total_bytes;
-            stats_guard.active_connections = stats_guard.active_connections.saturating_sub(1);
-        }
-
-        let _ = client_done_tx.send(()).await;
-    });
-
-    // Forward data from server to client
-    let stats_clone2 = Arc::clone(&stats);
-    let server_to_client = tokio::spawn(async move {
-        let mut buffer = [0; 8192];
-        let mut total_bytes = 0;
-
-        loop {
-            match ro.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    match wi.write_all(&buffer[0..n]).await {
-                        Ok(_) => {
-                            total_bytes += n;
-                            // Optionally update stats periodically
-                            if total_bytes > 1_000_000 {
-                                // Update every ~1MB
-                                if let Ok(mut stats_guard) = stats_clone2.lock() {
-                                    stats_guard.bytes_out += total_bytes;
-                                    total_bytes = 0;
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Final stats update
-        if total_bytes > 0 {
-            if let Ok(mut stats_guard) = stats_clone2.lock() {
-                stats_guard.bytes_out += total_bytes;
-            }
-        }
-
-        // Signal that this direction is done
-        let _ = server_done_tx.send(()).await;
-    });
-
-    // Wait for either direction to complete
-    tokio::select! {
-        _ = client_done_rx.recv() => {
-            info!("TCP Proxy: Client -> Server direction completed for {}", peer_addr);
-        }
-        _ = server_done_rx.recv() => {
-            info!("TCP Proxy: Server -> Client direction completed for {}", peer_addr);
+// Clone trait implementation
+impl Clone for TcpProxyService {
+    fn clone(&self) -> Self {
+        Self {
+            servers: Arc::clone(&self.servers),
+            db_mappings: Arc::clone(&self.db_mappings),
+            enable_tls: self.enable_tls,
+            ip_rules: self.ip_rules.clone(),
+            cert_contexts: Arc::clone(&self.cert_contexts),
         }
     }
+}
 
-    info!(
-        "TCP Proxy: Connection closed - Client: {} -> Target: {}",
-        peer_addr, target_addr
-    );
+// Extract SNI hostname from TLS ClientHello (simplified implementation)
+fn extract_sni_hostname(data: &[u8]) -> Option<String> {
+    // This is a simplified SNI extraction - in real code, you would use a TLS library
+    // to properly parse the ClientHello packet
 
-    // Clean up tasks
-    client_to_server.abort();
-    server_to_client.abort();
+    // Check for valid TLS handshake
+    if data.len() < 5 || data[0] != 0x16 {
+        // Not a handshake
+        return None;
+    }
 
-    Ok(())
+    // Basic sanity checks
+    if data[1] != 0x03 || data[2] > 0x03 {
+        // Not TLS 1.0-1.2
+        return None;
+    }
+
+    // Skip the TLS record header (5 bytes) and handshake header (4 bytes)
+    let mut pos = 9;
+
+    // Skip client random (32 bytes)
+    pos += 32;
+
+    // Skip session ID
+    if pos < data.len() {
+        let session_id_len = data[pos] as usize;
+        pos += 1 + session_id_len;
+    }
+
+    // Skip cipher suites
+    if pos + 1 < data.len() {
+        let cipher_suites_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
+        pos += 2 + cipher_suites_len;
+    }
+
+    // Skip compression methods
+    if pos < data.len() {
+        let compression_methods_len = data[pos] as usize;
+        pos += 1 + compression_methods_len;
+    }
+
+    // Check if we have extensions
+    if pos + 2 > data.len() {
+        return None;
+    }
+
+    // Get extensions length
+    let extensions_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
+    pos += 2;
+
+    // End position of extensions
+    let ext_end = pos + extensions_len;
+
+    // Iterate through extensions
+    while pos + 4 <= ext_end && pos + 4 <= data.len() {
+        let ext_type = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
+        let ext_len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
+        pos += 4;
+
+        if ext_type == 0 {
+            // SNI extension
+            if pos + 2 <= ext_end && pos + 2 <= data.len() {
+                // Skip SNI list length
+                let sni_list_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
+                pos += 2;
+
+                if pos < ext_end && pos < data.len() {
+                    let name_type = data[pos];
+                    pos += 1;
+
+                    if name_type == 0 && pos + 2 <= ext_end && pos + 2 <= data.len() {
+                        // Host name type
+                        let name_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
+                        pos += 2;
+
+                        if pos + name_len <= ext_end && pos + name_len <= data.len() {
+                            // Extract hostname
+                            if let Ok(hostname) = std::str::from_utf8(&data[pos..pos + name_len]) {
+                                return Some(hostname.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        // Skip to next extension
+        pos += ext_len;
+    }
+
+    None
 }
 
 #[async_trait]
@@ -604,80 +822,40 @@ impl Service for TcpProxyService {
         // Initialize mappings from config
         self.initialize_mappings().await;
 
-        // Create shutdown channels for each proxy
+        // Create shutdown channels for each database type proxy
         let mut shutdown_channels = Vec::new();
 
-        // Start a proxy for each database mapping
-        let mut mappings = Vec::new();
+        if self.enable_tls {
+            // Start a proxy for each database type
+            for db_type in [
+                DatabaseType::MongoDB,
+                DatabaseType::PostgreSQL,
+                DatabaseType::MySQL,
+                DatabaseType::Redis,
+            ]
+            .iter()
+            {
+                let (tx, rx) = mpsc::channel::<()>(1);
+                shutdown_channels.push(tx);
 
-        // Extract mappings from mutex to avoid holding lock during async operations
-        if let Ok(db_mappings) = self.db_mappings.lock() {
-            for (domain, mapping) in db_mappings.iter() {
-                mappings.push((domain.clone(), mapping.clone()));
+                let listen_port = db_type.listen_port();
+                let self_clone = self.clone();
+                let db_type_clone = *db_type;
+
+                tokio::spawn(async move {
+                    if let Err(e) = self_clone
+                        .run_tls_proxy(db_type_clone, listen_port, rx)
+                        .await
+                    {
+                        error!("TLS proxy for {:?} failed: {}", db_type_clone, e);
+                    }
+                });
             }
+
+            info!("Started TLS-enabled database proxies on standard ports");
+        } else {
+            error!("TLS is disabled, SNI routing will not be available. Enable TCP_PROXY_TLS for SNI routing.");
         }
-
-        // Process each mapping
-        for (domain, mapping) in mappings {
-            let (tx, rx) = mpsc::channel::<()>(1);
-            shutdown_channels.push(tx);
-
-            // Clone only what we need for the new task
-            let domain_clone = domain.clone();
-            let enable_tls = self.enable_tls;
-            let servers = Arc::clone(&self.servers);
-            let db_mappings = Arc::clone(&self.db_mappings);
-            let ip_rules = self.ip_rules.clone();
-            let db_mappings_clone = Arc::clone(&db_mappings);
-            let ip_rules_clone = ip_rules.clone();
-
-            tokio::spawn(async move {
-                // Create a new service instance without holding any mutex guards
-                let service = TcpProxyService {
-                    servers,
-                    db_mappings,
-                    enable_tls,
-                    ip_rules,
-                };
-
-                // Run either TLS or regular TCP proxy based on configuration
-                if enable_tls {
-                    if let Err(e) = service
-                        .run_tls_proxy(
-                            domain_clone.clone(),
-                            mapping.public_port,
-                            mapping.target_host.clone(),
-                            mapping.target_port,
-                            mapping.db_type,
-                            mapping.stats.clone(),
-                            rx,
-                        )
-                        .await
-                    {
-                        error!("TLS proxy for {} failed: {}", domain_clone, e);
-                    }
-                } else {
-                    if let Err(e) = service
-                        .run_tcp_proxy(
-                            domain_clone.clone(),
-                            mapping.public_port,
-                            mapping.target_host.clone(),
-                            mapping.target_port,
-                            mapping.db_type,
-                            mapping.stats.clone(),
-                            rx,
-                            db_mappings_clone, // Pass the arc
-                            ip_rules_clone,    // Pass the clone
-                        )
-                        .await
-                    {
-                        error!("TCP proxy for {} failed: {}", domain_clone, e);
-                    }
-                }
-            });
-        }
-
-        info!("Started {} TCP proxies", shutdown_channels.len());
 
         // Periodically check for config changes and update mappings
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -685,8 +863,8 @@ impl Service for TcpProxyService {
         loop {
             tokio::select! {
                 // Check for shutdown signal
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                result = shutdown.changed() => {
+                    if result.is_ok() && *shutdown.borrow() {
                         info!("Shutting down TCP Proxy service");
 
                         // Signal all proxies to shut down
@@ -702,7 +880,16 @@ impl Service for TcpProxyService {
 
                 // Check for config changes periodically
                 _ = interval.tick() => {
+                    // Reinitialize mappings if needed
                     self.initialize_mappings().await;
+
+                    // Check for IP rules reload
+                    if self.check_reload_needed().await {
+                        info!("IP rules change detected, reloading rules");
+                        if let Err(e) = self.ip_rules.load_from_storage().await {
+                            error!("Failed to reload IP rules: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -717,25 +904,4 @@ impl Service for TcpProxyService {
     fn threads(&self) -> Option<usize> {
         Some(2) // Use 2 threads for this service
     }
-}
-
-// Clone trait implementation
-impl Clone for TcpProxyService {
-    fn clone(&self) -> Self {
-        Self {
-            servers: Arc::clone(&self.servers),
-            db_mappings: Arc::clone(&self.db_mappings),
-            enable_tls: self.enable_tls,
-            ip_rules: self.ip_rules.clone(),
-        }
-    }
-}
-
-// Add this helper function to calculate a simple hash
-fn calculate_hash(s: &str) -> u16 {
-    let mut hash: u32 = 0;
-    for b in s.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
-    }
-    (hash % 1000) as u16
 }

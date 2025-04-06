@@ -16,10 +16,11 @@ services:
       - "443:443"
       - "81:81"
       - "9100:9100"
-      - "27017:27017" # MongoDB
-      - "5432:5432" # PostgreSQL
-      - "3306:3306" # MySQL/MariaDB
-      # - "6379:6379" # Redis
+      # Only expose one port per database type
+      - "27017:27017" # MongoDB primary port
+      - "5432:5432" # PostgreSQL primary port
+      - "3306:3306" # MySQL primary port
+      # - "6379:6379" # Redis primary port
     networks:
       - proxy-network
     volumes:
@@ -58,7 +59,7 @@ services:
       # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
       - ENABLE_TCP_PROXY=true
-      - TCP_PROXY_TLS=false
+      - TCP_PROXY_TLS=true # Enable TLS for database connections
 
     deploy:
       mode: replicated
