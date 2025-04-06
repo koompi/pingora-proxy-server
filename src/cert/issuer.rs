@@ -316,38 +316,38 @@ impl CertificateIssuer {
         let staging = request.staging.unwrap_or(false);
         let is_wildcard = request.wildcard.unwrap_or(false);
 
-        // First check for any running certbot processes and kill stale ones
-        if let Ok(output) = std::process::Command::new("pgrep").arg("certbot").output() {
-            if !output.stdout.is_empty() {
-                // Get the PIDs of running certbot processes
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let pids = stdout.split_whitespace().collect::<Vec<_>>();
+        // // First check for any running certbot processes and kill stale ones
+        // if let Ok(output) = std::process::Command::new("pgrep").arg("certbot").output() {
+        //     if !output.stdout.is_empty() {
+        //         // Get the PIDs of running certbot processes
+        //         let stdout = String::from_utf8_lossy(&output.stdout);
+        //         let pids = stdout.split_whitespace().collect::<Vec<_>>();
 
-                // Check each process
-                for pid in pids {
-                    // Check process age
-                    if let Ok(age_output) = std::process::Command::new("ps")
-                        .args(&["-o", "etimes=", "-p", pid])
-                        .output()
-                    {
-                        let age = String::from_utf8_lossy(&age_output.stdout)
-                            .trim()
-                            .parse::<u32>()
-                            .unwrap_or(0);
+        //         // Check each process
+        //         for pid in pids {
+        //             // Check process age
+        //             if let Ok(age_output) = std::process::Command::new("ps")
+        //                 .args(&["-o", "etimes=", "-p", pid])
+        //                 .output()
+        //             {
+        //                 let age = String::from_utf8_lossy(&age_output.stdout)
+        //                     .trim()
+        //                     .parse::<u32>()
+        //                     .unwrap_or(0);
 
-                        // If process is older than 1 minutes, kill it
-                        if age > 60 {
-                            let _ = std::process::Command::new("kill").arg(pid).output();
-                            println!("Killed stale certbot process {}", pid);
-                            continue;
-                        }
+        //                 // If process is older than 1 minutes, kill it
+        //                 if age > 60 {
+        //                     let _ = std::process::Command::new("kill").arg(pid).output();
+        //                     println!("Killed stale certbot process {}", pid);
+        //                     continue;
+        //                 }
 
-                        // If process is fresh, abort
-                        return Err(anyhow!("Another certbot process is already running. Please try again in a few minutes."));
-                    }
-                }
-            }
-        }
+        //                 // If process is fresh, abort
+        //                 return Err(anyhow!("Another certbot process is already running. Please try again in a few minutes."));
+        //             }
+        //         }
+        //     }
+        // }
 
         // Add a small delay to ensure any killed processes are cleaned up
         std::thread::sleep(std::time::Duration::from_secs(2));
