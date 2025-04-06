@@ -526,7 +526,6 @@ impl TcpProxyService {
         cert_contexts: Arc<Mutex<HashMap<DatabaseType, HashMap<String, SslContext>>>>,
         ip_rules: DatabaseIpRules,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // First, we need to peek at the TLS ClientHello to extract SNI without consuming data
         let mut peek_buf = [0u8; 1024];
         let peek_size = client_stream.peek(&mut peek_buf).await?;
 
@@ -537,11 +536,34 @@ impl TcpProxyService {
                 hostname
             }
             None => {
-                error!("No SNI hostname found in TLS ClientHello");
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "No SNI hostname in TLS ClientHello",
-                )));
+                // For MongoDB, use default mapping when SNI is not provided
+                if db_type == DatabaseType::MongoDB {
+                    let mappings = db_mappings.lock().await;
+                    let default_mapping = mappings
+                        .iter()
+                        .find(|(k, _)| k.contains("mongodb"))
+                        .map(|(k, _)| k.clone());
+
+                    match default_mapping {
+                        Some(hostname) => {
+                            info!("Using default MongoDB mapping: {}", hostname);
+                            hostname
+                        }
+                        None => {
+                            error!("No default MongoDB mapping available");
+                            return Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "No default MongoDB mapping available",
+                            )));
+                        }
+                    }
+                } else {
+                    error!("No SNI hostname found in TLS ClientHello");
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "No SNI hostname in TLS ClientHello",
+                    )));
+                }
             }
         };
 
