@@ -487,7 +487,7 @@ impl CertificateIssuer {
     // Create a Cloudflare credentials file for certbot dns-cloudflare plugin
     fn create_cloudflare_credentials(&self, credentials: &Credentials) -> Result<String> {
         // Use /mnt/gluster/certbot/letsencrypt/cloudflare instead of self.certbot_dir
-        let credentials_dir = PathBuf::from("/mnt/gluster/certbot/letsencrypt/cloudflare");
+        let credentials_dir = PathBuf::from("/certbot/letsencrypt/cloudflare");
         fs::create_dir_all(&credentials_dir)?;
 
         // Create unique filename
