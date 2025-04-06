@@ -24,6 +24,7 @@ pub struct CertificateRequest {
     pub wildcard: Option<bool>,
     pub dns_provider: Option<String>,         // e.g., "cloudflare"
     pub dns_credentials: Option<Credentials>, // Provider-specific credentials
+    pub auth_method: String,                  // Add this field
 }
 
 // DNS provider credentials
@@ -351,16 +352,13 @@ impl CertificateIssuer {
 
         println!("Issuing certificate for: {}", domain);
 
-        // Build certbot command - use webroot directly, don't try to handle tokens yourself
+        // Build certbot command based on authentication method
         let mut cmd = Command::new("certbot");
         cmd.arg("certonly")
-            .arg("--webroot")
-            .arg("-w")
-            .arg("/var/www/html")
+            .arg("--non-interactive")
+            .arg("--agree-tos")
             .arg("--email")
             .arg(email)
-            .arg("--agree-tos")
-            .arg("--no-eff-email")
             .arg("--config-dir")
             .arg(&self.certbot_dir);
 
@@ -368,50 +366,34 @@ impl CertificateIssuer {
             cmd.arg("--staging");
         }
 
-        // Handle different challenge types
+        // Use appropriate authentication method
         if is_wildcard {
-            // For wildcard certificates, use DNS challenge with Cloudflare
-            if let Some(dns_provider) = &request.dns_provider {
-                if dns_provider == "cloudflare" {
-                    if let Some(credentials) = &request.dns_credentials {
-                        // Create Cloudflare credentials file
-                        let cf_credentials_path =
-                            self.create_cloudflare_credentials(credentials)?;
+            if let (Some(provider), Some(credentials)) =
+                (&request.dns_provider, &request.dns_credentials)
+            {
+                cmd.arg(format!("--dns-{}", provider));
 
-                        cmd.arg("--authenticator")
-                            .arg("dns-cloudflare")
-                            .arg("--dns-cloudflare-credentials")
-                            .arg(&cf_credentials_path);
-                    } else {
-                        return Err(anyhow!(
-                            "Cloudflare credentials required for wildcard certificates"
-                        ));
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "Only Cloudflare is supported for wildcard certificates"
-                    ));
-                }
+                // Create temporary credentials file
+                let creds_file = self.create_temp_credentials_file(credentials)?;
+                cmd.arg(format!("--dns-{}-credentials", provider))
+                    .arg(&creds_file);
+
+                // Add both the base domain and wildcard
+                cmd.arg("-d")
+                    .arg(domain)
+                    .arg("-d")
+                    .arg(format!("*.{}", domain));
             } else {
-                return Err(anyhow!("DNS provider required for wildcard certificates"));
+                return Err(anyhow::anyhow!(
+                    "DNS credentials required for wildcard certificates"
+                ));
             }
-
-            // Add domain and wildcard domain
-            cmd.arg("-d")
-                .arg(domain)
-                .arg("-d")
-                .arg(format!("*.{}", domain));
-
-            println!("Using DNS-01 challenge for wildcard certificate");
         } else {
-            // For regular certificates, use HTTP-01 challenge
             cmd.arg("--webroot")
                 .arg("-w")
-                .arg("/var/www/html") // Webroot path
+                .arg("/var/www/html")
                 .arg("-d")
                 .arg(domain);
-
-            println!("Using HTTP-01 challenge for standard certificate");
         }
 
         // Execute certbot command
@@ -474,6 +456,21 @@ impl CertificateIssuer {
             error: None,
             is_wildcard: Some(is_wildcard),
         })
+    }
+
+    // Create temporary credentials file for DNS providers
+    fn create_temp_credentials_file(&self, credentials: &Credentials) -> Result<String> {
+        match credentials {
+            // Handle Cloudflare credentials
+            credentials
+                if credentials.api_token.is_some()
+                    || (credentials.api_key.is_some() && credentials.api_email.is_some()) =>
+            {
+                self.create_cloudflare_credentials(credentials)
+            }
+            // Add support for other DNS providers here if needed
+            _ => Err(anyhow!("Unsupported DNS provider credentials format")),
+        }
     }
 
     // Create a Cloudflare credentials file for certbot dns-cloudflare plugin

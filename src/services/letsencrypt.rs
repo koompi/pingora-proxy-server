@@ -201,16 +201,19 @@ impl LetsEncryptService {
                 None
             },
             dns_credentials,
+            // Add this field to specify the authentication method
+            auth_method: if is_wildcard {
+                "dns-01".to_string()
+            } else {
+                "http-01".to_string()
+            },
         };
 
         let status = issuer.process_request(request).await;
 
-        if status.error.is_some() {
-            println!(
-                "Failed to issue certificate for {}: {:?}",
-                domain, status.error
-            );
-            return Err(anyhow::anyhow!("Certificate issuance failed"));
+        if let Some(error) = status.error {
+            println!("Failed to issue certificate for {}: {:?}", domain, error);
+            return Err(anyhow::anyhow!("Certificate issuance failed: {}", error));
         }
 
         println!(
