@@ -1,10 +1,15 @@
 // src/proxy/tls_db_proxy.rs
+use foreign_types_shared::ForeignTypeRef;
 use log::{debug, error, info, warn};
-use openssl::ssl::{NameType, SslAcceptor, SslContext, SslFiletype, SslMethod, SslVerifyMode};
+use openssl::ssl::{
+    NameType, SslAcceptor, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
+};
+use openssl::ssl::{SslContextRef, SslOptions};
 use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::ptr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -45,13 +50,17 @@ impl SniContextManager {
             )
         })?;
 
+        // Set more permissive options for MongoDB compatibility
         builder.set_verify(SslVerifyMode::NONE);
 
-        // Use .build() to get SslContext from SslAcceptor
-        let default_context = builder.build().into_context();
+        // Build the context
+
+        // Allow legacy renegotiation for older MongoDB clients
+        builder.clear_options(SslOptions::NO_RENEGOTIATION);
+        let ctx = builder.build();
 
         Ok(Self {
-            default_context,
+            default_context: ctx.into_context(),
             domain_contexts: HashMap::new(),
             cert_dir: cert_dir.to_string(),
         })
@@ -87,7 +96,7 @@ impl SniContextManager {
 
         builder.set_verify(SslVerifyMode::NONE);
 
-        // Set SNI callback to handle servername indication
+        // Set SNI callback
         builder.set_servername_callback(|ssl_ref, _alert| {
             if let Some(servername) = ssl_ref.servername(NameType::HOST_NAME) {
                 info!("SNI hostname received: {}", servername);
@@ -95,9 +104,12 @@ impl SniContextManager {
             Ok(())
         });
 
-        // Use .build() to get SslContext from SslAcceptor
-        let context = builder.build().into_context();
-        self.domain_contexts.insert(domain.to_string(), context);
+        builder.set_verify(SslVerifyMode::NONE);
+        builder.clear_options(SslOptions::NO_RENEGOTIATION);
+        let ctx = builder.build();
+
+        self.domain_contexts
+            .insert(domain.to_string(), ctx.into_context());
 
         Ok(())
     }
@@ -315,7 +327,7 @@ async fn handle_tls_connection(
                 let mappings = db_mappings.lock().await;
                 let default_mapping = mappings
                     .iter()
-                    .find(|(k, v)| k.contains("mongodb"))
+                    .find(|(k, _v)| k.contains("mongodb"))
                     .map(|(k, _)| k.clone());
 
                 if let Some(default_hostname) = default_mapping {
