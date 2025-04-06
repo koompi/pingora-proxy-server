@@ -486,8 +486,8 @@ impl CertificateIssuer {
 
     // Create a Cloudflare credentials file for certbot dns-cloudflare plugin
     fn create_cloudflare_credentials(&self, credentials: &Credentials) -> Result<String> {
-        // Create directory for credentials if needed
-        let credentials_dir = self.certbot_dir.join("cloudflare");
+        // Use /mnt/gluster/certbot/letsencrypt/cloudflare instead of self.certbot_dir
+        let credentials_dir = PathBuf::from("/mnt/gluster/certbot/letsencrypt/cloudflare");
         fs::create_dir_all(&credentials_dir)?;
 
         // Create unique filename
@@ -495,25 +495,16 @@ impl CertificateIssuer {
             credentials_dir.join(format!("cloudflare-{}.ini", uuid::Uuid::new_v4()));
 
         // Write credentials to file
-        let mut content = String::new();
-
-        // Prefer API token (newer API) if available
-        if let Some(api_token) = &credentials.api_token {
-            content.push_str(&format!("dns_cloudflare_api_token = {}\n", api_token));
-        } else if let (Some(api_key), Some(api_email)) =
-            (&credentials.api_key, &credentials.api_email)
-        {
-            // Fall back to API key (older API)
-            content.push_str(&format!("dns_cloudflare_api_key = {}\n", api_key));
-            content.push_str(&format!("dns_cloudflare_email = {}\n", api_email));
-        } else {
-            return Err(anyhow!(
-                "Either API token or both API key and email are required for Cloudflare"
-            ));
-        }
+        let content = format!(
+            "dns_cloudflare_api_token = {}\n",
+            credentials
+                .api_token
+                .as_ref()
+                .ok_or_else(|| anyhow!("Cloudflare API token is required"))?
+        );
 
         // Write the file with strict permissions
-        fs::write(&credentials_file, content)?;
+        fs::write(&credentials_file, &content)?;
 
         // Set permissions to read-only for owner (600)
         #[cfg(unix)]
@@ -522,6 +513,13 @@ impl CertificateIssuer {
             let perms = fs::Permissions::from_mode(0o600);
             fs::set_permissions(&credentials_file, perms)?;
         }
+
+        // Debug output
+        println!(
+            "Created Cloudflare credentials file at: {:?}",
+            credentials_file
+        );
+        println!("File contents (first few chars): {:?}", &content[..20]);
 
         Ok(credentials_file.to_string_lossy().to_string())
     }
