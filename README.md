@@ -244,13 +244,3 @@ docker buildx build --platform linux/amd64,linux/arm64 -t localhost:5000/library
 | `CONFIG_PATH`        | Path to configuration file      | `/app/config/config.json`     |
 | `DISABLE_SSL`        | Disable SSL/TLS functionality   | `false`                       |
 | `PROXY_SERVICE_NAME` | Docker service name for updates | `proxy_proxy`                 |
-
-## 📝 License
-
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- [Cloudflare Pingora](https://github.com/cloudflare/pingora) - The high-performance Rust proxy framework
-- [certbot](https://certbot.eff.org/) - For Let's Encrypt integration
-- [bollard](https://github.com/fussybeaver/bollard) - Rust Docker API client
