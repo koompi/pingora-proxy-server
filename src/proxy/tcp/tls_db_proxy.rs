@@ -8,6 +8,7 @@ use openssl::ssl::{SslContextRef, SslOptions};
 use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
@@ -20,151 +21,116 @@ use crate::proxy::tcp::{DatabaseIpRules, DatabaseMapping, DatabaseType};
 
 // Helper struct for SNI context selection
 pub struct SniContextManager {
-    default_context: SslContext,
-    domain_contexts: HashMap<String, SslContext>,
+    default_contexts: HashMap<DatabaseType, SslContext>,
+    domain_contexts: HashMap<String, (DatabaseType, SslContext)>,
     cert_dir: String,
 }
 
 impl SniContextManager {
-    pub fn new(default_cert: &str, default_key: &str, cert_dir: &str) -> Result<Self, IoError> {
-        // Create a default context
-        let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())
-            .map_err(|e| IoError::new(ErrorKind::Other, format!("SSL builder error: {}", e)))?;
+    pub fn new(cert_dir: &str) -> Result<Self, IoError> {
+        let mut default_contexts = HashMap::new();
 
-        builder
-            .set_certificate_file(default_cert, SslFiletype::PEM)
-            .map_err(|e| {
-                IoError::new(ErrorKind::InvalidData, format!("Certificate error: {}", e))
-            })?;
+        // Initialize default contexts for each database type
+        for db_type in [
+            DatabaseType::MongoDB,
+            DatabaseType::PostgreSQL,
+            DatabaseType::MySQL,
+            DatabaseType::Redis,
+        ]
+        .iter()
+        {
+            let default_cert = format!("{}/default/{:?}/fullchain.pem", cert_dir, db_type);
+            let default_key = format!("{}/default/{:?}/privkey.pem", cert_dir, db_type);
 
-        builder
-            .set_private_key_file(default_key, SslFiletype::PEM)
-            .map_err(|e| {
-                IoError::new(ErrorKind::InvalidData, format!("Private key error: {}", e))
-            })?;
-
-        builder.check_private_key().map_err(|e| {
-            IoError::new(
-                ErrorKind::InvalidData,
-                format!("Key verification error: {}", e),
-            )
-        })?;
-
-        // Enhanced MongoDB compatibility settings
-        builder.set_verify(SslVerifyMode::NONE);
-
-        // Set broader cipher list for MongoDB compatibility
-        builder
-            .set_cipher_list("HIGH:!aNULL:!MD5:!RC4:!3DES:@STRENGTH")
-            .map_err(|e| IoError::new(ErrorKind::Other, format!("Cipher list error: {}", e)))?;
-
-        // Additional TLS options for better compatibility
-        let options =
-            SslOptions::NO_COMPRESSION | SslOptions::CIPHER_SERVER_PREFERENCE | SslOptions::ALL;
-        builder.set_options(options);
-
-        // Clear restrictive options
-        builder.clear_options(
-            SslOptions::NO_RENEGOTIATION
-                | SslOptions::NO_TLSV1
-                | SslOptions::NO_TLSV1_1
-                | SslOptions::NO_TICKET,
-        );
-
-        // Build the context
-        let ctx = builder.build();
+            if Path::new(&default_cert).exists() && Path::new(&default_key).exists() {
+                let ctx = Self::create_ssl_context(&default_cert, &default_key)?;
+                default_contexts.insert(*db_type, ctx);
+            }
+        }
 
         Ok(Self {
-            default_context: ctx.into_context(),
+            default_contexts,
             domain_contexts: HashMap::new(),
             cert_dir: cert_dir.to_string(),
         })
     }
 
+    // Add this create_ssl_context method
+    fn create_ssl_context(cert_path: &str, key_path: &str) -> Result<SslContext, IoError> {
+        use openssl::ssl::{SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
+
+        let mut builder = SslContextBuilder::new(SslMethod::tls())
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+
+        // Set certificate
+        builder
+            .set_certificate_file(cert_path, SslFiletype::PEM)
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+
+        // Set private key
+        builder
+            .set_private_key_file(key_path, SslFiletype::PEM)
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+
+        // Verify private key
+        builder
+            .check_private_key()
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+
+        // Set up for MongoDB compatibility
+        builder.set_verify(SslVerifyMode::NONE);
+
+        // Set cipher for compatibility
+        builder
+            .set_cipher_list("HIGH:!aNULL:!MD5:!RC4:!3DES:@STRENGTH")
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+
+        // Enable support for multiple protocols
+        let options = openssl::ssl::SslOptions::NO_COMPRESSION
+            | openssl::ssl::SslOptions::CIPHER_SERVER_PREFERENCE;
+        builder.set_options(options);
+
+        Ok(builder.build())
+    }
+
     pub fn add_domain_context(
         &mut self,
         domain: &str,
+        db_type: DatabaseType,
         cert_path: &str,
         key_path: &str,
     ) -> Result<(), IoError> {
-        let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())
-            .map_err(|e| IoError::new(ErrorKind::Other, format!("SSL builder error: {}", e)))?;
-
-        builder
-            .set_certificate_file(cert_path, SslFiletype::PEM)
-            .map_err(|e| {
-                IoError::new(ErrorKind::InvalidData, format!("Certificate error: {}", e))
-            })?;
-
-        builder
-            .set_private_key_file(key_path, SslFiletype::PEM)
-            .map_err(|e| {
-                IoError::new(ErrorKind::InvalidData, format!("Private key error: {}", e))
-            })?;
-
-        builder.check_private_key().map_err(|e| {
-            IoError::new(
-                ErrorKind::InvalidData,
-                format!("Key verification error: {}", e),
-            )
-        })?;
-
-        // Enhanced MongoDB compatibility settings
-        builder.set_verify(SslVerifyMode::NONE);
-
-        // Set broader cipher list
-        builder
-            .set_cipher_list("HIGH:!aNULL:!MD5:!RC4:!3DES:@STRENGTH")
-            .map_err(|e| IoError::new(ErrorKind::Other, format!("Cipher list error: {}", e)))?;
-
-        // Additional TLS options
-        let options =
-            SslOptions::NO_COMPRESSION | SslOptions::CIPHER_SERVER_PREFERENCE | SslOptions::ALL;
-        builder.set_options(options);
-
-        // Clear restrictive options
-        builder.clear_options(
-            SslOptions::NO_RENEGOTIATION
-                | SslOptions::NO_TLSV1
-                | SslOptions::NO_TLSV1_1
-                | SslOptions::NO_TICKET,
-        );
-
-        // Set SNI callback
-        builder.set_servername_callback(|ssl_ref, _alert| {
-            if let Some(servername) = ssl_ref.servername(NameType::HOST_NAME) {
-                info!("SNI hostname received: {}", servername);
-            }
+        if Path::new(cert_path).exists() && Path::new(key_path).exists() {
+            let ctx = Self::create_ssl_context(cert_path, key_path)?;
+            self.domain_contexts
+                .insert(domain.to_string(), (db_type, ctx));
             Ok(())
-        });
-
-        let ctx = builder.build();
-
-        self.domain_contexts
-            .insert(domain.to_string(), ctx.into_context());
-
-        Ok(())
+        } else {
+            Err(IoError::new(
+                ErrorKind::NotFound,
+                "Certificate files not found",
+            ))
+        }
     }
 
-    pub fn get_context_for_domain(&self, domain: &str) -> SslContext {
-        // First check for exact match
-        if let Some(ctx) = self.domain_contexts.get(domain) {
-            return ctx.clone();
+    pub fn get_context(&self, domain: &str, db_type: DatabaseType) -> Option<SslContext> {
+        // Try exact domain match first
+        if let Some((_, ctx)) = self.domain_contexts.get(domain) {
+            return Some(ctx.clone());
         }
 
-        // Then try wildcard matching
+        // Try wildcard match
         let domain_parts: Vec<&str> = domain.split('.').collect();
         if domain_parts.len() >= 2 {
             let base_domain = domain_parts[1..].join(".");
-            let wildcard_domain = format!("*.{}", base_domain);
-
-            if let Some(ctx) = self.domain_contexts.get(&wildcard_domain) {
-                return ctx.clone();
+            let wildcard = format!("*.{}", base_domain);
+            if let Some((_, ctx)) = self.domain_contexts.get(&wildcard) {
+                return Some(ctx.clone());
             }
         }
 
-        // Fallback to default context
-        self.default_context.clone()
+        // Fallback to default context for the database type
+        self.default_contexts.get(&db_type).cloned()
     }
 }
 
@@ -235,7 +201,7 @@ impl TlsDatabaseProxy {
         };
 
         // Create SNI context manager
-        let sni_manager = match SniContextManager::new(&cert_path, &key_path, cert_dir) {
+        let sni_manager = match SniContextManager::new(cert_dir) {
             Ok(manager) => manager,
             Err(e) => return Err(e),
         };
@@ -256,6 +222,7 @@ impl TlsDatabaseProxy {
                     if cert.exists() && key.exists() {
                         match manager.add_domain_context(
                             &domain,
+                            db_type,
                             &cert.to_string_lossy(),
                             &key.to_string_lossy(),
                         ) {
@@ -336,43 +303,99 @@ async fn handle_tls_connection(
     ip_rules: DatabaseIpRules,
     sni_manager: Arc<Mutex<SniContextManager>>,
 ) -> Result<(), IoError> {
+    use crate::proxy::tcp::sni_utils::{
+        extract_hostname_from_uri, extract_mongo_uri, proxy_connection, resolve_mongodb_srv,
+    };
+
     let client_ip = client_addr.ip().to_string();
     info!(
         "New connection from {} to {:?} database port",
         client_ip, db_type
     );
 
-    // Use our SNI extraction utility
+    // Peek at initial handshake data
     let mut peek_buf = [0u8; 1024];
     let peek_size = client.peek(&mut peek_buf).await?;
 
-    // Extract SNI hostname
+    // Extract SNI hostname from TLS ClientHello
     let hostname = match extract_sni_hostname(&peek_buf[..peek_size]) {
         Some(hostname) => {
-            info!("SNI hostname: {}", hostname);
+            info!("SNI hostname extracted: {}", hostname);
             hostname
         }
         None => {
             // For MongoDB, use default mapping when SNI is not provided
             if db_type == DatabaseType::MongoDB {
-                // Get the first MongoDB mapping as default
-                let mappings = db_mappings.lock().await;
-                let default_mapping = mappings
-                    .iter()
-                    .find(|(k, _v)| k.contains("mongodb"))
-                    .map(|(k, _)| k.clone());
+                // Look for MongoDB URI pattern in the handshake
+                if let Some(uri) = extract_mongo_uri(&peek_buf[..peek_size]) {
+                    info!("Found MongoDB URI: {}", uri);
 
-                if let Some(default_hostname) = default_mapping {
-                    info!("Using default MongoDB mapping: {}", default_hostname);
-                    default_hostname
-                } else {
-                    warn!("No default MongoDB mapping available");
-                    return Err(IoError::new(
-                        ErrorKind::InvalidData,
-                        "No default MongoDB mapping available",
-                    ));
+                    // For mongodb+srv://, perform SRV resolution
+                    if uri.starts_with("mongodb+srv://") {
+                        match extract_hostname_from_uri(&uri) {
+                            Ok(srv_hostname) => {
+                                info!("Extracted SRV hostname: {}", srv_hostname);
+
+                                // Perform SRV resolution
+                                match resolve_mongodb_srv(&srv_hostname).await {
+                                    Ok(servers) if !servers.is_empty() => {
+                                        info!(
+                                            "Resolved SRV records for {}: {:?}",
+                                            srv_hostname, servers
+                                        );
+
+                                        // Connect directly to the resolved server
+                                        let target_host = servers[0].0.clone();
+                                        let target_port = servers[0].1;
+
+                                        let backend_addr =
+                                            format!("{}:{}", target_host, target_port);
+                                        info!(
+                                            "Connecting to SRV-resolved backend: {}",
+                                            backend_addr
+                                        );
+
+                                        let backend = match TcpStream::connect(&backend_addr).await
+                                        {
+                                            Ok(stream) => stream,
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to connect to backend {}: {}",
+                                                    backend_addr, e
+                                                );
+                                                return Err(e);
+                                            }
+                                        };
+
+                                        // Start proxying
+                                        return proxy_connection(client, backend, srv_hostname)
+                                            .await;
+                                    }
+                                    _ => {
+                                        info!("SRV resolution failed, falling back to mappings");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                info!("Failed to extract hostname from URI: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                // Use default MongoDB mapping as fallback
+                match find_default_mapping(db_mappings.clone(), db_type).await {
+                    Ok(domain) => {
+                        info!("Using default MongoDB mapping: {}", domain);
+                        domain
+                    }
+                    Err(e) => {
+                        error!("No MongoDB mapping available: {}", e);
+                        return Err(e);
+                    }
                 }
             } else {
+                // For non-MongoDB databases, SNI is required
                 warn!("No SNI hostname provided by client");
                 return Err(IoError::new(
                     ErrorKind::InvalidData,
@@ -406,44 +429,6 @@ async fn handle_tls_connection(
         }
     };
 
-    // Get SSL context for this hostname
-    let ssl_ctx = {
-        let manager = sni_manager.lock().await;
-        manager.get_context_for_domain(&hostname)
-    };
-
-    // Create SSL acceptor
-    let mut acceptor = match openssl::ssl::Ssl::new(&ssl_ctx) {
-        Ok(ssl) => ssl,
-        Err(e) => {
-            error!("Failed to create SSL object: {}", e);
-            return Err(IoError::new(ErrorKind::Other, "TLS setup failed"));
-        }
-    };
-
-    // Set server name for proper certificate selection during handshake
-    if let Err(e) = acceptor.set_hostname(&hostname) {
-        warn!("Failed to set SSL hostname: {}", e);
-    }
-
-    // Create TLS stream
-    let mut tls_stream = match TokioSslStream::new(acceptor, client) {
-        Ok(stream) => stream,
-        Err(e) => {
-            error!("Failed to create TLS stream: {}", e);
-            return Err(IoError::new(ErrorKind::Other, "TLS setup failed"));
-        }
-    };
-
-    // Accept TLS connection - fixed to use Pin
-    if let Err(e) = Pin::new(&mut tls_stream).accept().await {
-        error!("TLS handshake failed: {}", e);
-        return Err(IoError::new(
-            ErrorKind::ConnectionRefused,
-            "TLS handshake failed",
-        ));
-    }
-
     // Connect to target backend
     let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
     info!("Connecting to backend: {}", backend_addr);
@@ -456,102 +441,27 @@ async fn handle_tls_connection(
         }
     };
 
-    // Start bidirectional proxying
-    let (mut client_r, mut client_w) = tokio::io::split(tls_stream);
-    let (mut backend_r, mut backend_w) = tokio::io::split(backend);
+    // Start proxying
+    proxy_connection(client, backend, hostname).await
+}
 
-    // Set up completion channels
-    let (client_done_tx, mut client_done_rx) = mpsc::channel::<()>(1);
-    let (backend_done_tx, mut backend_done_rx) = mpsc::channel::<()>(1);
+async fn find_default_mapping(
+    db_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+    db_type: DatabaseType,
+) -> Result<String, IoError> {
+    let mappings = db_mappings.lock().await;
 
-    // Update connection stats
-    {
-        let mut stats = mapping.stats.lock().await;
-        stats.active_connections += 1;
-        stats.total_connections += 1;
-    }
-
-    // Client -> Backend
-    let stats_clone = mapping.stats.clone();
-    let client_to_backend = tokio::spawn(async move {
-        let mut buffer = [0u8; 8192];
-        let mut total_bytes = 0;
-
-        loop {
-            match client_r.read(&mut buffer).await {
-                Ok(0) => break, // Connection closed
-                Ok(n) => match backend_w.write_all(&buffer[..n]).await {
-                    Ok(_) => {
-                        total_bytes += n;
-                    }
-                    Err(e) => {
-                        error!("Error writing to backend: {}", e);
-                        break;
-                    }
-                },
-                Err(e) => {
-                    error!("Error reading from client: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // Update stats
-        let mut stats = stats_clone.lock().await;
-        stats.bytes_in += total_bytes;
-        stats.active_connections = stats.active_connections.saturating_sub(1);
-
-        let _ = client_done_tx.send(()).await;
-    });
-
-    // Backend -> Client
-    let stats_clone = mapping.stats.clone();
-    let backend_to_client = tokio::spawn(async move {
-        let mut buffer = [0u8; 8192];
-        let mut total_bytes = 0;
-
-        loop {
-            match backend_r.read(&mut buffer).await {
-                Ok(0) => break, // Connection closed
-                Ok(n) => match client_w.write_all(&buffer[..n]).await {
-                    Ok(_) => {
-                        total_bytes += n;
-                    }
-                    Err(e) => {
-                        error!("Error writing to client: {}", e);
-                        break;
-                    }
-                },
-                Err(e) => {
-                    error!("Error reading from backend: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // Update stats
-        let mut stats = stats_clone.lock().await;
-        stats.bytes_out += total_bytes;
-
-        let _ = backend_done_tx.send(()).await;
-    });
-
-    // Wait for either side to complete
-    tokio::select! {
-        _ = client_done_rx.recv() => {
-            debug!("Client -> Backend completed for {}", hostname);
-        }
-        _ = backend_done_rx.recv() => {
-            debug!("Backend -> Client completed for {}", hostname);
+    // Find first matching mapping for the database type
+    for (domain, mapping) in mappings.iter() {
+        if mapping.db_type == db_type {
+            return Ok(domain.clone());
         }
     }
 
-    // Clean up tasks
-    client_to_backend.abort();
-    backend_to_client.abort();
-
-    info!("Connection for {} completed", hostname);
-    Ok(())
+    Err(IoError::new(
+        ErrorKind::NotFound,
+        format!("No default mapping found for {:?}", db_type),
+    ))
 }
 
 // Extract SNI hostname from TLS ClientHello data

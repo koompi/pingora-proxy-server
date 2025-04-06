@@ -1,4 +1,4 @@
-// src/proxy/sni_utils.rs
+// src/proxy/tcp/sni_utils.rs
 use log::{debug, info};
 use openssl::ssl::{SslAcceptor, SslContext, SslFiletype, SslMethod, SslVerifyMode};
 use std::io::{Error as IoError, ErrorKind};
@@ -218,4 +218,206 @@ pub fn find_certificate_for_hostname(hostname: &str, cert_dir: &str) -> Option<(
 
     // No match found
     None
+}
+
+/// Extract MongoDB URI from client handshake data
+pub fn extract_mongo_uri(data: &[u8]) -> Option<String> {
+    // Look for the mongodb:// or mongodb+srv:// pattern in the handshake
+    if data.len() < 20 {
+        return None;
+    }
+
+    // Convert to string for easier searching
+    if let Ok(data_str) = std::str::from_utf8(data) {
+        // Look for MongoDB URI patterns
+        if let Some(start_idx) = data_str.find("mongodb") {
+            // Extract the URI until a space, null byte, or end of data
+            let mut end_idx = start_idx;
+            while end_idx < data_str.len()
+                && !data_str[end_idx..].starts_with(' ')
+                && !data_str[end_idx..].starts_with('\0')
+            {
+                end_idx += 1;
+            }
+
+            return Some(data_str[start_idx..end_idx].to_string());
+        }
+    }
+
+    None
+}
+
+/// Extract hostname from MongoDB URI
+pub fn extract_hostname_from_uri(uri: &str) -> Result<String, IoError> {
+    // Parse URI to extract hostname
+    // Format: mongodb[+srv]://[username:password@]hostname[:port][/database][?options]
+
+    let uri_parts: Vec<&str> = uri.split("://").collect();
+    if uri_parts.len() < 2 {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "Invalid MongoDB URI format",
+        ));
+    }
+
+    let address_part = uri_parts[1];
+
+    // Handle authentication if present
+    let host_part = if address_part.contains('@') {
+        address_part.split('@').nth(1).unwrap_or(address_part)
+    } else {
+        address_part
+    };
+
+    // Remove path and query parameters
+    let host_only = host_part
+        .split('/')
+        .next()
+        .unwrap_or(host_part)
+        .split('?')
+        .next()
+        .unwrap_or(host_part);
+
+    // Remove port if present
+    let hostname = host_only.split(':').next().unwrap_or(host_only);
+
+    Ok(hostname.to_string())
+}
+
+/// Resolve MongoDB SRV records
+pub async fn resolve_mongodb_srv(hostname: &str) -> Result<Vec<(String, u16)>, IoError> {
+    use tokio::process::Command as TokioCommand;
+
+    // Construct SRV lookup name
+    let srv_record = format!("_mongodb._tcp.{}", hostname);
+    info!("Looking up SRV record: {}", srv_record);
+
+    // Try using dig for SRV lookup
+    let output = TokioCommand::new("dig")
+        .args(&["+short", "SRV", &srv_record])
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if !output.stdout.is_empty() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!("SRV lookup result: {}", stdout);
+
+            let mut servers = Vec::new();
+
+            // Parse SRV records (format: priority weight port target)
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    if let Ok(port) = parts[2].parse::<u16>() {
+                        let host = parts[3].trim_end_matches('.');
+                        servers.push((host.to_string(), port));
+                    }
+                }
+            }
+
+            if !servers.is_empty() {
+                info!("Found SRV records: {:?}", servers);
+                return Ok(servers);
+            }
+        }
+        _ => {
+            // Fallback to assuming standard MongoDB port 27017
+            info!("SRV lookup failed, using standard port 27017");
+        }
+    }
+
+    // Default fallback
+    info!("Using default MongoDB port for {}", hostname);
+    Ok(vec![(hostname.to_string(), 27017)])
+}
+
+/// Proxy connection between client and backend
+pub async fn proxy_connection(
+    client: TcpStream,
+    backend: TcpStream,
+    hostname: String,
+) -> Result<(), IoError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    info!("Starting proxy connection for hostname: {}", hostname);
+
+    // Create owned handles to avoid ownership issues
+    let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let (mut backend_rx, mut backend_tx) = tokio::io::split(backend);
+
+    // Set up completion channels
+    let (client_done_tx, mut client_done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (backend_done_tx, mut backend_done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Client -> Backend (clone hostname for task)
+    let hostname_c2b = hostname.clone();
+    let client_to_backend = tokio::spawn(async move {
+        let mut buffer = [0u8; 8192];
+        let mut _total_bytes = 0;
+
+        loop {
+            match client_rx.read(&mut buffer).await {
+                Ok(0) => break, // EOF from client
+                Ok(n) => match backend_tx.write_all(&buffer[..n]).await {
+                    Ok(_) => {
+                        _total_bytes += n;
+                    }
+                    Err(e) => {
+                        info!("Error writing to backend: {}", e);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    info!("Error reading from client: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Client -> Backend completed for hostname: {}", hostname_c2b);
+        let _ = client_done_tx.send(()).await;
+    });
+
+    // Backend -> Client (clone hostname for task)
+    let hostname_b2c = hostname.clone();
+    let backend_to_client = tokio::spawn(async move {
+        let mut buffer = [0u8; 8192];
+        let mut _total_bytes = 0;
+
+        loop {
+            match backend_rx.read(&mut buffer).await {
+                Ok(0) => break, // EOF from backend
+                Ok(n) => match client_tx.write_all(&buffer[..n]).await {
+                    Ok(_) => {
+                        _total_bytes += n;
+                    }
+                    Err(e) => {
+                        info!("Error writing to client: {}", e);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    info!("Error reading from backend: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Backend -> Client completed for hostname: {}", hostname_b2c);
+        let _ = backend_done_tx.send(()).await;
+    });
+
+    // Wait for either side to complete
+    tokio::select! {
+        _ = client_done_rx.recv() => {}
+        _ = backend_done_rx.recv() => {}
+    }
+
+    // Clean up tasks
+    client_to_backend.abort();
+    backend_to_client.abort();
+
+    info!("Connection closed for hostname: {}", hostname);
+    Ok(())
 }
