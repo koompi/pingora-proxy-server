@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_openssl::SslStream as TokioSslStream;
 
-use crate::proxy::tcp::sni_utils::extract_hostname_from_uri;
+use crate::proxy::tcp::sni_utils::{extract_hostname_from_uri, proxy_connection};
 use crate::proxy::tcp::{DatabaseIpRules, DatabaseMapping, DatabaseType};
 
 use super::sni_utils::extract_mongo_uri;
@@ -306,10 +306,6 @@ async fn handle_tls_connection(
     ip_rules: DatabaseIpRules,
     sni_manager: Arc<Mutex<SniContextManager>>,
 ) -> Result<(), IoError> {
-    use crate::proxy::tcp::sni_utils::{
-        extract_hostname_from_uri, extract_mongo_uri, proxy_connection, resolve_mongodb_srv,
-    };
-
     let client_ip = client_addr.ip().to_string();
     info!(
         "New connection from {} to {:?} database port",
@@ -320,66 +316,85 @@ async fn handle_tls_connection(
     let mut peek_buf = [0u8; 1024];
     let peek_size = client.peek(&mut peek_buf).await?;
 
-    // Extract SNI hostname from TLS ClientHello
-    let hostname = match extract_sni_hostname(&peek_buf[..peek_size]) {
-        Some(hostname) if !hostname.is_empty() => {
-            info!("SNI hostname extracted: {}", hostname);
-            hostname
-        }
-        _ => {
-            // For MongoDB, use our improved mapping function
-            if db_type == DatabaseType::MongoDB {
-                info!("No SNI hostname provided, attempting to find default MongoDB mapping");
-                match find_default_mapping(db_mappings.clone(), db_type, &mut client).await {
-                    Ok(domain) => {
-                        info!("Selected MongoDB mapping: {}", domain);
-                        domain
-                    }
-                    Err(e) => {
-                        error!("No MongoDB mapping available: {}", e);
-                        return Err(e);
+    let hostname = if db_type == DatabaseType::MongoDB {
+        // For MongoDB, first try to extract the URI
+        if let Some(uri) = extract_mongo_uri(&peek_buf[..peek_size]) {
+            info!("Found MongoDB URI in handshake: {}", uri);
+            match extract_hostname_from_uri(&uri) {
+                Ok(extracted_hostname) => {
+                    info!(
+                        "Extracted hostname from MongoDB URI: {}",
+                        extracted_hostname
+                    );
+                    // Verify the hostname exists in our mappings
+                    let mappings = db_mappings.lock().await;
+                    if mappings.contains_key(&extracted_hostname) {
+                        extracted_hostname
+                    } else {
+                        return Err(IoError::new(
+                            ErrorKind::NotFound,
+                            format!(
+                                "No mapping found for MongoDB hostname: {}",
+                                extracted_hostname
+                            ),
+                        ));
                     }
                 }
-            } else {
-                // For non-MongoDB databases, SNI is required
-                warn!("No SNI hostname provided by client");
+                Err(e) => {
+                    error!("Failed to extract hostname from MongoDB URI: {}", e);
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        format!("Invalid MongoDB URI hostname: {}", e),
+                    ));
+                }
+            }
+        } else {
+            // If we can't extract URI, try SNI as fallback
+            match extract_sni_hostname(&peek_buf[..peek_size]) {
+                Some(sni_hostname) if !sni_hostname.is_empty() => {
+                    info!("Using SNI hostname for MongoDB: {}", sni_hostname);
+                    sni_hostname
+                }
+                _ => {
+                    error!("No valid hostname found in MongoDB connection");
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "No valid hostname found in MongoDB connection",
+                    ));
+                }
+            }
+        }
+    } else {
+        // For non-MongoDB databases, require SNI
+        match extract_sni_hostname(&peek_buf[..peek_size]) {
+            Some(hostname) if !hostname.is_empty() => hostname,
+            _ => {
+                error!("SNI hostname required for non-MongoDB connection");
                 return Err(IoError::new(
                     ErrorKind::InvalidData,
-                    "No SNI hostname provided",
+                    "SNI hostname required",
                 ));
             }
         }
     };
 
-    // Additional validation to prevent empty hostname
-    if hostname.is_empty() {
-        error!("Empty hostname after SNI extraction and fallback");
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            "Empty hostname after SNI extraction and fallback",
-        ));
-    }
-
-    // Check IP rules
-    if !ip_rules.is_ip_allowed(&hostname, &client_ip) {
-        error!(
-            "Connection from {} to {} rejected by IP rules",
-            client_ip, hostname
-        );
-        return Err(IoError::new(
-            ErrorKind::PermissionDenied,
-            "IP not allowed for this database",
-        ));
-    }
-
     // Get database mapping
     let mapping = {
         let mappings = db_mappings.lock().await;
         match mappings.get(&hostname) {
-            Some(mapping) => mapping.clone(),
+            Some(mapping) => {
+                info!(
+                    "Found mapping for {}: {} -> {}",
+                    hostname, mapping.target_host, mapping.target_port
+                );
+                mapping.clone()
+            }
             None => {
                 error!("No database mapping found for hostname: {}", hostname);
-                return Err(IoError::new(ErrorKind::NotFound, "Database not found"));
+                return Err(IoError::new(
+                    ErrorKind::NotFound,
+                    format!("No mapping found for hostname: {}", hostname),
+                ));
             }
         }
     };
