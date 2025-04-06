@@ -316,12 +316,41 @@ impl CertificateIssuer {
         let staging = request.staging.unwrap_or(false);
         let is_wildcard = request.wildcard.unwrap_or(false);
 
-        // First check for any running certbot processes
+        // First check for any running certbot processes and kill stale ones
         if let Ok(output) = std::process::Command::new("pgrep").arg("certbot").output() {
             if !output.stdout.is_empty() {
-                return Err(anyhow!("Another certbot process is already running. Please try again in a few minutes."));
+                // Get the PIDs of running certbot processes
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let pids = stdout.split_whitespace().collect::<Vec<_>>();
+
+                // Check each process
+                for pid in pids {
+                    // Check process age
+                    if let Ok(age_output) = std::process::Command::new("ps")
+                        .args(&["-o", "etimes=", "-p", pid])
+                        .output()
+                    {
+                        let age = String::from_utf8_lossy(&age_output.stdout)
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap_or(0);
+
+                        // If process is older than 1 minutes, kill it
+                        if age > 60 {
+                            let _ = std::process::Command::new("kill").arg(pid).output();
+                            println!("Killed stale certbot process {}", pid);
+                            continue;
+                        }
+
+                        // If process is fresh, abort
+                        return Err(anyhow!("Another certbot process is already running. Please try again in a few minutes."));
+                    }
+                }
             }
         }
+
+        // Add a small delay to ensure any killed processes are cleaned up
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
         println!("Issuing certificate for: {}", domain);
 
@@ -346,16 +375,17 @@ impl CertificateIssuer {
             {
                 cmd.arg(format!("--dns-{}", provider));
 
-                // Create temporary credentials file
+                // Create temporary credentials file and store it in a let binding
                 let creds_file = self.create_temp_credentials_file(credentials)?;
 
-                // Set up cleanup using scopeguard
+                // Create the cleanup guard with the owned path
                 let _cleanup_guard = scopeguard::guard(creds_file.clone(), |f| {
                     if let Err(e) = std::fs::remove_file(&f) {
                         eprintln!("Failed to remove credentials file: {}", e);
                     }
                 });
 
+                // Use the credentials file in the command
                 cmd.arg(format!("--dns-{}-credentials", provider))
                     .arg(&creds_file);
 
