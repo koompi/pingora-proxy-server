@@ -720,19 +720,17 @@ fn find_backend_for_database(
     db_info: &str,
     mappings: &[DatabaseMapping],
 ) -> Option<(String, u16, usize)> {
-    // First try exact pattern matching
+    // First try to match based on the database name
     for (idx, mapping) in mappings.iter().enumerate() {
+        // Check if the database name contains our domain pattern
         if db_info.contains(&mapping.domain_pattern) {
             return Some((mapping.target_host.clone(), mapping.target_port, idx));
         }
     }
 
-    // Try to extract tenant ID from database name
-    let tenant_id = db_info.split(['-', '_', '.']).next()?;
-
-    // Look for matching backend using tenant ID
+    // If no match found based on database name, look for a default mapping
     for (idx, mapping) in mappings.iter().enumerate() {
-        if mapping.domain_pattern.contains(tenant_id) {
+        if mapping.domain_pattern == "default" || mapping.domain_pattern == "*" {
             return Some((mapping.target_host.clone(), mapping.target_port, idx));
         }
     }
