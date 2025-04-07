@@ -554,7 +554,7 @@ impl MongoHeader {
 async fn resolve_mongodb_srv(
     domain: &str,
 ) -> Result<Vec<(String, u16)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Clean up domain string
+    // Clean up domain string and extract base name
     let clean_domain = domain
         .trim_start_matches("mongodb+srv://")
         .trim_start_matches("mongodb://")
@@ -563,17 +563,29 @@ async fn resolve_mongodb_srv(
         .unwrap_or(domain)
         .to_lowercase();
 
-    // If domain contains specific patterns, skip SRV lookup
-    if clean_domain.contains("-mongodb-") || clean_domain.contains(".mongodb.koompi.cloud") {
+    // Extract the base service name for internal MongoDB instances
+    let service_name = if clean_domain.contains("-mongodb-") {
+        // Extract just the service name part (e.g., "weteka-mongodb-67e3df")
+        clean_domain
+            .split('.')
+            .next()
+            .unwrap_or(&clean_domain)
+            .to_string()
+    } else {
+        clean_domain.clone()
+    };
+
+    // If domain contains specific patterns, use Docker service DNS
+    if service_name.contains("-mongodb-") {
         info!(
-            "Skipping SRV lookup for direct MongoDB domain: {}",
-            clean_domain
+            "Using Docker service DNS for MongoDB instance: {}",
+            service_name
         );
-        return Ok(vec![(clean_domain, 27017)]);
+        return Ok(vec![(format!("tasks.{}", service_name), 27017)]);
     }
 
+    // Standard SRV lookup for external domains
     info!("Attempting SRV resolution for: {}", clean_domain);
-
     let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
     let srv_name = format!("_mongodb._tcp.{}", clean_domain);
 
@@ -588,7 +600,7 @@ async fn resolve_mongodb_srv(
                 .collect();
 
             if endpoints.is_empty() {
-                info!("No SRV records found, using default port");
+                info!("No SRV records found, using default connection");
                 Ok(vec![(clean_domain, 27017)])
             } else {
                 info!("Resolved {} SRV records", endpoints.len());
