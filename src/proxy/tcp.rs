@@ -1,12 +1,14 @@
 // src/proxy/tcp.rs
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use log::{error, info, warn};
 use pingora::server::{Fds, ShutdownWatch};
 use pingora::services::Service;
+use std::io::{Read, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -16,12 +18,43 @@ use crate::config::model::ConfigStore;
 use byteorder::{ByteOrder, LittleEndian};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::net::IpAddr;
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
-use trust_dns_resolver::AsyncResolver;
+
+// MongoDB header structure for protocol parsing
+#[derive(Debug)]
+struct MongoHeader {
+    message_length: i32,
+    request_id: i32,
+    response_to: i32,
+    op_code: i32,
+}
+
+impl MongoHeader {
+    fn from_bytes(buffer: &[u8]) -> Option<Self> {
+        if buffer.len() < 16 {
+            return None;
+        }
+
+        // Ensure we're reading valid MongoDB wire protocol message
+        let message_length = LittleEndian::read_i32(&buffer[0..4]);
+        let request_id = LittleEndian::read_i32(&buffer[4..8]);
+        let response_to = LittleEndian::read_i32(&buffer[8..12]);
+        let op_code = LittleEndian::read_i32(&buffer[12..16]);
+
+        // Validate message length and op_code
+        if message_length <= 0 || message_length > 48_000_000 {
+            // MongoDB max message size
+            return None;
+        }
+
+        Some(MongoHeader {
+            message_length,
+            request_id,
+            response_to,
+            op_code,
+        })
+    }
+}
 
 // Database type enum
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,15 +78,31 @@ impl DatabaseType {
         }
     }
 
+    // Convert to string for logging
+    pub fn to_string(&self) -> Option<String> {
+        match self {
+            DatabaseType::MongoDB => Some("MongoDB".to_string()),
+            DatabaseType::PostgreSQL => Some("PostgreSQL".to_string()),
+            DatabaseType::MySQL => Some("MySQL".to_string()),
+            DatabaseType::Redis => Some("Redis".to_string()),
+            DatabaseType::Unknown => None,
+        }
+    }
+
     // Detect database type from domain pattern
     pub fn detect_from_domain(domain: &str) -> Self {
-        if domain.contains(".mongodb.") {
+        if domain.contains(".mongodb.") || domain.contains("-mongodb-") || domain.contains("mongo")
+        {
             DatabaseType::MongoDB
-        } else if domain.contains(".postgres.") || domain.contains(".postgresql.") {
+        } else if domain.contains(".postgres.")
+            || domain.contains(".postgresql.")
+            || domain.contains("postgres")
+        {
             DatabaseType::PostgreSQL
-        } else if domain.contains(".mysql.") || domain.contains(".sql.") {
+        } else if domain.contains(".mysql.") || domain.contains(".sql.") || domain.contains("mysql")
+        {
             DatabaseType::MySQL
-        } else if domain.contains(".redis.") {
+        } else if domain.contains(".redis.") || domain.contains("redis") {
             DatabaseType::Redis
         } else {
             DatabaseType::Unknown
@@ -75,14 +124,42 @@ pub struct ConnectionStats {
 pub struct DatabaseMapping {
     pub domain_pattern: String, // e.g., "riverbase-mongodb"
     pub target_host: String,    // Docker service DNS name
-    pub target_port: u16,       // Always 27017 for MongoDB
+    pub target_port: u16,       // Default MongoDB port
+    pub db_type: DatabaseType,  // Type of database
     pub stats: Arc<Mutex<ConnectionStats>>,
-    pub active_connections: Arc<AtomicUsize>, // New field
+    pub active_connections: Arc<AtomicUsize>, // Connection counter
 }
 
 impl DatabaseMapping {
     fn matches_domain(&self, domain: &str) -> bool {
-        domain.contains(&self.domain_pattern)
+        // Exact match
+        if domain == self.domain_pattern {
+            return true;
+        }
+
+        // Or it contains the pattern
+        if domain.contains(&self.domain_pattern) {
+            return true;
+        }
+
+        // Check if domain matches parts of the pattern
+        // This helps with matching something like "riverbase-mongodb" when the user specifies "riverbase"
+        let domain_parts: Vec<&str> = domain.split(|c| c == '.' || c == '-' || c == '_').collect();
+        let pattern_parts: Vec<&str> = self
+            .domain_pattern
+            .split(|c| c == '.' || c == '-' || c == '_')
+            .collect();
+
+        // If domain parts are a subset of pattern parts
+        let mut found_all = true;
+        for part in &domain_parts {
+            if !pattern_parts.contains(part) && !part.is_empty() {
+                found_all = false;
+                break;
+            }
+        }
+
+        found_all
     }
 }
 
@@ -122,35 +199,11 @@ impl DatabaseIpRules {
     }
 
     // Add rule for specific database
-    pub async fn add_rule(
-        &mut self,
-        database: &str,
-        rule: IpRule,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn add_rule(&mut self, database: &str, rule: IpRule) {
         self.rules
             .entry(database.to_string())
             .or_insert_with(HashSet::new)
             .insert(rule);
-
-        // Save to shared storage
-        self.save_to_storage().await?;
-
-        // Notify other nodes
-        let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
-        if let Some(parent) = reload_path.parent() {
-            if !parent.exists() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
-
-        // Write timestamp to trigger other nodes
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        fs::write(reload_path, now.to_string()).await?;
-
-        Ok(())
     }
 
     // Remove rule for specific database
@@ -214,10 +267,8 @@ impl DatabaseIpRules {
     async fn save_to_storage(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create storage directory if it doesn't exist
         let storage_path = std::path::Path::new("/pingora-proxy/storage");
-        if let Some(parent) = storage_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if !storage_path.exists() {
+            std::fs::create_dir_all(storage_path)?;
         }
 
         // Convert rules to JSON
@@ -255,7 +306,9 @@ pub struct TcpProxyService {
     servers: Arc<Mutex<ConfigStore>>,
     db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
     enable_tls: bool,
-    ip_rules: DatabaseIpRules,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,  // "direct" or "service-discovery"
+    tcp_ports: Vec<u16>, // Ports to listen on
 }
 
 impl TcpProxyService {
@@ -263,17 +316,37 @@ impl TcpProxyService {
         servers: Arc<Mutex<ConfigStore>>,
         enable_tls: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Get proxy mode from environment variable
+        let proxy_mode = std::env::var("TCP_PROXY_MODE").unwrap_or_else(|_| "direct".to_string());
+
+        // Get ports from environment variable
+        let ports_str =
+            std::env::var("TCP_PROXY_PORTS").unwrap_or_else(|_| "27017,5432,3306".to_string());
+        let tcp_ports: Vec<u16> = ports_str
+            .split(',')
+            .filter_map(|p| p.trim().parse::<u16>().ok())
+            .collect();
+
+        info!(
+            "TCP Proxy initialized with mode: {}, ports: {:?}",
+            proxy_mode, tcp_ports
+        );
+
         Ok(Self {
             servers,
             db_mappings: Arc::new(Mutex::new(Vec::new())),
             enable_tls,
-            ip_rules: DatabaseIpRules::new_with_storage().await?,
+            ip_rules: Arc::new(tokio::sync::Mutex::new(
+                DatabaseIpRules::new_with_storage().await?,
+            )),
+            proxy_mode,
+            tcp_ports,
         })
     }
 
     // Initialize database mappings from config
     async fn initialize_mappings(&self) {
-        info!("Initializing MongoDB database mappings");
+        info!("Initializing database mappings");
 
         // Create a new vec of mappings
         let mut mappings = Vec::new();
@@ -281,45 +354,40 @@ impl TcpProxyService {
         // Lock the server config store
         if let Ok(servers) = self.servers.lock() {
             for (domain, (backend, _)) in servers.iter() {
-                // Check if this is a MongoDB domain
-                if domain.contains(".mongodb.") {
-                    // Extract the key part to match in connection strings
-                    let domain_key = if let Some(mongo_idx) = domain.find(".mongodb.") {
-                        if mongo_idx > 0 {
-                            // Get the part before .mongodb. as the domain key
-                            &domain[0..mongo_idx]
-                        } else {
-                            // Fallback to the whole domain
-                            domain
-                        }
-                    } else {
-                        domain
-                    };
+                // Detect database type
+                let db_type = DatabaseType::detect_from_domain(domain);
 
-                    // Parse target backend (host:port)
-                    let parts: Vec<&str> = backend.split(':').collect();
-                    let (target_host, target_port) = if parts.len() > 1 {
-                        (
-                            parts[0].to_string(),
-                            parts[1].parse::<u16>().unwrap_or(27017),
-                        )
-                    } else {
-                        (parts[0].to_string(), 27017)
-                    };
-
-                    info!(
-                        "Adding MongoDB mapping: domain_pattern={}, target={}:{}",
-                        domain_key, target_host, target_port
-                    );
-
-                    mappings.push(DatabaseMapping {
-                        domain_pattern: domain_key.to_string(),
-                        target_host,
-                        target_port,
-                        stats: Arc::new(Mutex::new(ConnectionStats::default())),
-                        active_connections: Arc::new(AtomicUsize::new(0)),
-                    });
+                // Skip non-database domains
+                if db_type == DatabaseType::Unknown {
+                    continue;
                 }
+
+                // Parse target backend (host:port)
+                let parts: Vec<&str> = backend.split(':').collect();
+                let (target_host, target_port) = if parts.len() > 1 {
+                    (
+                        parts[0].to_string(),
+                        parts[1]
+                            .parse::<u16>()
+                            .unwrap_or_else(|_| db_type.default_port()),
+                    )
+                } else {
+                    (parts[0].to_string(), db_type.default_port())
+                };
+
+                info!(
+                    "Adding database mapping: domain_pattern='{}', target={}:{}, type={:?}",
+                    domain, target_host, target_port, db_type
+                );
+
+                mappings.push(DatabaseMapping {
+                    domain_pattern: domain.to_string(),
+                    target_host,
+                    target_port,
+                    db_type,
+                    stats: Arc::new(Mutex::new(ConnectionStats::default())),
+                    active_connections: Arc::new(AtomicUsize::new(0)),
+                });
             }
         }
 
@@ -330,36 +398,18 @@ impl TcpProxyService {
 
         // Log what we found
         if let Ok(mappings) = self.db_mappings.lock() {
-            info!("Initialized {} MongoDB database mappings", mappings.len());
+            info!("Initialized {} database mappings", mappings.len());
             for (i, mapping) in mappings.iter().enumerate() {
                 info!(
-                    "  [{}] Pattern '{}' -> {}:{}",
-                    i, mapping.domain_pattern, mapping.target_host, mapping.target_port
+                    "  [{}] Pattern '{}' -> {}:{} (Type: {:?})",
+                    i,
+                    mapping.domain_pattern,
+                    mapping.target_host,
+                    mapping.target_port,
+                    mapping.db_type
                 );
             }
         }
-    }
-
-    // Modified reload check to include file watching
-    async fn check_reload_needed(&self) -> bool {
-        let reload_path = std::path::Path::new("/pingora-proxy/locks/ip_rules_reload");
-
-        if reload_path.exists() {
-            if let Ok(content) = fs::read_to_string(reload_path).await {
-                if let Ok(timestamp) = content.trim().parse::<u64>() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    // Reload if the file was modified in the last 5 seconds
-                    if now - timestamp < 5 {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 }
 
@@ -370,39 +420,58 @@ impl Service for TcpProxyService {
         _fds: Option<Arc<tokio::sync::Mutex<Fds>>>,
         mut shutdown: ShutdownWatch,
     ) {
-        info!("Starting TCP Proxy service for MongoDB connections");
+        info!("Starting TCP Proxy service for database connections");
 
         // Initialize mappings
         self.initialize_mappings().await;
 
-        // Get a clone of the db_mappings for the accept loop
+        // Create shutdown channels for each listener
+        let mut shutdown_senders = Vec::new();
+        let mut listener_tasks = Vec::new();
+
+        // Get references needed for the listeners
         let db_mappings = self.db_mappings.clone();
+        let ip_rules = self.ip_rules.clone();
 
-        // Create shutdown channel for the accept loop
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // Start a listener for each port
+        for &port in &self.tcp_ports {
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            shutdown_senders.push(shutdown_tx);
 
-        // Create a single TCP listener for MongoDB
-        let listener = match TcpListener::bind("0.0.0.0:27017").await {
-            Ok(listener) => {
-                info!("Successfully bound MongoDB proxy to 0.0.0.0:27017");
-                listener
-            }
-            Err(e) => {
-                error!("Failed to bind MongoDB proxy to 0.0.0.0:27017: {}", e);
-                return;
-            }
-        };
+            let db_mappings_clone = db_mappings.clone();
+            let ip_rules_clone = ip_rules.clone();
+            let proxy_mode = self.proxy_mode.clone();
 
-        // Spawn the accept loop task
-        let accept_task = tokio::spawn(mongodb_accept_loop(listener, db_mappings, shutdown_rx));
+            // Start the listener task
+            let task = tokio::spawn(async move {
+                start_db_listener(
+                    port,
+                    db_mappings_clone,
+                    ip_rules_clone,
+                    proxy_mode,
+                    shutdown_rx,
+                )
+                .await;
+            });
+
+            listener_tasks.push(task);
+        }
 
         // Wait for shutdown signal
         match shutdown.changed().await {
             Ok(_) => {
                 if *shutdown.borrow() {
-                    info!("Shutdown signal received, stopping MongoDB proxy");
-                    let _ = shutdown_tx.send(()).await;
-                    let _ = tokio::time::timeout(Duration::from_secs(5), accept_task).await;
+                    info!("Shutdown signal received, stopping TCP proxy");
+
+                    // Send shutdown signal to all listeners
+                    for tx in shutdown_senders {
+                        let _ = tx.send(()).await;
+                    }
+
+                    // Wait for listeners to shut down with timeout
+                    for task in listener_tasks {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+                    }
                 }
             }
             Err(e) => {
@@ -410,7 +479,7 @@ impl Service for TcpProxyService {
             }
         }
 
-        info!("MongoDB proxy service stopped");
+        info!("TCP proxy service stopped");
     }
 
     fn name(&self) -> &'static str {
@@ -429,185 +498,255 @@ impl Clone for TcpProxyService {
             servers: Arc::clone(&self.servers),
             db_mappings: Arc::clone(&self.db_mappings),
             enable_tls: self.enable_tls,
-            ip_rules: self.ip_rules.clone(),
+            ip_rules: Arc::clone(&self.ip_rules),
+            proxy_mode: self.proxy_mode.clone(),
+            tcp_ports: self.tcp_ports.clone(),
         }
     }
 }
 
-// Main accept loop for MongoDB connections with better connection tracking
-// Fix for the mongodb_accept_loop function
-async fn mongodb_accept_loop(
-    listener: TcpListener,
+// Start a listener for a specific database port
+async fn start_db_listener(
+    port: u16,
     db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
-    // Set up a counter for connection management
+    // Determine database type from port
+    let db_type = match port {
+        27017 => DatabaseType::MongoDB,
+        5432 => DatabaseType::PostgreSQL,
+        3306 => DatabaseType::MySQL,
+        6379 => DatabaseType::Redis,
+        _ => DatabaseType::Unknown,
+    };
+
+    info!(
+        "Starting {} listener on port {}",
+        db_type.to_string().unwrap_or("database".to_string()),
+        port
+    );
+
+    // Create a TCP listener
+    let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        Ok(listener) => {
+            info!("Successfully bound to 0.0.0.0:{}", port);
+            listener
+        }
+        Err(e) => {
+            error!("Failed to bind to port {}: {}", port, e);
+            return;
+        }
+    };
+
+    // Connection counter for logging
     let connection_count = Arc::new(AtomicUsize::new(0));
 
-    // Let people know we're ready to receive MongoDB connections
-    info!("MongoDB proxy is ready to accept connections on port 27017");
-
-    // Initialize MongoDB connection mappings
-    {
-        // IMPORTANT: Scope the mutex guard so it's dropped before any await
-        let mappings = db_mappings.lock().unwrap();
-        if !mappings.is_empty() {
-            info!("Available MongoDB backends:");
-            for (i, mapping) in mappings.iter().enumerate() {
-                info!(
-                    "  [{}] Pattern '{}' -> {}:{}",
-                    i, mapping.domain_pattern, mapping.target_host, mapping.target_port
-                );
-            }
-        } else {
-            warn!("No MongoDB backends are configured. Connections will fail.");
-        }
-        // The mappings guard is dropped here when the scope ends
-    }
-
+    // Accept loop
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((client_stream, client_addr)) => {
                         let count = connection_count.fetch_add(1, Ordering::SeqCst);
-                        info!("New MongoDB connection #{} from {}", count, client_addr);
+                        info!("New database connection #{} from {} on port {}", count, client_addr, port);
 
-                        // Clone the mappings for this connection
+                        // Clone needed data for the handler
                         let mappings = Arc::clone(&db_mappings);
-                        let conn_count = Arc::clone(&connection_count);
+                        let count_ref = Arc::clone(&connection_count);
+                        let ip_rules_clone = Arc::clone(&ip_rules);
+                        let proxy_mode_clone = proxy_mode.clone();
 
-                        // Spawn a new task to handle this connection
+                        // Spawn a handler task
                         tokio::spawn(async move {
-                            let result = handle_mongodb_connection(
-                                client_stream,
-                                client_addr,
-                                mappings,
-                            ).await;
+                            let db_type_str = match db_type {
+                                DatabaseType::MongoDB => "MongoDB",
+                                DatabaseType::PostgreSQL => "PostgreSQL",
+                                DatabaseType::MySQL => "MySQL",
+                                DatabaseType::Redis => "Redis",
+                                DatabaseType::Unknown => "Unknown",
+                            };
 
-                            if let Err(e) = result {
-                                error!("Error handling MongoDB connection #{}: {}", count, e);
-                            } else {
-                                info!("Successfully closed MongoDB connection #{}", count);
+                            info!("Handling {} connection #{} from {}", db_type_str, count, client_addr);
+
+                            let result = match db_type {
+                                DatabaseType::MongoDB => {
+                                    handle_mongodb_connection(
+                                        client_stream,
+                                        client_addr,
+                                        mappings,
+                                        ip_rules_clone,
+                                        proxy_mode_clone,
+                                    ).await
+                                },
+                                DatabaseType::PostgreSQL => {
+                                    handle_postgres_connection(
+                                        client_stream,
+                                        client_addr,
+                                        mappings,
+                                        ip_rules_clone,
+                                        proxy_mode_clone,
+                                    ).await
+                                },
+                                DatabaseType::MySQL => {
+                                    handle_mysql_connection(
+                                        client_stream,
+                                        client_addr,
+                                        mappings,
+                                        ip_rules_clone,
+                                        proxy_mode_clone,
+                                    ).await
+                                },
+                                _ => {
+                                    // Default generic handler
+                                    handle_generic_db_connection(
+                                        client_stream,
+                                        client_addr,
+                                        db_type,
+                                        mappings,
+                                        ip_rules_clone,
+                                        proxy_mode_clone,
+                                    ).await
+                                }
+                            };
+
+                            match result {
+                                Ok(()) => info!("Successfully closed connection #{}", count),
+                                Err(e) => error!("Error handling connection #{}: {}", count, e),
                             }
 
                             // Decrement active connection count
-                            conn_count.fetch_sub(1, Ordering::SeqCst);
+                            count_ref.fetch_sub(1, Ordering::SeqCst);
                         });
-                    }
+                    },
                     Err(e) => {
-                        error!("Failed to accept connection: {}", e);
+                        error!("Failed to accept connection on port {}: {}", port, e);
                         // Don't exit on accept errors, just continue
-                        continue;
                     }
                 }
-            }
+            },
             _ = shutdown_rx.recv() => {
-                info!("Received shutdown signal, stopping MongoDB proxy accept loop");
+                info!("Received shutdown signal, stopping listener on port {}", port);
                 break;
             }
         }
     }
 
     info!(
-        "MongoDB accept loop stopped. Current connections: {}",
+        "Listener on port {} stopped. Current connections: {}",
+        port,
         connection_count.load(Ordering::SeqCst)
     );
 }
 
-// Add these new structs for MongoDB protocol handling
-#[derive(Debug)]
-struct MongoHeader {
-    message_length: i32,
-    request_id: i32,
-    response_to: i32,
-    op_code: i32,
-}
+// Generic database connection handler
+async fn handle_generic_db_connection(
+    mut client_stream: tokio::net::TcpStream,
+    client_addr: SocketAddr,
+    db_type: DatabaseType,
+    db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read initial data
+    let mut buffer = vec![0u8; 8192];
+    let n = match client_stream.read(&mut buffer).await {
+        Ok(n) if n == 0 => return Err("Client closed connection immediately".into()),
+        Ok(n) => n,
+        Err(e) => return Err(format!("Failed to read from client: {}", e).into()),
+    };
+    buffer.truncate(n);
 
-impl MongoHeader {
-    fn from_bytes(buffer: &[u8]) -> Option<Self> {
-        if buffer.len() < 16 {
-            return None;
-        }
-
-        // Ensure we're reading valid MongoDB wire protocol message
-        let message_length = LittleEndian::read_i32(&buffer[0..4]);
-        let request_id = LittleEndian::read_i32(&buffer[4..8]);
-        let response_to = LittleEndian::read_i32(&buffer[8..12]);
-        let op_code = LittleEndian::read_i32(&buffer[12..16]);
-
-        // Validate message length and op_code
-        if message_length <= 0 || message_length > 48_000_000 {
-            // MongoDB max message size
-            return None;
-        }
-
-        Some(MongoHeader {
-            message_length,
-            request_id,
-            response_to,
-            op_code,
-        })
-    }
-}
-
-async fn resolve_mongodb_srv(
-    domain: &str,
-) -> Result<Vec<(String, u16)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Clean up domain string and extract base name
-    let clean_domain = domain
-        .trim_start_matches("mongodb+srv://")
-        .trim_start_matches("mongodb://")
-        .splitn(2, ['@', '/', '?'])
-        .next()
-        .unwrap_or(domain)
-        .to_lowercase();
-
-    // For your specific "riverbase-mongodb-*" pattern, directly use Docker service discovery
-    if clean_domain.contains("riverbase-mongodb-") {
-        info!("Direct Docker service mapping for: {}", clean_domain);
-        // For Docker Swarm, don't attempt SRV lookup, just use the service name
-        return Ok(vec![(format!("{}.proxy-network", clean_domain), 27017)]);
-    }
-
-    // Rest of the function remains unchanged for standard SRV resolution...
-    info!("Attempting SRV resolution for: {}", clean_domain);
-    let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
-    let srv_name = format!("_mongodb._tcp.{}", clean_domain);
-
-    match resolver.srv_lookup(srv_name).await {
-        Ok(srv_records) => {
-            let mut endpoints: Vec<_> = srv_records
-                .iter()
-                .map(|srv| {
-                    let target = srv.target().to_string().trim_end_matches('.').to_string();
-                    (target, srv.port())
-                })
-                .collect();
-
-            if endpoints.is_empty() {
-                info!("No SRV records found, using default connection");
-                Ok(vec![(clean_domain, 27017)])
-            } else {
-                info!("Resolved {} SRV records", endpoints.len());
-                endpoints.sort_by(|a, b| a.0.cmp(&b.0));
-                Ok(endpoints)
+    // Find backend based on client IP since we don't have protocol-specific extraction
+    let (backend, mapping) = {
+        let mappings = match db_mappings.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock db_mappings: {}", e);
+                return Err("Internal server error".into());
             }
+        };
+
+        // Try to find a backend for this database type
+        match route_by_client_ip(&client_addr, &mappings, db_type) {
+            Some((host, port, idx)) => {
+                let mapping = mappings.get(idx).cloned();
+                (Some((host, port)), mapping)
+            }
+            None => (None, None),
         }
-        Err(e) => {
-            info!("SRV lookup failed ({}), using direct connection", e);
-            Ok(vec![(clean_domain, 27017)])
+    };
+
+    match backend {
+        Some((host, port)) => {
+            info!(
+                "Routing generic database connection from {} to {}:{}",
+                client_addr, host, port
+            );
+
+            // Update connection stats if mapping available
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_add(1, Ordering::SeqCst);
+            }
+
+            // Create connection to backend
+            let mut server_stream = if proxy_mode == "service-discovery" {
+                match connect_to_service(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Decrement connection count on failure
+                        if let Some(m) = &mapping {
+                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        return Err(format!("Failed to connect to service {}: {}", host, e).into());
+                    }
+                }
+            } else {
+                match connect_to_backend(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Decrement connection count on failure
+                        if let Some(m) = &mapping {
+                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        return Err(format!("Failed to connect to backend {}: {}", host, e).into());
+                    }
+                }
+            };
+
+            // Write the initial buffer to the server
+            server_stream.write_all(&buffer[0..n]).await?;
+
+            // Start proxying
+            let result = proxy_bidirectional(client_stream, server_stream).await;
+
+            // Update connection stats when done
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_sub(1, Ordering::SeqCst);
+            }
+
+            result
+        }
+        None => {
+            error!(
+                "No backend found for generic database connection from {}",
+                client_addr
+            );
+            Err("No matching backend found for this database connection".into())
         }
     }
 }
 
-// Handle a MongoDB connection
+// MongoDB-specific connection handler
 async fn handle_mongodb_connection(
-    mut client_stream: TcpStream,
+    mut client_stream: tokio::net::TcpStream,
     client_addr: SocketAddr,
     db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Read initial data from client
+    // Read initial data from client to extract database info
     let mut buffer = vec![0u8; 8192];
     let n = match client_stream.read(&mut buffer).await {
         Ok(n) if n == 0 => return Err("Client closed connection immediately".into()),
@@ -630,152 +769,314 @@ async fn handle_mongodb_connection(
         header.message_length, header.op_code, header.request_id
     );
 
-    // Extract database information and find backend
-    // IMPORTANT: Clone all needed data out of the MutexGuard before any await
-    // Extract database information and find backend
-    let (backend, mapping) = {
-        let mappings = db_mappings.lock().unwrap();
+    // Extract database information from the MongoDB message
+    let mut db_info = String::new();
+    if let Some(info) = extract_database_info(&buffer[16..], header.op_code) {
+        db_info = info;
+        info!("Detected database info: {}", db_info);
+    } else {
+        warn!("Could not extract database info from MongoDB message");
+    }
 
-        if let Some(db_info) = extract_database_info(&buffer[16..], header.op_code) {
-            info!("Detected database info: {}", db_info);
+    // Check IP rules
+    let db_name = db_info.clone();
+    let client_ip = client_addr.ip().to_string();
 
-            // Detect SRV connections
-            let is_srv_connection = db_info.contains("+srv")
-                || db_info.contains("-mongodb-")
-                || db_info.contains(".mongodb.");
+    let ip_allowed = {
+        let ip_rules_guard = ip_rules.lock().await;
+        ip_rules_guard.is_ip_allowed(&db_name, &client_ip)
+    };
 
-            // First try exact domain pattern match
-            if let Some((host, port, idx)) = find_backend_for_database(&db_info, &mappings) {
-                info!(
-                    "Found exact match for database '{}' -> {}:{}",
-                    db_info, host, port
-                );
+    if !ip_allowed {
+        error!(
+            "IP {} is not allowed to access database {}",
+            client_ip, db_name
+        );
+        return Err(format!("IP {} is not allowed to access this database", client_ip).into());
+    }
 
-                // Get the backend host and port
-                let host_clone = host.clone();
-                let port_clone = port;
+    // Find backend based on the database info or client IP
+    let (backend, mapping) =
+        find_backend_for_connection(&db_info, &client_addr, &db_mappings, DatabaseType::MongoDB)?;
 
-                // Clone the mapping if it exists
-                let mapping_clone = if let Some(m) = mappings.get(idx) {
-                    Some(m.clone())
-                } else {
-                    None
-                };
-
-                // Return the data outside the guard scope
-                if host.contains(".mongodb.koompi.cloud") {
-                    // We'll handle SRV resolution outside the guard scope
-                    (Some((host_clone, port_clone, true)), mapping_clone)
-                } else {
-                    (Some((host_clone, port_clone, false)), mapping_clone)
-                }
-            } else {
-                // Fall back to default mapping if available
-                if let Some((_, mapping)) = mappings
-                    .iter()
-                    .enumerate()
-                    .find(|(_, m)| m.domain_pattern == "default" || m.domain_pattern == "*")
-                {
-                    (
-                        Some((mapping.target_host.clone(), mapping.target_port, false)),
-                        Some(mapping.clone()),
-                    )
-                } else {
-                    (None, None)
-                }
-            }
-        } else {
-            warn!("Could not extract database info, falling back to IP routing");
-            match route_by_client_ip(&client_addr, &mappings) {
-                Some((host, port, idx)) => {
-                    let mapping_clone = if let Some(m) = mappings.get(idx) {
-                        Some(m.clone())
-                    } else {
-                        None
-                    };
-                    (Some((host, port, false)), mapping_clone)
-                }
-                None => (None, None),
-            }
-        }
-    }; // MutexGuard is dropped here
-
-    // Now handle the connection routing without the MutexGuard
     match backend {
-        Some((host, port, needs_srv_lookup)) => {
-            // Perform SRV lookup if needed (now that we're outside the MutexGuard scope)
-            let (resolved_host, resolved_port) = if needs_srv_lookup {
-                info!("Performing SRV lookup for {}", host);
-                match resolve_mongodb_srv(&host).await {
-                    Ok(mut endpoints) => {
-                        // Rotate DNS results for basic load balancing
-                        if endpoints.len() > 1 {
-                            endpoints.rotate_left(1);
-                        }
-                        let (h, p) = endpoints
-                            .first()
-                            .map(|e| (e.0.clone(), e.1))
-                            .unwrap_or_else(|| (host.clone(), port));
-                        info!("Resolved MongoDB SRV record: {} -> {}:{}", host, h, p);
-                        (h, p)
-                    }
-                    Err(e) => {
-                        warn!("SRV lookup failed ({}), using direct connection", e);
-                        (host.clone(), port)
-                    }
-                }
-            } else {
-                (host.clone(), port)
-            };
-
+        Some((host, port)) => {
             info!(
                 "Routing MongoDB connection from {} to {}:{}",
-                client_addr, resolved_host, resolved_port
+                client_addr, host, port
             );
 
-            // Try to resolve the backend address first
-            match tokio::net::lookup_host(format!("{}:{}", resolved_host, resolved_port)).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        match TcpStream::connect(addr).await {
-                            Ok(server_stream) => {
-                                // Connection successful, proceed with proxying
-                                if let Some(m) = &mapping {
-                                    m.active_connections.fetch_add(1, Ordering::SeqCst);
-                                }
-
-                                let result =
-                                    proxy_bidirectional(client_stream, server_stream).await;
-
-                                if let Some(m) = &mapping {
-                                    m.active_connections.fetch_sub(1, Ordering::SeqCst);
-                                }
-
-                                result
-                            }
-                            Err(e) => {
-                                error!("Failed to connect to resolved address {}: {}", addr, e);
-                                Err(format!("Connection failed: {}", e).into())
-                            }
-                        }
-                    } else {
-                        Err("No addresses resolved for backend".into())
+            // Handle different connection modes
+            let mut server_stream = if proxy_mode == "service-discovery" {
+                // For service discovery mode, connect using Swarm DNS
+                match connect_to_service(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        return Err(format!("Failed to connect to service {}: {}", host, e).into())
                     }
                 }
-                Err(e) => {
-                    error!("Failed to resolve backend host {}: {}", resolved_host, e);
-                    Err(format!("DNS resolution failed: {}", e).into())
+            } else {
+                // Direct connection mode
+                match connect_to_backend(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        return Err(format!("Failed to connect to backend {}: {}", host, e).into())
+                    }
                 }
+            };
+
+            // Update connection stats if mapping available
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_add(1, Ordering::SeqCst);
             }
+
+            // Write the initial buffer to the server
+            server_stream.write_all(&buffer[0..n]).await?;
+
+            // Start proxying in both directions
+            let result = proxy_bidirectional(client_stream, server_stream).await;
+
+            // Update connection stats when done
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_sub(1, Ordering::SeqCst);
+            }
+
+            result
         }
         None => {
             error!(
                 "No backend found for MongoDB connection from {}",
                 client_addr
             );
-            Err("No matching backend found".into())
+            Err("No matching backend found for this MongoDB connection".into())
         }
     }
+}
+
+// PostgreSQL connection handler (similar structure to MongoDB)
+async fn handle_postgres_connection(
+    mut client_stream: tokio::net::TcpStream,
+    client_addr: SocketAddr,
+    db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read initial data to extract database info
+    let mut buffer = vec![0u8; 8192];
+    let n = match client_stream.read(&mut buffer).await {
+        Ok(n) if n == 0 => return Err("Client closed connection immediately".into()),
+        Ok(n) => n,
+        Err(e) => return Err(format!("Failed to read from client: {}", e).into()),
+    };
+    buffer.truncate(n);
+
+    // Extract PostgreSQL database name from startup message
+    let db_info = match extract_postgres_database(&buffer) {
+        Ok(name) => Some(name),
+        Err(_) => None,
+    };
+
+    if let Some(db_name) = &db_info {
+        info!("Detected PostgreSQL database: {}", db_name);
+    } else {
+        warn!("Could not extract database name from PostgreSQL startup message");
+    }
+
+    // Find backend based on the database info or client IP
+    let (backend, mapping) = find_backend_for_connection(
+        &db_info.unwrap_or_default(),
+        &client_addr,
+        &db_mappings,
+        DatabaseType::PostgreSQL,
+    )?;
+
+    match backend {
+        Some((host, port)) => {
+            // Similar implementation to MongoDB handler
+            info!(
+                "Routing PostgreSQL connection from {} to {}:{}",
+                client_addr, host, port
+            );
+
+            // Update connection stats if mapping available
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_add(1, Ordering::SeqCst);
+            }
+
+            // Create connection to backend
+            let mut server_stream = if proxy_mode == "service-discovery" {
+                match connect_to_service(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Decrement connection count on failure
+                        if let Some(m) = &mapping {
+                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        return Err(format!("Failed to connect to service {}: {}", host, e).into());
+                    }
+                }
+            } else {
+                match connect_to_backend(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Decrement connection count on failure
+                        if let Some(m) = &mapping {
+                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        return Err(format!("Failed to connect to backend {}: {}", host, e).into());
+                    }
+                }
+            };
+
+            // Write the initial buffer to the server
+            server_stream.write_all(&buffer[0..n]).await?;
+
+            // Start proxying
+            let result = proxy_bidirectional(client_stream, server_stream).await;
+
+            // Update connection stats when done
+            if let Some(m) = &mapping {
+                m.active_connections.fetch_sub(1, Ordering::SeqCst);
+            }
+
+            result
+        }
+        None => {
+            error!(
+                "No backend found for PostgreSQL connection from {}",
+                client_addr
+            );
+            Err("No matching backend found for this PostgreSQL connection".into())
+        }
+    }
+}
+
+// MySQL connection handler
+async fn handle_mysql_connection(
+    mut client_stream: tokio::net::TcpStream,
+    client_addr: SocketAddr,
+    db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
+    ip_rules: Arc<tokio::sync::Mutex<DatabaseIpRules>>,
+    proxy_mode: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Similar structure to other handlers
+    let mut buffer = vec![0u8; 8192];
+    let n = match client_stream.read(&mut buffer).await {
+        Ok(n) if n == 0 => return Err("Client closed connection immediately".into()),
+        Ok(n) => n,
+        Err(e) => return Err(format!("Failed to read from client: {}", e).into()),
+    };
+    buffer.truncate(n);
+
+    // Extract MySQL database name
+    let db_info = match extract_mysql_database(&buffer) {
+        Ok(name) => Some(name),
+        Err(_) => None,
+    };
+
+    if let Some(db_name) = &db_info {
+        info!("Detected MySQL database: {}", db_name);
+    } else {
+        warn!("Could not extract database name from MySQL startup message");
+    }
+
+    // Find backend based on the database info or client IP
+    let (backend, mapping) = find_backend_for_connection(
+        &db_info.unwrap_or_default(),
+        &client_addr,
+        &db_mappings,
+        DatabaseType::MySQL,
+    )?;
+
+    match backend {
+        Some((host, port)) => {
+            info!(
+                "Routing MySQL connection from {} to {}:{}",
+                client_addr, host, port
+            );
+
+            // Create connection to backend
+            let mut server_stream = if proxy_mode == "service-discovery" {
+                match connect_to_service(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        return Err(format!("Failed to connect to service {}: {}", host, e).into())
+                    }
+                }
+            } else {
+                match connect_to_backend(&host, port).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        return Err(format!("Failed to connect to backend {}: {}", host, e).into())
+                    }
+                }
+            };
+
+            // Write the initial buffer to the server
+            server_stream.write_all(&buffer[0..n]).await?;
+
+            // Start proxying
+            proxy_bidirectional(client_stream, server_stream).await
+        }
+        None => {
+            error!("No backend found for MySQL connection from {}", client_addr);
+            Err("No matching backend found for this MySQL connection".into())
+        }
+    }
+}
+
+fn route_by_client_ip(
+    client_addr: &SocketAddr,
+    mappings: &Vec<DatabaseMapping>,
+    db_type: DatabaseType,
+) -> Option<(String, u16, usize)> {
+    // Filter for mappings of the requested database type
+    let filtered_mappings: Vec<(usize, &DatabaseMapping)> = mappings
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.db_type == db_type)
+        .collect();
+
+    if filtered_mappings.is_empty() {
+        // If no mappings found for specific database type, try to find a default mapping
+        let default_mappings: Vec<(usize, &DatabaseMapping)> = mappings
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.domain_pattern == "default" || m.domain_pattern == "*")
+            .collect();
+
+        if default_mappings.is_empty() {
+            return None;
+        }
+
+        // Use the first default mapping
+        let (idx, mapping) = default_mappings[0];
+        return Some((mapping.target_host.clone(), mapping.target_port, idx));
+    }
+
+    // Generate hash from client IP
+    let hash_value = match client_addr.ip() {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            octets.iter().enumerate().fold(0u64, |acc, (i, &octet)| {
+                acc.wrapping_add((octet as u64) << (i * 8))
+            })
+        }
+        IpAddr::V6(ipv6) => {
+            // Better IPv6 handling - hash the entire address
+            let segments = ipv6.segments();
+            segments
+                .iter()
+                .enumerate()
+                .fold(0u64, |acc, (i, &segment)| {
+                    acc.wrapping_add((segment as u64) << (i * 16))
+                })
+        }
+    };
+
+    // Select backend using consistent hashing
+    let (idx, mapping) = filtered_mappings[(hash_value as usize) % filtered_mappings.len()];
+    Some((mapping.target_host.clone(), mapping.target_port, idx))
 }
 
 fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
@@ -862,7 +1163,7 @@ fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
                     extracted = extracted
                         .trim_start_matches("mongodb+srv://")
                         .trim_start_matches("mongodb://")
-                        .splitn(2, ['@', '/', '?'])
+                        .split(|c| c == '@' || c == '/' || c == '?')
                         .next()
                         .unwrap_or(extracted);
                 }
@@ -875,34 +1176,105 @@ fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
     None
 }
 
-fn find_backend_for_database(
+fn find_backend_for_connection(
     db_info: &str,
-    mappings: &[DatabaseMapping],
-) -> Option<(String, u16, usize)> {
-    // First try to match based on the database name
-    for (idx, mapping) in mappings.iter().enumerate() {
-        // Check if the database name contains our domain pattern
-        if db_info.contains(&mapping.domain_pattern) {
-            return Some((mapping.target_host.clone(), mapping.target_port, idx));
+    client_addr: &SocketAddr,
+    db_mappings: &Arc<Mutex<Vec<DatabaseMapping>>>,
+    db_type: DatabaseType,
+) -> Result<
+    (Option<(String, u16)>, Option<DatabaseMapping>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let mappings = match db_mappings.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("Failed to lock db_mappings: {}", e);
+            return Err("Internal server error".into());
+        }
+    };
+
+    // First try matching by database info if available
+    if !db_info.is_empty() {
+        if let Some((idx, mapping)) = mappings
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.matches_domain(db_info))
+        {
+            info!(
+                "Found mapping for database '{}' -> {}:{}",
+                db_info, mapping.target_host, mapping.target_port
+            );
+
+            return Ok((
+                Some((mapping.target_host.clone(), mapping.target_port)),
+                Some(mapping.clone()),
+            ));
+        }
+
+        // Fall back to default mapping for this database type
+        if let Some((idx, mapping)) = mappings.iter().enumerate().find(|(_, m)| {
+            m.db_type == db_type && (m.domain_pattern == "default" || m.domain_pattern == "*")
+        }) {
+            let db_type_str = db_type.to_string().unwrap_or_else(|| "Unknown".to_string());
+            info!(
+                "Using default {} mapping -> {}:{}",
+                db_type_str, mapping.target_host, mapping.target_port
+            );
+            return Ok((
+                Some((mapping.target_host.clone(), mapping.target_port)),
+                Some(mapping.clone()),
+            ));
         }
     }
 
-    // If no match found based on database name, look for a default mapping
-    for (idx, mapping) in mappings.iter().enumerate() {
-        if mapping.domain_pattern == "default" || mapping.domain_pattern == "*" {
-            return Some((mapping.target_host.clone(), mapping.target_port, idx));
+    // If specific routing failed or we have no database info, try IP-based routing as last resort
+    match route_by_client_ip(client_addr, &mappings, db_type) {
+        Some((host, port, idx)) => {
+            let mapping = mappings.get(idx).cloned();
+            Ok((Some((host, port)), mapping))
         }
+        None => Ok((None, None)),
     }
-
-    None
 }
 
-// Helper function to proxy data bidirectionally
+async fn connect_to_service(service: &str, port: u16) -> Result<TcpStream, std::io::Error> {
+    // For Docker Swarm, use the tasks.<service_name> DNS pattern
+    let service_name = if service.starts_with("tasks.") {
+        service.to_string()
+    } else {
+        format!("tasks.{}", service)
+    };
+
+    connect_to_backend(&service_name, port).await
+}
+
+async fn connect_to_backend(host: &str, port: u16) -> Result<TcpStream, std::io::Error> {
+    // Try to resolve the backend address
+    let addr_str = format!("{}:{}", host, port);
+    let addrs = tokio::net::lookup_host(&addr_str).await?;
+
+    // Try each address until one connects
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    // Return the last error if all connections failed
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("No addresses resolved for backend {}", host),
+        )
+    }))
+}
+
 async fn proxy_bidirectional(
-    client_stream: TcpStream,
-    server_stream: TcpStream,
+    client_stream: tokio::net::TcpStream,
+    server_stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get addresses for logging
     let client_addr = client_stream.peer_addr()?.to_string();
     let server_addr = server_stream.peer_addr()?.to_string();
 
@@ -911,15 +1283,12 @@ async fn proxy_bidirectional(
         client_addr, server_addr
     );
 
-    // Split the TCP streams
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
 
-    // Create channels to signal when a direction is complete
     let (client_done_tx, mut client_done_rx) = mpsc::channel::<()>(1);
     let (server_done_tx, mut server_done_rx) = mpsc::channel::<()>(1);
 
-    // Client to server forwarding
     let client_to_server = tokio::spawn(async move {
         let mut buffer = [0u8; 8192];
         let mut bytes_copied = 0;
@@ -927,7 +1296,6 @@ async fn proxy_bidirectional(
         loop {
             match client_read.read(&mut buffer).await {
                 Ok(0) => {
-                    // Client closed the connection
                     info!("Client disconnected after sending {} bytes", bytes_copied);
                     break;
                 }
@@ -950,7 +1318,6 @@ async fn proxy_bidirectional(
         let _ = client_done_tx.send(()).await;
     });
 
-    // Server to client forwarding
     let server_to_client = tokio::spawn(async move {
         let mut buffer = [0u8; 8192];
         let mut bytes_copied = 0;
@@ -958,7 +1325,6 @@ async fn proxy_bidirectional(
         loop {
             match server_read.read(&mut buffer).await {
                 Ok(0) => {
-                    // Server closed the connection
                     info!("Server disconnected after sending {} bytes", bytes_copied);
                     break;
                 }
@@ -981,7 +1347,6 @@ async fn proxy_bidirectional(
         let _ = server_done_tx.send(()).await;
     });
 
-    // Wait for either stream to complete
     tokio::select! {
         _ = client_done_rx.recv() => {
             info!("Client to server transfer completed");
@@ -991,7 +1356,6 @@ async fn proxy_bidirectional(
         }
     }
 
-    // Cancel the other task
     client_to_server.abort();
     server_to_client.abort();
 
@@ -999,75 +1363,68 @@ async fn proxy_bidirectional(
     Ok(())
 }
 
-// Find matching backend by checking all patterns against the data
-fn find_matching_backend(data: &str, mappings: &[DatabaseMapping]) -> Option<(String, u16)> {
-    // Domain patterns we check for
-    let domain_patterns = [".mongodb.koompi.cloud", "-mongodb-", ".mongodb."];
+fn extract_mysql_database(
+    buffer: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if buffer.len() < 36 {
+        return Err("Buffer too short for MySQL protocol".into());
+    }
 
-    // For each domain pattern, look for matches
-    for pattern in &domain_patterns {
-        if let Some(pos) = data.find(pattern) {
-            // Extract context around the match
-            let start = pos.saturating_sub(100);
-            let end = (pos + pattern.len() + 100).min(data.len());
-            let context = &data[start..end];
+    // Skip the initial handshake packet length and sequence number (4 bytes)
+    let mut pos = 4;
 
-            // Try each mapping against this context
-            for mapping in mappings {
-                if context.contains(&mapping.domain_pattern) {
-                    info!(
-                        "Found match for pattern '{}' in context",
-                        mapping.domain_pattern
-                    );
-                    return Some((mapping.target_host.clone(), mapping.target_port));
-                }
-            }
+    // Skip protocol version (1 byte)
+    pos += 1;
+
+    // Skip server version (null-terminated string)
+    while pos < buffer.len() && buffer[pos] != 0 {
+        pos += 1;
+    }
+    pos += 1;
+
+    // Skip connection id (4 bytes)
+    pos += 4;
+
+    // Try to find database name in connection attributes
+    if let Ok(payload_str) = std::str::from_utf8(&buffer[pos..]) {
+        if let Some(db_pos) = payload_str.find("database=") {
+            let start = db_pos + 9; // length of "database="
+            let end = payload_str[start..]
+                .find(|c: char| c.is_whitespace() || c == ';')
+                .map_or(payload_str.len(), |e| start + e);
+            return Ok(payload_str[start..end].to_string());
         }
     }
 
-    // Special case for connection strings
-    if data.contains("mongodb://") {
-        for mapping in mappings {
-            if data.contains(&mapping.domain_pattern) {
-                info!(
-                    "Found match for pattern '{}' in connection string",
-                    mapping.domain_pattern
-                );
-                return Some((mapping.target_host.clone(), mapping.target_port));
-            }
-        }
-    }
-
-    // No match found
-    None
+    Err("Could not extract database name".into())
 }
 
-// Fixed route_by_client_ip function to correctly return the index
-fn route_by_client_ip(
-    client_addr: &SocketAddr,
-    mappings: &[DatabaseMapping],
-) -> Option<(String, u16, usize)> {
-    if mappings.is_empty() {
-        return None;
+fn extract_postgres_database(
+    buffer: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if buffer.len() < 8 {
+        return Err("Buffer too short for PostgreSQL startup message".into());
     }
 
-    // Generate hash from client IP
-    let hash_value = match client_addr.ip() {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            octets.iter().enumerate().fold(0u64, |acc, (i, &octet)| {
-                acc.wrapping_add((octet as u64) << (i * 8))
-            })
-        }
-        IpAddr::V6(_) => {
-            // Simplified IPv6 handling - use first available backend
-            return Some((mappings[0].target_host.clone(), mappings[0].target_port, 0));
-        }
-    };
+    // First 4 bytes are message length, next 4 bytes are protocol version
+    let length = ((buffer[0] as u32) << 24)
+        | ((buffer[1] as u32) << 16)
+        | ((buffer[2] as u32) << 8)
+        | (buffer[3] as u32);
 
-    // Select backend using consistent hashing
-    let idx = (hash_value as usize) % mappings.len();
-    let mapping = &mappings[idx];
+    if length < 8 || length as usize > buffer.len() {
+        return Err("Invalid PostgreSQL message length".into());
+    }
 
-    Some((mapping.target_host.clone(), mapping.target_port, idx))
+    // Look for "database" parameter in startup message
+    if let Ok(payload_str) = std::str::from_utf8(&buffer[8..]) {
+        if let Some(db_pos) = payload_str.find("database\0") {
+            let value_start = db_pos + 9; // length of "database\0"
+            if let Some(value_end) = payload_str[value_start..].find('\0') {
+                return Ok(payload_str[value_start..(value_start + value_end)].to_string());
+            }
+        }
+    }
+
+    Err("Could not extract database name".into())
 }
