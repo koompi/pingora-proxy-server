@@ -710,8 +710,23 @@ fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
 
     // OpCode 2004 is OP_QUERY, 2013 is OP_MSG (MongoDB 3.6+)
     if (op_code == 2004 || op_code == 2013) && data.len() >= message_length {
-        // Convert the payload to string, ignoring invalid UTF-8
-        let payload = String::from_utf8_lossy(&data[16..message_length]);
+        // Split the payload into chunks and process each separately to avoid UTF-8 boundary issues
+        let payload_bytes = &data[16..message_length];
+
+        // Convert chunks to strings safely, skipping invalid UTF-8 sequences
+        let mut valid_strings = Vec::new();
+        let mut current_chunk = Vec::new();
+
+        for &byte in payload_bytes {
+            current_chunk.push(byte);
+            if let Ok(s) = String::from_utf8(current_chunk.clone()) {
+                valid_strings.push(s);
+                current_chunk.clear();
+            }
+        }
+
+        // Join valid strings and search for patterns
+        let payload = valid_strings.join("");
 
         // Look for connection string patterns
         let patterns = [
@@ -723,24 +738,47 @@ fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
             ("\"hostname\":", 100),
             ("\"db\":", 50),
             ("\"database\":", 50),
+            ("applicationName", 50), // MongoDB Compass and other clients
         ];
 
-        for (pattern, context_length) in &patterns {
-            if let Some(pos) = payload.find(pattern) {
-                // Get surrounding context
-                let start = pos.saturating_sub(*context_length);
-                let end = (pos + pattern.len() + *context_length).min(payload.len());
-                let context = &payload[start..end];
+        // First try to find MongoDB Compass specific patterns
+        if payload.contains("MongoDB Compass") {
+            // Extract connection details from MongoDB Compass connection
+            if let Some(pos) = payload.find("mongodb://") {
+                let end = payload[pos..]
+                    .find(char::is_whitespace)
+                    .map(|p| pos + p)
+                    .unwrap_or(payload.len());
+                let conn_string = &payload[pos..end];
 
-                // Look for domain patterns
-                if let Some(domain) = extract_domain_from_text(context) {
+                // Try to extract hostname from connection string
+                if let Some(domain) = extract_domain_from_text(conn_string) {
                     return Some(domain);
                 }
             }
         }
 
+        // Try regular pattern matching
+        for (pattern, context_length) in &patterns {
+            if let Some(pos) = payload.find(pattern) {
+                // Get surrounding context safely
+                let start = pos.saturating_sub(*context_length);
+                let end = (pos + pattern.len())
+                    .saturating_add(*context_length)
+                    .min(payload.len());
+
+                if let Some(context) = payload.get(start..end) {
+                    if let Some(domain) = extract_domain_from_text(context) {
+                        return Some(domain);
+                    }
+                }
+            }
+        }
+
         // Fallback: scan the entire payload for domain patterns
-        return extract_domain_from_text(&payload);
+        if let Some(domain) = extract_domain_from_text(&payload) {
+            return Some(domain);
+        }
     }
 
     None
