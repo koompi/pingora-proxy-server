@@ -1,6 +1,6 @@
 // src/proxy/tcp.rs
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +16,8 @@ use tokio::time::Duration;
 use crate::config::model::ConfigStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::os::fd::AsRawFd;
 use tokio::fs;
-
 // Database type enum
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatabaseType {
@@ -393,7 +393,7 @@ impl TcpProxyService {
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
-                                if let Err(e) = handle_mongodb_connection(inbound, client_addr, mappings).await {
+                                if let Err(e) = handle_mongodb_connection(inbound, client_addr, mappings, client_addr).await {
                                     error!("Error handling MongoDB connection: {}", e);
                                 }
                             });
@@ -637,28 +637,42 @@ impl Service for TcpProxyService {
                             Ok((client_stream, client_addr)) => {
                                 info!("New MongoDB connection from {}", client_addr);
 
+                                // Get original destination before creating the connection handler
+                                let original_dst = match get_original_dst(&client_stream) {
+                                    Some(addr) => {
+                                        info!("Original destination was: {}", addr);
+                                        addr
+                                    },
+                                    None => {
+                                        warn!("Could not get original destination for connection");
+                                        client_stream.local_addr().unwrap_or_else(|_| {
+                                            SocketAddr::new(
+                                                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                                                27017
+                                            )
+                                        })
+                                    }
+                                };
+
                                 // Clone the mappings data OUTSIDE the spawned task
-                                // This ensures no MutexGuard crosses await points
                                 let mappings_clone = Arc::clone(&shared_mappings);
                                 let mappings_data = {
-                                    // Take a separate clone inside a block that ends
-                                    // so the MutexGuard is dropped immediately
                                     let guard = mappings_clone.lock().unwrap();
                                     let cloned_data = guard.clone();
-                                    cloned_data // Return the cloned data; guard is dropped at block end
+                                    cloned_data
                                 };
 
                                 // Create a new Arc<Mutex<>> with the cloned data
                                 let task_mappings = Arc::new(Mutex::new(mappings_data));
 
-                                // Now spawn the task with the new Arc<Mutex<>>
                                 // Clone the necessary data before spawning the task
                                 let task_mappings_clone = Arc::clone(&task_mappings);
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_mongodb_connection(
                                         client_stream,
                                         client_addr,
-                                        task_mappings_clone
+                                        task_mappings_clone,
+                                        original_dst, // Pass the original destination
                                     ).await {
                                         error!("Error handling MongoDB connection: {}", e);
                                     }
@@ -670,7 +684,6 @@ impl Service for TcpProxyService {
                         }
                     }
                     _ = timeout => {
-                        // Just a timeout to check for shutdown
                         continue;
                     }
                 }
@@ -875,7 +888,13 @@ async fn handle_mongodb_connection(
     mut client_stream: TcpStream,
     client_addr: SocketAddr,
     domain_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+    original_dst: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!(
+        "Handling MongoDB connection from {} (original destination: {})",
+        client_addr, original_dst
+    );
+
     // Read a small buffer just to have something to start with
     let mut length_buffer = [0u8; 4];
 
@@ -983,5 +1002,41 @@ async fn check_mongodb_health(target: &str) -> bool {
             error!("MongoDB health check failed for {}: {}", target, e);
             false
         }
+    }
+}
+
+// Define the missing constants that aren't in the libc crate
+const SOL_IP: libc::c_int = 0;
+const SO_ORIGINAL_DST: libc::c_int = 80;
+
+// Alternative implementation that handles errors more gracefully
+fn get_original_dst(socket: &TcpStream) -> Option<SocketAddr> {
+    // Define the constants manually
+    const SOL_IP: libc::c_int = 0;
+    const SO_ORIGINAL_DST: libc::c_int = 80;
+
+    let fd = socket.as_raw_fd();
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut addrlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_IP,
+            SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut addrlen,
+        )
+    };
+
+    if result == 0 {
+        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+        let port = u16::from_be(addr.sin_port);
+        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    } else {
+        // Log the error and return None
+        let err = std::io::Error::last_os_error();
+        warn!("Failed to get original destination: {}", err);
+        None
     }
 }
