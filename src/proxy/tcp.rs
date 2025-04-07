@@ -599,6 +599,9 @@ impl Service for TcpProxyService {
             db_mappings.clone()
         };
 
+        // Create shutdown channel for the accept loop
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
         // Create a single TCP listener
         let listener = match TcpListener::bind("0.0.0.0:27017").await {
             Ok(listener) => {
@@ -611,23 +614,12 @@ impl Service for TcpProxyService {
             }
         };
 
-        // Create a channel for graceful shutdown
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-
-        // Shared domain mappings
-        let shared_mappings = Arc::new(Mutex::new(domain_mappings));
-
-        // Spawn a task to handle accepting connections
+        // Spawn the accept loop task
         let accept_task_handle = tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_rx; // Make shutdown_rx mutable here
-            loop {
-                // Check for shutdown signal
-                if shutdown_rx.try_recv().is_ok() {
-                    info!("Shutting down MongoDB proxy listener");
-                    break;
-                }
+            let shared_mappings = Arc::new(Mutex::new(domain_mappings));
 
-                // Accept with timeout to check for shutdown periodically
+            loop {
+                // Accept new connections
                 let accept_future = listener.accept();
                 let timeout = tokio::time::sleep(Duration::from_secs(1));
 
@@ -637,76 +629,48 @@ impl Service for TcpProxyService {
                             Ok((client_stream, client_addr)) => {
                                 info!("New MongoDB connection from {}", client_addr);
 
-                                // Get original destination before creating the connection handler
-                                let original_dst = match get_original_dst(&client_stream) {
-                                    Some(addr) => {
-                                        info!("Original destination was: {}", addr);
-                                        addr
-                                    },
-                                    None => {
-                                        warn!("Could not get original destination for connection");
-                                        client_stream.local_addr().unwrap_or_else(|_| {
-                                            SocketAddr::new(
-                                                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                                                27017
-                                            )
-                                        })
-                                    }
-                                };
+                                // Clone the mappings for this connection
+                                let mappings = Arc::clone(&shared_mappings);
 
-                                // Clone the mappings data OUTSIDE the spawned task
-                                let mappings_clone = Arc::clone(&shared_mappings);
-                                let mappings_data = {
-                                    let guard = mappings_clone.lock().unwrap();
-                                    let cloned_data = guard.clone();
-                                    cloned_data
-                                };
-
-                                // Create a new Arc<Mutex<>> with the cloned data
-                                let task_mappings = Arc::new(Mutex::new(mappings_data));
-
-                                // Clone the necessary data before spawning the task
-                                let task_mappings_clone = Arc::clone(&task_mappings);
+                                // Spawn a new task to handle this connection
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_mongodb_connection(
                                         client_stream,
                                         client_addr,
-                                        task_mappings_clone,
-                                        original_dst, // Pass the original destination
+                                        mappings,
+                                        client_addr
                                     ).await {
                                         error!("Error handling MongoDB connection: {}", e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("Error accepting MongoDB connection: {}", e);
+                                error!("Failed to accept connection: {}", e);
+                                // Don't exit on accept errors, just continue
+                                continue;
                             }
                         }
                     }
-                    _ = timeout => {
-                        continue;
+                    _ = shutdown_rx.recv() => {
+                        info!("Received shutdown signal, stopping MongoDB proxy accept loop");
+                        break;
                     }
                 }
             }
         });
 
-        info!("MongoDB proxy listener stopped");
-
         // Wait for shutdown signal
-        if let Ok(_) = shutdown.changed().await {
-            if *shutdown.borrow() {
-                info!("Shutdown signal received, stopping MongoDB proxy");
-
-                // Signal the accept task to stop
-                let _ = shutdown_tx.send(()).await;
-
-                // Wait for the accept task to complete
-                let _ = tokio::time::timeout(Duration::from_secs(5), accept_task_handle).await;
+        match shutdown.changed().await {
+            Ok(_) => {
+                if *shutdown.borrow() {
+                    info!("Shutdown signal received, stopping MongoDB proxy");
+                    let _ = shutdown_tx.send(()).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), accept_task_handle).await;
+                }
             }
-        } else {
-            // Just await the task directly if shutdown channel is closed
-            let _ = accept_task_handle.await;
-            info!("MongoDB proxy accept task completed unexpectedly");
+            Err(e) => {
+                error!("Error waiting for shutdown signal: {}", e);
+            }
         }
 
         info!("MongoDB proxy service stopped");
