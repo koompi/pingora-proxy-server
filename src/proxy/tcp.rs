@@ -563,6 +563,15 @@ async fn resolve_mongodb_srv(
         .unwrap_or(domain)
         .to_lowercase();
 
+    // If domain contains specific patterns, skip SRV lookup
+    if clean_domain.contains("-mongodb-") || clean_domain.contains(".mongodb.koompi.cloud") {
+        info!(
+            "Skipping SRV lookup for direct MongoDB domain: {}",
+            clean_domain
+        );
+        return Ok(vec![(clean_domain, 27017)]);
+    }
+
     info!("Attempting SRV resolution for: {}", clean_domain);
 
     let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
@@ -578,21 +587,20 @@ async fn resolve_mongodb_srv(
                 })
                 .collect();
 
-            // Sort by priority and weight
-            endpoints.sort_by(|a, b| {
-                a.0.cmp(&b.0) // Simple sort for now, implement full SRV sorting later
-            });
-
             if endpoints.is_empty() {
                 info!("No SRV records found, using default port");
                 Ok(vec![(clean_domain, 27017)])
             } else {
                 info!("Resolved {} SRV records", endpoints.len());
+                endpoints.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(endpoints)
             }
         }
         Err(e) => {
-            info!("SRV lookup failed ({}), falling back to A/AAAA records", e);
+            info!(
+                "SRV lookup failed ({}), falling back to direct connection",
+                e
+            );
             Ok(vec![(clean_domain, 27017)])
         }
     }
