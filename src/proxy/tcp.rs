@@ -697,123 +697,61 @@ impl Clone for TcpProxyService {
     }
 }
 
-// Helper function to parse the MongoDB wire protocol and extract the hostname
+// Improve MongoDB protocol parsing
 fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
-    // This is a simplified parser for the MongoDB wire protocol
-    // In a real implementation, you would need to follow the MongoDB wire protocol specification
-
-    // MongoDB messages start with a header:
-    // messageLength (4 bytes) + requestID (4 bytes) + responseTo (4 bytes) + opCode (4 bytes)
-
-    // We need at least 16 bytes for the header
+    // MongoDB wire protocol header is 16 bytes
     if data.len() < 16 {
         return None;
     }
 
-    // isMaster command is typically used for handshakes
-    // Look for "isMaster" or "ismaster" strings in the payload
-    let payload = std::str::from_utf8(&data[16..]).ok()?;
+    // Convert the payload to string, ignoring invalid UTF-8
+    let payload = String::from_utf8_lossy(&data[16..]);
 
-    // Look for typical database connection strings or hostnames
-    // This is a simplified approach - a real implementation would properly parse BSON
+    // Common MongoDB connection string patterns
+    let patterns = [
+        "mongodb://",
+        "\"host\":",
+        "\"hostname\":",
+        "\"db\":",
+        "\"database\":",
+    ];
 
-    // Look for domain names that match our MongoDB patterns
-    let patterns = ["mongodb.koompi.cloud", "selendra.mongodb", ".mongodb."];
-
+    // First try to find standard MongoDB connection patterns
     for pattern in &patterns {
         if let Some(pos) = payload.find(pattern) {
-            // Find the start of the hostname (likely before the pattern)
-            let start_pos = payload[..pos]
-                .rfind(&[' ', '"', '\'', ':', ',', '{', '}', '[', ']'][..])
-                .unwrap_or(0);
+            let remaining = &payload[pos..];
+            // Look for domain patterns
+            if let Some(domain) = extract_domain_from_text(remaining) {
+                return Some(domain);
+            }
+        }
+    }
 
-            // Find the end of the hostname (likely after the pattern)
-            let end_pos = pos
+    // Fallback: Look for known domain patterns directly
+    extract_domain_from_text(&payload)
+}
+
+fn extract_domain_from_text(text: &str) -> Option<String> {
+    // Define domain patterns to match
+    let domain_patterns = [".mongodb.koompi.cloud", ".mongodb.", "-mongodb-"];
+
+    for pattern in &domain_patterns {
+        if let Some(pos) = text.find(pattern) {
+            // Look backwards for the start of the domain
+            let start = text[..pos]
+                .rfind(|c: char| !c.is_alphanumeric() && c != '-' && c != '.')
+                .map_or(0, |i| i + 1);
+
+            // Look forward for the end of the domain
+            let end = pos
                 + pattern.len()
-                + payload[pos + pattern.len()..]
-                    .find(&[' ', '"', '\'', ':', ',', '{', '}', '[', ']'][..])
-                    .unwrap_or(0);
+                + text[pos + pattern.len()..]
+                    .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '.')
+                    .unwrap_or(text[pos + pattern.len()..].len());
 
-            // Extract the hostname
-            let hostname = payload[start_pos..end_pos].trim_matches(|c| " \"':,{}[]".contains(c));
-
-            if !hostname.is_empty() {
-                return Some(hostname.to_string());
-            }
-        }
-    }
-
-    // Alternative approach: extract anything that looks like a domain name
-    let domain_regex =
-        regex::Regex::new(r"[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z0-9][-a-zA-Z0-9]*)+").ok()?;
-    if let Some(captures) = domain_regex.captures(payload) {
-        if let Some(domain) = captures.get(0) {
-            return Some(domain.as_str().to_string());
-        }
-    }
-
-    None
-}
-
-// Helper function to extract hostname from MongoDB message
-fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
-    // Try to read the message as a string
-    if let Ok(payload_str) = std::str::from_utf8(&buffer[16..]) {
-        // Look for MongoDB connection strings
-        let connection_patterns = ["mongodb://"];
-
-        for pattern in &connection_patterns {
-            if let Some(pos) = payload_str.find(pattern) {
-                // Find the auth separator (@)
-                if let Some(auth_pos) = payload_str[pos..].find('@') {
-                    // The hostname starts after the @ symbol
-                    let hostname_start = pos + auth_pos + 1;
-
-                    // Find the end of the hostname (next / or ? or whitespace)
-                    let mut hostname_end = payload_str.len();
-                    for end_char in &['/', '?', ' ', '"', '\''] {
-                        if let Some(end_pos) = payload_str[hostname_start..].find(*end_char) {
-                            let candidate_end = hostname_start + end_pos;
-                            if candidate_end < hostname_end {
-                                hostname_end = candidate_end;
-                            }
-                        }
-                    }
-
-                    if hostname_end > hostname_start {
-                        // Extract the hostname part
-                        let hostname = &payload_str[hostname_start..hostname_end];
-
-                        // Remove port if present
-                        if let Some(port_pos) = hostname.find(':') {
-                            return Some(hostname[0..port_pos].to_string());
-                        } else {
-                            return Some(hostname.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Alternatively, directly search for your specific domain patterns
-        let domain_patterns = [".selendra.mongodb.koompi.cloud"];
-
-        for pattern in &domain_patterns {
-            if let Some(pos) = payload_str.find(pattern) {
-                // Find the start of the hostname (look for alphanumeric/period/dash characters)
-                let mut start_pos = pos;
-                while start_pos > 0 {
-                    let prev_char = payload_str.as_bytes()[start_pos - 1] as char;
-                    if prev_char.is_alphanumeric() || prev_char == '.' || prev_char == '-' {
-                        start_pos -= 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Extract the hostname
-                let hostname = &payload_str[start_pos..(pos + pattern.len())];
-                return Some(hostname.to_string());
+            let domain = text[start..end].trim();
+            if !domain.is_empty() {
+                return Some(domain.to_string());
             }
         }
     }
@@ -821,173 +759,95 @@ fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
     None
 }
 
-// Extract hostname based on client's IP address and known mappings
-async fn extract_hostname_from_client_addr(
-    client_addr: &SocketAddr,
-    domain_mappings: &Arc<Mutex<HashMap<String, DatabaseMapping>>>,
-) -> Option<String> {
-    // Get the original destination address that the client was trying to connect to
-    if let Ok(sock) = TcpStream::connect(client_addr).await {
-        if let Ok(orig_dst) = sock.peer_addr() {
-            // Convert the original destination to a string and perform lookup
-            let lookup_result = tokio::net::lookup_host(orig_dst.to_string()).await;
-
-            if let Ok(hostnames) = lookup_result {
-                // Check if any of the hostnames match our mappings
-                let mappings = domain_mappings.lock().unwrap();
-                for addr in hostnames {
-                    let hostname = addr.to_string();
-                    if mappings.contains_key(&hostname) {
-                        return Some(hostname);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-// New function to handle MongoDB connections
 async fn handle_mongodb_connection(
     mut client_stream: TcpStream,
     client_addr: SocketAddr,
     domain_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
     original_dst: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(
-        "Handling MongoDB connection from {} (original destination: {})",
-        client_addr, original_dst
-    );
+    info!("New MongoDB connection from {}", client_addr);
 
-    // Log available mappings
-    {
+    // Print available mappings for debugging
+    let available_mappings = {
         let mappings = domain_mappings.lock().unwrap();
-        info!("Current MongoDB mappings:");
+        info!("Available MongoDB mappings:");
         for (domain, mapping) in mappings.iter() {
             info!(
                 "  {} -> {}:{}",
                 domain, mapping.target_host, mapping.target_port
             );
         }
-    }
+        mappings.clone()
+    };
 
-    // Read initial message length
+    // Read the initial MongoDB message
     let mut length_buffer = [0u8; 4];
-    match client_stream.read_exact(&mut length_buffer).await {
-        Ok(_) => {
-            info!("Successfully read initial MongoDB message length");
-        }
-        Err(e) => {
-            error!("Failed to read MongoDB message length: {}", e);
-            return Err(Box::new(e));
-        }
-    }
-
-    // Read the full message for hostname extraction
+    client_stream.read_exact(&mut length_buffer).await?;
     let message_length = u32::from_le_bytes(length_buffer) as usize;
+
+    // Validate message length
     if message_length < 4 || message_length > 1024 * 1024 {
         error!("Invalid MongoDB message length: {}", message_length);
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid MongoDB message length",
-        )));
+        return Err("Invalid message length".into());
     }
 
+    // Read the full message
     let mut buffer = vec![0u8; message_length];
     buffer[..4].copy_from_slice(&length_buffer);
+    client_stream.read_exact(&mut buffer[4..]).await?;
 
-    match client_stream.read_exact(&mut buffer[4..]).await {
-        Ok(_) => {
-            info!("Successfully read full MongoDB message");
-        }
-        Err(e) => {
-            error!("Failed to read full MongoDB message: {}", e);
-            return Err(Box::new(e));
-        }
-    }
+    // Try to extract hostname from the message
+    let hostname = parse_mongodb_hostname(&buffer).or_else(|| {
+        // Try to extract from original destination
+        Some(format!("{}.mongodb.koompi.cloud", original_dst.port()))
+    });
 
-    // Try to extract hostname
-    if let Some(hostname) = parse_mongodb_hostname(&buffer) {
-        info!("Extracted MongoDB hostname: {}", hostname);
+    info!("Extracted hostname: {:?}", hostname);
 
-        // Look up the backend mapping
-        let backend = {
-            let mappings = domain_mappings.lock().unwrap();
-            mappings.get(&hostname).cloned()
-        };
+    // Find the matching backend
+    let backend = if let Some(host) = hostname {
+        // Try exact match first
+        available_mappings.get(&host).cloned().or_else(|| {
+            // Try pattern matching if exact match fails
+            available_mappings
+                .iter()
+                .find(|(k, _)| host.contains(*k) || k.contains(&host))
+                .map(|(_, v)| v.clone())
+        })
+    } else {
+        // Fall back to first available mapping
+        available_mappings.values().next().cloned()
+    };
 
-        if let Some(mapping) = backend {
+    match backend {
+        Some(mapping) => {
             info!(
-                "Found backend mapping for {}: {}:{}",
-                hostname, mapping.target_host, mapping.target_port
+                "Routing MongoDB connection to backend: {}:{}",
+                mapping.target_host, mapping.target_port
             );
 
-            // Connect to backend
+            // Connect to the backend
             let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
             match TcpStream::connect(&backend_addr).await {
-                Ok(mut server_stream) => {
-                    // Forward the initial message
-                    if let Err(e) = server_stream.write_all(&buffer).await {
-                        error!("Failed to forward initial message to backend: {}", e);
-                        return Err(Box::new(e));
-                    }
+                Ok(server_stream) => {
+                    // Forward the initial message and start proxying
+                    server_stream.writable().await?;
+                    server_stream.try_write(&buffer)?;
 
-                    info!("Successfully connected to backend, starting proxy");
-                    return proxy_connection(client_stream, server_stream, mapping.stats).await;
+                    info!("Successfully connected to backend, starting bidirectional proxy");
+                    proxy_connection(client_stream, server_stream, mapping.stats).await
                 }
                 Err(e) => {
                     error!("Failed to connect to backend {}: {}", backend_addr, e);
-                    return Err(Box::new(e));
+                    Err(e.into())
                 }
             }
-        } else {
-            error!("No backend mapping found for hostname: {}", hostname);
         }
-    } else {
-        error!("Failed to extract hostname from MongoDB message");
-    }
-
-    // Fall back to default backend if available
-    let default_backend = {
-        let mappings = domain_mappings.lock().unwrap();
-        mappings.iter().next().map(|(_, m)| m.clone())
-    };
-
-    if let Some(mapping) = default_backend {
-        info!(
-            "Using default backend: {}:{}",
-            mapping.target_host, mapping.target_port
-        );
-
-        let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
-        match TcpStream::connect(&backend_addr).await {
-            Ok(mut server_stream) => {
-                if let Err(e) = server_stream.write_all(&buffer).await {
-                    error!(
-                        "Failed to forward initial message to default backend: {}",
-                        e
-                    );
-                    return Err(Box::new(e));
-                }
-
-                info!("Successfully connected to default backend, starting proxy");
-                return proxy_connection(client_stream, server_stream, mapping.stats).await;
-            }
-            Err(e) => {
-                error!(
-                    "Failed to connect to default backend {}: {}",
-                    backend_addr, e
-                );
-                return Err(Box::new(e));
-            }
+        None => {
+            error!("No suitable backend found for MongoDB connection");
+            Err("No suitable backend found".into())
         }
     }
-
-    error!("No available MongoDB backends");
-    Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "No available MongoDB backends",
-    )))
 }
 
 async fn check_mongodb_health(target: &str) -> bool {
