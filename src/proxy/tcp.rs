@@ -769,6 +769,14 @@ fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
 fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
     // First approach: Look for the "host" field in the isMaster command
     if let Ok(payload_str) = std::str::from_utf8(&buffer[16..]) {
+        info!(
+            "MongoDB message payload (first 200 chars): {}",
+            if payload_str.len() > 200 {
+                &payload_str[..200]
+            } else {
+                payload_str
+            }
+        );
         // Look for MongoDB connection string patterns
         let connection_string_patterns = ["mongodb://", "mongodb+srv://"];
 
