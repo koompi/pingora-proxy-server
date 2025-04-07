@@ -780,7 +780,7 @@ async fn handle_mongodb_connection(
         mappings.clone()
     };
 
-    // Read the initial MongoDB message
+    // Read and parse the MongoDB message
     let mut length_buffer = [0u8; 4];
     client_stream.read_exact(&mut length_buffer).await?;
     let message_length = u32::from_le_bytes(length_buffer) as usize;
@@ -797,26 +797,27 @@ async fn handle_mongodb_connection(
     client_stream.read_exact(&mut buffer[4..]).await?;
 
     // Try to extract hostname from the message
-    let hostname = parse_mongodb_hostname(&buffer).or_else(|| {
-        // Try to extract from original destination
-        Some(format!("{}.mongodb.koompi.cloud", original_dst.port()))
-    });
+    let hostname = parse_mongodb_hostname(&buffer);
 
-    info!("Extracted hostname: {:?}", hostname);
+    info!("Extracted hostname from message: {:?}", hostname);
 
-    // Find the matching backend
-    let backend = if let Some(host) = hostname {
-        // Try exact match first
-        available_mappings.get(&host).cloned().or_else(|| {
-            // Try pattern matching if exact match fails
-            available_mappings
-                .iter()
-                .find(|(k, _)| host.contains(*k) || k.contains(&host))
-                .map(|(_, v)| v.clone())
-        })
-    } else {
-        // Fall back to first available mapping
-        available_mappings.values().next().cloned()
+    // If we couldn't extract a hostname, use the first available backend
+    let backend = match hostname {
+        Some(host) => {
+            // Try exact match first
+            available_mappings.get(&host).cloned().or_else(|| {
+                // Try pattern matching if exact match fails
+                available_mappings
+                    .iter()
+                    .find(|(k, _)| host.contains(&**k) || k.contains(&host))
+                    .map(|(_, v)| v.clone())
+            })
+        }
+        None => {
+            // If no hostname found, use the first available mapping
+            info!("No hostname found in message, using first available backend");
+            available_mappings.values().next().cloned()
+        }
     };
 
     match backend {
@@ -844,8 +845,35 @@ async fn handle_mongodb_connection(
             }
         }
         None => {
-            error!("No suitable backend found for MongoDB connection");
-            Err("No suitable backend found".into())
+            // If no backend found, use the first available one as fallback
+            if let Some(first_mapping) = available_mappings.values().next().cloned() {
+                info!(
+                    "No matching backend found, using default backend: {}:{}",
+                    first_mapping.target_host, first_mapping.target_port
+                );
+
+                let backend_addr = format!(
+                    "{}:{}",
+                    first_mapping.target_host, first_mapping.target_port
+                );
+                match TcpStream::connect(&backend_addr).await {
+                    Ok(server_stream) => {
+                        server_stream.writable().await?;
+                        server_stream.try_write(&buffer)?;
+                        proxy_connection(client_stream, server_stream, first_mapping.stats).await
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to connect to default backend {}: {}",
+                            backend_addr, e
+                        );
+                        Err(e.into())
+                    }
+                }
+            } else {
+                error!("No available backends found");
+                Err("No available backends".into())
+            }
         }
     }
 }
