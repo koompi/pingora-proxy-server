@@ -554,34 +554,46 @@ impl MongoHeader {
 async fn resolve_mongodb_srv(
     domain: &str,
 ) -> Result<Vec<(String, u16)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a new resolver
+    // Clean up domain string
+    let clean_domain = domain
+        .trim_start_matches("mongodb+srv://")
+        .trim_start_matches("mongodb://")
+        .splitn(2, ['@', '/', '?'])
+        .next()
+        .unwrap_or(domain)
+        .to_lowercase();
+
+    info!("Attempting SRV resolution for: {}", clean_domain);
+
     let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
+    let srv_name = format!("_mongodb._tcp.{}", clean_domain);
 
-    // Construct SRV query name: _mongodb._tcp.{domain}
-    let srv_name = format!("_mongodb._tcp.{}", domain);
-
-    // Lookup SRV records
     match resolver.srv_lookup(srv_name).await {
         Ok(srv_records) => {
-            let mut endpoints = Vec::new();
+            let mut endpoints: Vec<_> = srv_records
+                .iter()
+                .map(|srv| {
+                    let target = srv.target().to_string().trim_end_matches('.').to_string();
+                    (target, srv.port())
+                })
+                .collect();
 
-            for srv in srv_records.iter() {
-                endpoints.push((
-                    srv.target().to_string().trim_end_matches('.').to_string(),
-                    srv.port(),
-                ));
-            }
+            // Sort by priority and weight
+            endpoints.sort_by(|a, b| {
+                a.0.cmp(&b.0) // Simple sort for now, implement full SRV sorting later
+            });
 
             if endpoints.is_empty() {
-                // Fallback to direct connection if no SRV records
-                endpoints.push((domain.to_string(), 27017));
+                info!("No SRV records found, using default port");
+                Ok(vec![(clean_domain, 27017)])
+            } else {
+                info!("Resolved {} SRV records", endpoints.len());
+                Ok(endpoints)
             }
-
-            Ok(endpoints)
         }
-        Err(_) => {
-            // Fallback to direct connection if SRV lookup fails
-            Ok(vec![(domain.to_string(), 27017)])
+        Err(e) => {
+            info!("SRV lookup failed ({}), falling back to A/AAAA records", e);
+            Ok(vec![(clean_domain, 27017)])
         }
     }
 }
@@ -617,13 +629,17 @@ async fn handle_mongodb_connection(
 
     // Extract database information and find backend
     // IMPORTANT: Clone all needed data out of the MutexGuard before any await
+    // Extract database information and find backend
     let (backend, mapping) = {
-        // Scope the mutex guard so it's dropped before await points
         let mappings = db_mappings.lock().unwrap();
 
-        // Try to extract database name from connection string or command
         if let Some(db_info) = extract_database_info(&buffer[16..], header.op_code) {
             info!("Detected database info: {}", db_info);
+
+            // Detect SRV connections
+            let is_srv_connection = db_info.contains("+srv")
+                || db_info.contains("-mongodb-")
+                || db_info.contains(".mongodb.");
 
             // First try exact domain pattern match
             if let Some((host, port, idx)) = find_backend_for_database(&db_info, &mappings) {
@@ -686,19 +702,27 @@ async fn handle_mongodb_connection(
         Some((host, port, needs_srv_lookup)) => {
             // Perform SRV lookup if needed (now that we're outside the MutexGuard scope)
             let (resolved_host, resolved_port) = if needs_srv_lookup {
+                info!("Performing SRV lookup for {}", host);
                 match resolve_mongodb_srv(&host).await {
-                    Ok(endpoints) if !endpoints.is_empty() => {
-                        let (resolved_host, resolved_port) = &endpoints[0];
-                        info!(
-                            "Resolved MongoDB SRV record: {} -> {}:{}",
-                            host, resolved_host, resolved_port
-                        );
-                        (resolved_host.clone(), *resolved_port)
+                    Ok(mut endpoints) => {
+                        // Rotate DNS results for basic load balancing
+                        if endpoints.len() > 1 {
+                            endpoints.rotate_left(1);
+                        }
+                        let (h, p) = endpoints
+                            .first()
+                            .map(|e| (e.0.clone(), e.1))
+                            .unwrap_or_else(|| (host.clone(), port));
+                        info!("Resolved MongoDB SRV record: {} -> {}:{}", host, h, p);
+                        (h, p)
                     }
-                    _ => (host, port),
+                    Err(e) => {
+                        warn!("SRV lookup failed ({}), using direct connection", e);
+                        (host.clone(), port)
+                    }
                 }
             } else {
-                (host, port)
+                (host.clone(), port)
             };
 
             info!(
@@ -752,7 +776,8 @@ async fn handle_mongodb_connection(
 }
 
 fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
-    match op_code {
+    // First try standard protocol parsing
+    let from_protocol = match op_code {
         2004 => {
             // OP_QUERY
             if payload.len() < 8 {
@@ -772,9 +797,15 @@ fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
                 if let Ok(collection) = std::str::from_utf8(&payload[offset..end]) {
                     // Collection names are in format: dbname.collectionname
                     if let Some(dot_pos) = collection.find('.') {
-                        return Some(collection[0..dot_pos].to_string());
+                        Some(collection[0..dot_pos].to_string())
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
         }
         2013 => {
@@ -794,8 +825,48 @@ fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
                     }
                 }
             }
+            None
         }
-        _ => {}
+        _ => None,
+    };
+
+    if from_protocol.is_some() {
+        return from_protocol;
+    }
+
+    // Fallback to string-based parsing
+    if let Ok(payload_str) = std::str::from_utf8(payload) {
+        // Check for connection strings
+        let patterns = [
+            "mongodb+srv://",
+            "mongodb://",
+            ".mongodb.koompi.cloud",
+            "-mongodb-",
+        ];
+
+        for pattern in patterns {
+            if let Some(pos) = payload_str.find(pattern) {
+                let start = pos;
+                let end = payload_str[start..]
+                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                    .map(|e| start + e)
+                    .unwrap_or_else(|| payload_str.len());
+
+                let mut extracted = &payload_str[start..end];
+
+                // Clean up connection strings
+                if extracted.starts_with("mongodb") {
+                    extracted = extracted
+                        .trim_start_matches("mongodb+srv://")
+                        .trim_start_matches("mongodb://")
+                        .splitn(2, ['@', '/', '?'])
+                        .next()
+                        .unwrap_or(extracted);
+                }
+
+                return Some(extracted.to_string());
+            }
+        }
     }
 
     None
