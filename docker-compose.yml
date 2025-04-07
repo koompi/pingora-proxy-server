@@ -62,7 +62,7 @@ services:
 
     deploy:
       mode: replicated
-      replicas: 1
+      replicas: 4
       update_config:
         parallelism: 1
         delay: 10s
@@ -75,8 +75,7 @@ services:
       placement:
         # max_replicas_per_node: 1
         constraints:
-          # - node.role == manager
-          - node.hostname == selendra-01
+          - node.role == manager
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
