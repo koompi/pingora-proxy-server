@@ -704,40 +704,55 @@ fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    // Convert the payload to string, ignoring invalid UTF-8
-    let payload = String::from_utf8_lossy(&data[16..]);
+    // First try to parse the standard MongoDB wire protocol
+    let message_length = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let op_code = u32::from_le_bytes(data[12..16].try_into().unwrap());
 
-    // Common MongoDB connection string patterns
-    let patterns = [
-        "mongodb://",
-        "\"host\":",
-        "\"hostname\":",
-        "\"db\":",
-        "\"database\":",
-    ];
+    // OpCode 2004 is OP_QUERY, 2013 is OP_MSG (MongoDB 3.6+)
+    if (op_code == 2004 || op_code == 2013) && data.len() >= message_length {
+        // Convert the payload to string, ignoring invalid UTF-8
+        let payload = String::from_utf8_lossy(&data[16..message_length]);
 
-    // First try to find standard MongoDB connection patterns
-    for pattern in &patterns {
-        if let Some(pos) = payload.find(pattern) {
-            let remaining = &payload[pos..];
-            // Look for domain patterns
-            if let Some(domain) = extract_domain_from_text(remaining) {
-                return Some(domain);
+        // Look for connection string patterns
+        let patterns = [
+            ("isMaster", 20),   // MongoDB handshake
+            ("ismaster", 20),   // Older MongoDB versions
+            ("hello", 20),      // MongoDB 5.0+
+            ("mongodb://", 50), // Connection string
+            ("\"host\":", 100),
+            ("\"hostname\":", 100),
+            ("\"db\":", 50),
+            ("\"database\":", 50),
+        ];
+
+        for (pattern, context_length) in &patterns {
+            if let Some(pos) = payload.find(pattern) {
+                // Get surrounding context
+                let start = pos.saturating_sub(*context_length);
+                let end = (pos + pattern.len() + *context_length).min(payload.len());
+                let context = &payload[start..end];
+
+                // Look for domain patterns
+                if let Some(domain) = extract_domain_from_text(context) {
+                    return Some(domain);
+                }
             }
         }
+
+        // Fallback: scan the entire payload for domain patterns
+        return extract_domain_from_text(&payload);
     }
 
-    // Fallback: Look for known domain patterns directly
-    extract_domain_from_text(&payload)
+    None
 }
 
 fn extract_domain_from_text(text: &str) -> Option<String> {
-    // Define domain patterns to match
-    let domain_patterns = [".mongodb.koompi.cloud", ".mongodb.", "-mongodb-"];
+    // Define domain patterns to match, ordered by specificity
+    let domain_patterns = [".mongodb.koompi.cloud", "-mongodb-", ".mongodb."];
 
     for pattern in &domain_patterns {
         if let Some(pos) = text.find(pattern) {
-            // Look backwards for the start of the domain
+            // Look backwards for the start of the domain (including service names)
             let start = text[..pos]
                 .rfind(|c: char| !c.is_alphanumeric() && c != '-' && c != '.')
                 .map_or(0, |i| i + 1);
@@ -751,6 +766,11 @@ fn extract_domain_from_text(text: &str) -> Option<String> {
 
             let domain = text[start..end].trim();
             if !domain.is_empty() {
+                // Add debug logging
+                info!(
+                    "Found domain pattern '{}' in text, extracted domain: {}",
+                    pattern, domain
+                );
                 return Some(domain.to_string());
             }
         }
