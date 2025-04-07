@@ -19,12 +19,17 @@ services:
       - "443:443"
       - "81:81"
       - "9100:9100"
-      - "27017:27017" # MongoDB
+      - target: 27017
+        published: 27017
+        protocol: tcp
+        mode: host
       - "5432:5432" # PostgreSQL
       - "3306:3306" # MySQL/MariaDB
       # - "6379:6379" # Redis
     networks:
-      - proxy-network
+      proxy-network:
+        aliases:
+          - proxy-tcp
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/gluster/certbot:/certbot:rw
@@ -62,11 +67,15 @@ services:
       # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
       - ENABLE_TCP_PROXY=true
-      - TCP_PROXY_TLS=false
+      - TCP_PROXY_PORTS=27017
+      - TCP_PROXY_MODE=direct
 
     deploy:
-      mode: replicated
-      replicas: 4
+      mode: global # Change to global for TCP proxy
+      placement:
+        constraints:
+          - node.role == manager
+      endpoint_mode: dnsrr # Use DNS round-robin for TCP
       update_config:
         parallelism: 1
         delay: 10s
@@ -75,11 +84,6 @@ services:
       restart_policy:
         condition: any
         delay: 5s
-      endpoint_mode: vip
-      placement:
-        # max_replicas_per_node: 1
-        constraints:
-          - node.role == manager
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
