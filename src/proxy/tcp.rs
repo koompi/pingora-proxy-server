@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 use crate::config::model::ConfigStore;
+use byteorder::{ByteOrder, LittleEndian};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -517,6 +518,30 @@ async fn mongodb_accept_loop(
     );
 }
 
+// Add these new structs for MongoDB protocol handling
+#[derive(Debug)]
+struct MongoHeader {
+    message_length: i32,
+    request_id: i32,
+    response_to: i32,
+    op_code: i32,
+}
+
+impl MongoHeader {
+    fn from_bytes(buffer: &[u8]) -> Option<Self> {
+        if buffer.len() < 16 {
+            return None;
+        }
+
+        Some(MongoHeader {
+            message_length: LittleEndian::read_i32(&buffer[0..4]),
+            request_id: LittleEndian::read_i32(&buffer[4..8]),
+            response_to: LittleEndian::read_i32(&buffer[8..12]),
+            op_code: LittleEndian::read_i32(&buffer[12..16]),
+        })
+    }
+}
+
 // Handle a MongoDB connection
 async fn handle_mongodb_connection(
     mut client_stream: TcpStream,
@@ -532,29 +557,57 @@ async fn handle_mongodb_connection(
     };
     buffer.truncate(n);
 
-    let data_string = String::from_utf8_lossy(&buffer);
-    let preview = if data_string.len() > 200 {
-        &data_string[..200]
-    } else {
-        &data_string
-    };
-    info!("Analyzing connection data (first 200 chars): {}", preview);
+    // Parse MongoDB wire protocol header
+    let header = MongoHeader::from_bytes(&buffer).ok_or("Invalid MongoDB protocol header")?;
 
-    // Find backend using pattern matching first, then IP-based routing
+    info!(
+        "MongoDB message: length={}, opCode={}, reqID={}",
+        header.message_length, header.op_code, header.request_id
+    );
+
+    // Extract database information from the message
     let (backend, mapping) = {
         let mappings = db_mappings.lock().unwrap();
 
-        if let Some(backend) = find_matching_backend(&data_string, &mappings) {
-            (Some(backend), None)
+        if let Some(db_info) = extract_database_info(&buffer[16..], header.op_code) {
+            info!("Detected database info: {}", db_info);
+
+            // Try to find matching backend based on database info
+            if let Some((host, port, idx)) = find_backend_for_database(&db_info, &mappings) {
+                info!(
+                    "Found matching backend for database '{}': {}:{}",
+                    db_info, host, port
+                );
+
+                // Increment active connections counter
+                if let Some(mapping) = mappings.get(idx) {
+                    mapping.active_connections.fetch_add(1, Ordering::SeqCst);
+                    (Some((host, port)), Some(mapping.clone()))
+                } else {
+                    (Some((host, port)), None)
+                }
+            } else {
+                // Fall back to IP-based routing
+                match route_by_client_ip(&client_addr, &mappings) {
+                    Some((host, port, idx)) => {
+                        info!(
+                            "Using IP-based routing for client {} -> {}:{}",
+                            client_addr, host, port
+                        );
+                        if let Some(mapping) = mappings.get(idx) {
+                            mapping.active_connections.fetch_add(1, Ordering::SeqCst);
+                            (Some((host, port)), Some(mapping.clone()))
+                        } else {
+                            (Some((host, port)), None)
+                        }
+                    }
+                    None => (None, None),
+                }
+            }
         } else {
+            // Fall back to IP-based routing if we can't extract database info
             match route_by_client_ip(&client_addr, &mappings) {
                 Some((host, port, idx)) => {
-                    info!(
-                        "Using IP-based routing for client {} -> {}:{}",
-                        client_addr, host, port
-                    );
-
-                    // Increment active connections counter
                     if let Some(mapping) = mappings.get(idx) {
                         mapping.active_connections.fetch_add(1, Ordering::SeqCst);
                         (Some((host, port)), Some(mapping.clone()))
@@ -608,22 +661,83 @@ async fn handle_mongodb_connection(
                 "No backend found for MongoDB connection from {}",
                 client_addr
             );
-            if let Ok(mappings) = db_mappings.lock() {
-                info!("Available backends ({}):", mappings.len());
-                for (i, mapping) in mappings.iter().enumerate() {
-                    info!(
-                        "  [{}] Pattern '{}' -> {}:{} (active: {})",
-                        i,
-                        mapping.domain_pattern,
-                        mapping.target_host,
-                        mapping.target_port,
-                        mapping.active_connections.load(Ordering::SeqCst)
-                    );
-                }
-            }
             Err("No matching backend found".into())
         }
     }
+}
+
+fn extract_database_info(payload: &[u8], op_code: i32) -> Option<String> {
+    match op_code {
+        2004 => {
+            // OP_QUERY
+            if payload.len() < 8 {
+                return None;
+            }
+
+            // Skip flags (4 bytes)
+            let mut offset = 4;
+
+            // Find null-terminated collection name
+            let mut end = offset;
+            while end < payload.len() && payload[end] != 0 {
+                end += 1;
+            }
+
+            if end > offset {
+                if let Ok(collection) = std::str::from_utf8(&payload[offset..end]) {
+                    // Collection names are in format: dbname.collectionname
+                    if let Some(dot_pos) = collection.find('.') {
+                        return Some(collection[0..dot_pos].to_string());
+                    }
+                }
+            }
+        }
+        2013 => {
+            // OP_MSG (MongoDB 3.6+)
+            if payload.len() < 4 {
+                return None;
+            }
+
+            let data = String::from_utf8_lossy(payload);
+
+            // Common patterns for database identification
+            for pattern in &["\"$db\":\"", "$db: \"", "db: \"", "\"db\":\""] {
+                if let Some(pos) = data.find(pattern) {
+                    let start = pos + pattern.len();
+                    if let Some(end) = data[start..].find('"') {
+                        return Some(data[start..(start + end)].to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+fn find_backend_for_database(
+    db_info: &str,
+    mappings: &[DatabaseMapping],
+) -> Option<(String, u16, usize)> {
+    // First try exact pattern matching
+    for (idx, mapping) in mappings.iter().enumerate() {
+        if db_info.contains(&mapping.domain_pattern) {
+            return Some((mapping.target_host.clone(), mapping.target_port, idx));
+        }
+    }
+
+    // Try to extract tenant ID from database name
+    let tenant_id = db_info.split(['-', '_', '.']).next()?;
+
+    // Look for matching backend using tenant ID
+    for (idx, mapping) in mappings.iter().enumerate() {
+        if mapping.domain_pattern.contains(tenant_id) {
+            return Some((mapping.target_host.clone(), mapping.target_port, idx));
+        }
+    }
+
+    None
 }
 
 // Helper function to proxy data bidirectionally
