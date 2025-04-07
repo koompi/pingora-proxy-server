@@ -68,11 +68,16 @@ struct ConnectionStats {
 // Database host mapping
 #[derive(Clone)]
 struct DatabaseMapping {
-    public_port: u16,
-    target_host: String,
-    target_port: u16,
-    db_type: DatabaseType,
+    domain_pattern: String, // e.g., "riverbase-mongodb"
+    target_host: String,    // Docker service DNS name
+    target_port: u16,       // Always 27017 for MongoDB
     stats: Arc<Mutex<ConnectionStats>>,
+}
+
+impl DatabaseMapping {
+    fn matches_domain(&self, domain: &str) -> bool {
+        domain.contains(&self.domain_pattern)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
@@ -306,10 +311,9 @@ impl TcpProxyService {
                         db_mappings.insert(
                             domain.clone(),
                             DatabaseMapping {
-                                public_port: 27017, // All MongoDB instances use the same port
+                                domain_pattern: domain.clone(),
                                 target_host,
                                 target_port,
-                                db_type,
                                 stats: Arc::new(Mutex::new(ConnectionStats::default())),
                             },
                         );
@@ -821,71 +825,32 @@ async fn handle_mongodb_connection(
     mut client_stream: TcpStream,
     client_addr: SocketAddr,
     domain_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
-    original_dst: SocketAddr,
+    _original_dst: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("New MongoDB connection from {}", client_addr);
+    // Read initial data
+    let mut buffer = vec![0u8; 4096];
+    let n = client_stream.read(&mut buffer).await?;
+    buffer.truncate(n);
 
-    // Print available mappings for debugging
-    let available_mappings = {
-        let mappings = domain_mappings.lock().unwrap();
-        info!("Available MongoDB mappings:");
-        for (domain, mapping) in mappings.iter() {
-            info!(
-                "  {} -> {}:{}",
-                domain, mapping.target_host, mapping.target_port
-            );
+    // Extract hostname from connection data
+    let hostname = parse_mongodb_hostname(&buffer).or_else(|| {
+        // Fallback: try to find domain pattern in raw data
+        let text = String::from_utf8_lossy(&buffer);
+        if let Some(pos) = text.find(".mongodb.koompi.cloud") {
+            let start = pos.saturating_sub(50);
+            let context = &text[start..pos];
+            Some(context.to_string())
+        } else {
+            None
         }
-        mappings.clone()
-    };
+    });
 
-    // Read and parse the MongoDB message
-    let mut length_buffer = [0u8; 4];
-    client_stream.read_exact(&mut length_buffer).await?;
-    let message_length = u32::from_le_bytes(length_buffer) as usize;
-
-    // Validate message length
-    if message_length < 4 || message_length > 1024 * 1024 {
-        error!("Invalid MongoDB message length: {}", message_length);
-        return Err("Invalid message length".into());
-    }
-
-    // Read the full message
-    let mut buffer = vec![0u8; message_length];
-    buffer[..4].copy_from_slice(&length_buffer);
-    client_stream.read_exact(&mut buffer[4..]).await?;
-
-    // Try to extract hostname from the message
-    let hostname = parse_mongodb_hostname(&buffer);
-
-    info!("Extracted hostname from message: {:?}", hostname);
-
-    // If we couldn't extract a hostname, try to use original destination
     let backend = match hostname {
         Some(host) => {
-            // Try exact match first
-            available_mappings.get(&host).cloned().or_else(|| {
-                // Try pattern matching if exact match fails
-                available_mappings
-                    .iter()
-                    .find(|(k, _)| host.contains(&**k) || k.contains(&host))
-                    .map(|(_, v)| v.clone())
-            })
+            let mappings = domain_mappings.lock().unwrap();
+            mappings.values().find(|m| m.matches_domain(&host)).cloned()
         }
-        None => {
-            // Try to use original destination information
-            info!("No hostname found in message, checking original destination");
-            if let Some(original_addr) = get_original_dst(&client_stream) {
-                info!("Original destination was: {}", original_addr);
-                // Find mapping that matches the original destination port
-                available_mappings
-                    .values()
-                    .find(|m| m.public_port == original_addr.port())
-                    .cloned()
-            } else {
-                info!("No original destination found, using first available backend");
-                available_mappings.values().next().cloned()
-            }
-        }
+        None => None,
     };
 
     match backend {
@@ -895,40 +860,20 @@ async fn handle_mongodb_connection(
                 mapping.target_host, mapping.target_port
             );
 
-            // Try DNS resolution first
-            let backend_addrs =
-                tokio::net::lookup_host(format!("{}:{}", mapping.target_host, mapping.target_port))
+            let server_stream =
+                TcpStream::connect(format!("{}:{}", mapping.target_host, mapping.target_port))
                     .await?;
 
-            // Try each resolved address
-            for addr in backend_addrs {
-                match TcpStream::connect(addr).await {
-                    Ok(server_stream) => {
-                        server_stream.writable().await?;
-                        server_stream.try_write(&buffer)?;
+            // Send initial data
+            server_stream.writable().await?;
+            server_stream.try_write(&buffer)?;
 
-                        info!("Successfully connected to backend {}", addr);
-                        return proxy_connection(client_stream, server_stream, mapping.stats).await;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to connect to backend {} ({}): {}",
-                            mapping.target_host, addr, e
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            error!(
-                "Failed to connect to any resolved addresses for {}",
-                mapping.target_host
-            );
-            Err("Failed to connect to any backend addresses".into())
+            // Proxy the connection
+            proxy_connection(client_stream, server_stream, mapping.stats).await
         }
         None => {
-            error!("No available backends found");
-            Err("No available backends".into())
+            error!("No backend found for connection");
+            Err("No matching backend found".into())
         }
     }
 }
