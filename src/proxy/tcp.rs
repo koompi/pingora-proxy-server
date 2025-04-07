@@ -15,7 +15,9 @@ use tokio::time::Duration;
 use crate::config::model::ConfigStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
 
 // Database type enum
@@ -72,6 +74,7 @@ pub struct DatabaseMapping {
     pub target_host: String,    // Docker service DNS name
     pub target_port: u16,       // Always 27017 for MongoDB
     pub stats: Arc<Mutex<ConnectionStats>>,
+    pub active_connections: Arc<AtomicUsize>, // New field
 }
 
 impl DatabaseMapping {
@@ -311,6 +314,7 @@ impl TcpProxyService {
                         target_host,
                         target_port,
                         stats: Arc::new(Mutex::new(ConnectionStats::default())),
+                        active_connections: Arc::new(AtomicUsize::new(0)),
                     });
                 }
             }
@@ -427,12 +431,34 @@ impl Clone for TcpProxyService {
     }
 }
 
-// Main accept loop for MongoDB connections
+// Main accept loop for MongoDB connections with better connection tracking
 async fn mongodb_accept_loop(
     listener: TcpListener,
     db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
+    // Set up a counter for connection management
+    let connection_count = Arc::new(AtomicUsize::new(0));
+
+    // Let people know we're ready to receive MongoDB connections
+    info!("MongoDB proxy is ready to accept connections on port 27017");
+
+    // Initialize MongoDB connection mappings
+    {
+        let mappings = db_mappings.lock().unwrap();
+        if !mappings.is_empty() {
+            info!("Available MongoDB backends:");
+            for (i, mapping) in mappings.iter().enumerate() {
+                info!(
+                    "  [{}] Pattern '{}' -> {}:{}",
+                    i, mapping.domain_pattern, mapping.target_host, mapping.target_port
+                );
+            }
+        } else {
+            warn!("No MongoDB backends are configured. Connections will fail.");
+        }
+    }
+
     loop {
         // Accept new connections with timeout to check for shutdown
         let accept_future = listener.accept();
@@ -442,20 +468,29 @@ async fn mongodb_accept_loop(
             accept_result = accept_future => {
                 match accept_result {
                     Ok((client_stream, client_addr)) => {
-                        info!("New MongoDB connection from {}", client_addr);
+                        let count = connection_count.fetch_add(1, Ordering::SeqCst);
+                        info!("New MongoDB connection #{} from {}", count, client_addr);
 
                         // Clone the mappings for this connection
                         let mappings = Arc::clone(&db_mappings);
+                        let conn_count = Arc::clone(&connection_count);
 
                         // Spawn a new task to handle this connection
                         tokio::spawn(async move {
-                            if let Err(e) = handle_mongodb_connection(
+                            let result = handle_mongodb_connection(
                                 client_stream,
                                 client_addr,
                                 mappings,
-                            ).await {
-                                error!("Error handling MongoDB connection: {}", e);
+                            ).await;
+
+                            if let Err(e) = result {
+                                error!("Error handling MongoDB connection #{}: {}", count, e);
+                            } else {
+                                info!("Successfully closed MongoDB connection #{}", count);
                             }
+
+                            // Decrement active connection count
+                            conn_count.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
                     Err(e) => {
@@ -475,6 +510,11 @@ async fn mongodb_accept_loop(
             }
         }
     }
+
+    info!(
+        "MongoDB accept loop stopped. Current connections: {}",
+        connection_count.load(Ordering::SeqCst)
+    );
 }
 
 // Handle a MongoDB connection
@@ -486,22 +526,13 @@ async fn handle_mongodb_connection(
     // Read initial data from client
     let mut buffer = vec![0u8; 8192];
     let n = match client_stream.read(&mut buffer).await {
-        Ok(n) => {
-            if n == 0 {
-                return Err("Client closed connection immediately".into());
-            }
-            n
-        }
-        Err(e) => {
-            return Err(format!("Failed to read from client: {}", e).into());
-        }
+        Ok(n) if n == 0 => return Err("Client closed connection immediately".into()),
+        Ok(n) => n,
+        Err(e) => return Err(format!("Failed to read from client: {}", e).into()),
     };
     buffer.truncate(n);
 
-    // Convert to string for pattern matching
     let data_string = String::from_utf8_lossy(&buffer);
-
-    // Log the first 200 chars for debugging
     let preview = if data_string.len() > 200 {
         &data_string[..200]
     } else {
@@ -509,52 +540,87 @@ async fn handle_mongodb_connection(
     };
     info!("Analyzing connection data (first 200 chars): {}", preview);
 
-    // Find the backend by checking all patterns
-    let backend = {
+    // Find backend using pattern matching first, then IP-based routing
+    let (backend, mapping) = {
         let mappings = db_mappings.lock().unwrap();
-        find_matching_backend(&data_string, &mappings)
+
+        if let Some(backend) = find_matching_backend(&data_string, &mappings) {
+            (Some(backend), None)
+        } else {
+            match route_by_client_ip(&client_addr, &mappings) {
+                Some((host, port, idx)) => {
+                    info!(
+                        "Using IP-based routing for client {} -> {}:{}",
+                        client_addr, host, port
+                    );
+
+                    // Increment active connections counter
+                    if let Some(mapping) = mappings.get(idx) {
+                        mapping.active_connections.fetch_add(1, Ordering::SeqCst);
+                        (Some((host, port)), Some(mapping.clone()))
+                    } else {
+                        (Some((host, port)), None)
+                    }
+                }
+                None => (None, None),
+            }
+        }
     };
 
     match backend {
         Some((host, port)) => {
-            info!("Found matching backend: {}:{}", host, port);
+            info!(
+                "Routing MongoDB connection from {} to {}:{}",
+                client_addr, host, port
+            );
 
-            // Connect to the backend
             match TcpStream::connect(format!("{}:{}", host, port)).await {
                 Ok(mut server_stream) => {
-                    // Forward the initial data
                     if let Err(e) = server_stream.write_all(&buffer).await {
+                        // Decrease connection count on error
+                        if let Some(m) = &mapping {
+                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        }
                         return Err(format!("Failed to write to server: {}", e).into());
                     }
 
-                    // Now proxy data in both directions
-                    proxy_bidirectional(client_stream, server_stream).await?;
-                    Ok(())
+                    let result = proxy_bidirectional(client_stream, server_stream).await;
+
+                    // Decrease connection count after proxy ends
+                    if let Some(m) = &mapping {
+                        m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                    }
+
+                    result
                 }
                 Err(e) => {
+                    // Decrease connection count on error
+                    if let Some(m) = &mapping {
+                        m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                    }
                     error!("Failed to connect to backend {}:{}: {}", host, port, e);
                     Err(format!("Failed to connect to backend: {}", e).into())
                 }
             }
         }
         None => {
-            error!("No backend found for MongoDB connection");
-
-            // Enhanced debugging: Log available backends
+            error!(
+                "No backend found for MongoDB connection from {}",
+                client_addr
+            );
             if let Ok(mappings) = db_mappings.lock() {
-                if !mappings.is_empty() {
-                    info!("Available backends ({}):", mappings.len());
-                    for (i, mapping) in mappings.iter().enumerate() {
-                        info!(
-                            "  [{}] Pattern '{}' -> {}:{}",
-                            i, mapping.domain_pattern, mapping.target_host, mapping.target_port
-                        );
-                    }
-                } else {
-                    info!("No MongoDB backends configured");
+                info!("Available backends ({}):", mappings.len());
+                for (i, mapping) in mappings.iter().enumerate() {
+                    info!(
+                        "  [{}] Pattern '{}' -> {}:{} (active: {})",
+                        i,
+                        mapping.domain_pattern,
+                        mapping.target_host,
+                        mapping.target_port,
+                        mapping.active_connections.load(Ordering::SeqCst)
+                    );
                 }
             }
-
             Err("No matching backend found".into())
         }
     }
@@ -703,4 +769,34 @@ fn find_matching_backend(data: &str, mappings: &[DatabaseMapping]) -> Option<(St
 
     // No match found
     None
+}
+
+// Fixed route_by_client_ip function to correctly return the index
+fn route_by_client_ip(
+    client_addr: &SocketAddr,
+    mappings: &[DatabaseMapping],
+) -> Option<(String, u16, usize)> {
+    if mappings.is_empty() {
+        return None;
+    }
+
+    // Generate hash from client IP
+    let hash_value = match client_addr.ip() {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            octets.iter().enumerate().fold(0u64, |acc, (i, &octet)| {
+                acc.wrapping_add((octet as u64) << (i * 8))
+            })
+        }
+        IpAddr::V6(_) => {
+            // Simplified IPv6 handling - use first available backend
+            return Some((mappings[0].target_host.clone(), mappings[0].target_port, 0));
+        }
+    };
+
+    // Select backend using consistent hashing
+    let idx = (hash_value as usize) % mappings.len();
+    let mapping = &mappings[idx];
+
+    Some((mapping.target_host.clone(), mapping.target_port, idx))
 }
