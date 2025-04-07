@@ -15,17 +15,35 @@ services:
     # Fixed command for Docker Swarm compatibility
     command: "sh -c 'sleep $$(shuf -i 1-10 -n 1) && /app/entrypoint.sh'"
     ports:
-      - "80:80"
-      - "443:443"
-      - "81:81"
-      - "9100:9100"
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: ingress
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: ingress
+      - target: 81
+        published: 81
+        protocol: tcp
+        mode: ingress
+      - target: 9100
+        published: 9100
+        protocol: tcp
+        mode: ingress
+      # TCP ports in host mode
       - target: 27017
         published: 27017
         protocol: tcp
         mode: host
-      - "5432:5432" # PostgreSQL
-      - "3306:3306" # MySQL/MariaDB
-      # - "6379:6379" # Redis
+      - target: 5432
+        published: 5432
+        protocol: tcp
+        mode: host
+      - target: 3306
+        published: 3306
+        protocol: tcp
+        mode: host
     networks:
       proxy-network:
         aliases:
@@ -67,7 +85,7 @@ services:
       # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
       - ENABLE_TCP_PROXY=true
-      - TCP_PROXY_PORTS=27017
+      - TCP_PROXY_PORTS=27017,5432,3306
       - TCP_PROXY_MODE=direct
 
     deploy:
