@@ -767,78 +767,63 @@ fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
 
 // Helper function to extract hostname from MongoDB message
 fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
-    // First approach: Look for the "host" field in the isMaster command
+    // Try to read the message as a string
     if let Ok(payload_str) = std::str::from_utf8(&buffer[16..]) {
-        info!(
-            "MongoDB message payload (first 200 chars): {}",
-            if payload_str.len() > 200 {
-                &payload_str[..200]
-            } else {
-                payload_str
-            }
-        );
-        // Look for MongoDB connection string patterns
-        let connection_string_patterns = ["mongodb://", "mongodb+srv://"];
+        // Look for MongoDB connection strings
+        let connection_patterns = ["mongodb://"];
 
-        for pattern in &connection_string_patterns {
+        for pattern in &connection_patterns {
             if let Some(pos) = payload_str.find(pattern) {
-                // Find the end of the connection string (likely a quote or whitespace)
-                let end_delimiters = ['"', '\'', ' ', ',', '}'];
-                let remaining = &payload_str[pos..];
+                // Find the auth separator (@)
+                if let Some(auth_pos) = payload_str[pos..].find('@') {
+                    // The hostname starts after the @ symbol
+                    let hostname_start = pos + auth_pos + 1;
 
-                // Find the hostname part of the connection string
-                let auth_separator = remaining.find('@');
-                let path_separator = remaining.find('/');
-
-                let start_idx = match auth_separator {
-                    Some(idx) => pos + idx + 1,
-                    None => pos + pattern.len(),
-                };
-
-                let end_idx = match path_separator {
-                    Some(idx) => pos + idx,
-                    None => {
-                        // Look for the next delimiter
-                        let mut idx = start_idx;
-                        while idx < payload_str.len() {
-                            if end_delimiters.contains(&(payload_str.as_bytes()[idx] as char)) {
-                                break;
+                    // Find the end of the hostname (next / or ? or whitespace)
+                    let mut hostname_end = payload_str.len();
+                    for end_char in &['/', '?', ' ', '"', '\''] {
+                        if let Some(end_pos) = payload_str[hostname_start..].find(*end_char) {
+                            let candidate_end = hostname_start + end_pos;
+                            if candidate_end < hostname_end {
+                                hostname_end = candidate_end;
                             }
-                            idx += 1;
                         }
-                        idx
                     }
-                };
 
-                if end_idx > start_idx {
-                    let hostname = &payload_str[start_idx..end_idx];
+                    if hostname_end > hostname_start {
+                        // Extract the hostname part
+                        let hostname = &payload_str[hostname_start..hostname_end];
 
-                    // Remove port if present
-                    let hostname = hostname.split(':').next().unwrap_or(hostname);
-
-                    return Some(hostname.to_string());
+                        // Remove port if present
+                        if let Some(port_pos) = hostname.find(':') {
+                            return Some(hostname[0..port_pos].to_string());
+                        } else {
+                            return Some(hostname.to_string());
+                        }
+                    }
                 }
             }
         }
 
-        // Look for domain patterns that match our MongoDB servers
-        let domain_patterns = [".mongodb.koompi.cloud", ".selendra.mongodb."];
+        // Alternatively, directly search for your specific domain patterns
+        let domain_patterns = [".selendra.mongodb.koompi.cloud"];
 
         for pattern in &domain_patterns {
             if let Some(pos) = payload_str.find(pattern) {
-                // Look for the start of the domain (likely a word boundary)
+                // Find the start of the hostname (look for alphanumeric/period/dash characters)
                 let mut start_pos = pos;
-                while start_pos > 0
-                    && (payload_str.as_bytes()[start_pos - 1] as char).is_alphanumeric()
-                {
-                    start_pos -= 1;
+                while start_pos > 0 {
+                    let prev_char = payload_str.as_bytes()[start_pos - 1] as char;
+                    if prev_char.is_alphanumeric() || prev_char == '.' || prev_char == '-' {
+                        start_pos -= 1;
+                    } else {
+                        break;
+                    }
                 }
 
-                // Extract the full domain name
-                let end_pos = pos + pattern.len();
-                let domain = &payload_str[start_pos..end_pos];
-
-                return Some(domain.to_string());
+                // Extract the hostname
+                let hostname = &payload_str[start_pos..(pos + pattern.len())];
+                return Some(hostname.to_string());
             }
         }
     }
@@ -889,6 +874,16 @@ async fn handle_mongodb_connection(
     // Allocate a buffer for the entire message
     let mut buffer = vec![0u8; message_length as usize];
 
+    info!(
+        "First 100 bytes of MongoDB message: {:?}",
+        &buffer[0..100.min(buffer.len())]
+    );
+    if let Ok(str_data) = std::str::from_utf8(&buffer[16..]) {
+        info!(
+            "MongoDB message as string (first 200 chars): {}",
+            &str_data[0..200.min(str_data.len())]
+        );
+    }
     // Copy the length bytes we already read
     buffer[0..4].copy_from_slice(&length_buffer);
 
@@ -900,21 +895,29 @@ async fn handle_mongodb_connection(
     // MongoDB connection string extraction - more reliable approach
     // Try multiple strategies to extract the hostname
     let hostname = if let Some(h) = extract_hostname_from_mongodb_message(&buffer) {
-        h
-    } else if let Some(h) = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await
-    {
+        info!(
+            "Successfully extracted hostname from MongoDB message: {}",
+            h
+        );
         h
     } else {
-        // Fall back to a default if available
-        let mappings = domain_mappings.lock().unwrap();
-        if let Some((default_host, _)) = mappings.iter().next() {
-            info!("Using default hostname: {}", default_host);
-            default_host.clone()
+        info!("Failed to extract hostname from MongoDB message, trying client address mapping");
+        if let Some(h) = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await {
+            info!("Found hostname mapping for client address: {}", h);
+            h
         } else {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine target hostname and no default available",
-            )));
+            info!("No hostname mapping found for client address, using default");
+            // Fall back to a default if available
+            let mappings = domain_mappings.lock().unwrap();
+            if let Some((default_host, _)) = mappings.iter().next() {
+                info!("Using default hostname: {}", default_host);
+                default_host.clone()
+            } else {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Could not determine target hostname and no default available",
+                )));
+            }
         }
     };
 
