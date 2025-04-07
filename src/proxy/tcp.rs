@@ -561,26 +561,16 @@ async fn resolve_mongodb_srv(
         .splitn(2, ['@', '/', '?'])
         .next()
         .unwrap_or(domain)
-        .trim_end_matches(".mongodb.koompi.cloud")
         .to_lowercase();
 
-    // Extract the service name for Docker Swarm services
-    if clean_domain.contains("-mongodb-") {
-        // Get just the service name without any UUID suffix
-        let service_base = clean_domain
-            .split('-')
-            .take_while(|&part| !part.chars().all(|c| c.is_ascii_hexdigit()))
-            .collect::<Vec<_>>()
-            .join("-");
-
-        if !service_base.is_empty() {
-            info!("Using Docker Swarm service DNS for: {}", service_base);
-            // Use the Docker Swarm DNS name format
-            return Ok(vec![(format!("{}.proxy-network", service_base), 27017)]);
-        }
+    // For your specific "riverbase-mongodb-*" pattern, directly use Docker service discovery
+    if clean_domain.contains("riverbase-mongodb-") {
+        info!("Direct Docker service mapping for: {}", clean_domain);
+        // For Docker Swarm, don't attempt SRV lookup, just use the service name
+        return Ok(vec![(format!("{}.proxy-network", clean_domain), 27017)]);
     }
 
-    // Standard SRV lookup for external domains
+    // Rest of the function remains unchanged for standard SRV resolution...
     info!("Attempting SRV resolution for: {}", clean_domain);
     let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
     let srv_name = format!("_mongodb._tcp.{}", clean_domain);
