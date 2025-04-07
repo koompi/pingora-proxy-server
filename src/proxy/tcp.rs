@@ -859,7 +859,7 @@ async fn handle_mongodb_connection(
 
     info!("Extracted hostname from message: {:?}", hostname);
 
-    // If we couldn't extract a hostname, use the first available backend
+    // If we couldn't extract a hostname, try to use original destination
     let backend = match hostname {
         Some(host) => {
             // Try exact match first
@@ -872,9 +872,19 @@ async fn handle_mongodb_connection(
             })
         }
         None => {
-            // If no hostname found, use the first available mapping
-            info!("No hostname found in message, using first available backend");
-            available_mappings.values().next().cloned()
+            // Try to use original destination information
+            info!("No hostname found in message, checking original destination");
+            if let Some(original_addr) = get_original_dst(&client_stream) {
+                info!("Original destination was: {}", original_addr);
+                // Find mapping that matches the original destination port
+                available_mappings
+                    .values()
+                    .find(|m| m.public_port == original_addr.port())
+                    .cloned()
+            } else {
+                info!("No original destination found, using first available backend");
+                available_mappings.values().next().cloned()
+            }
         }
     };
 
@@ -885,53 +895,40 @@ async fn handle_mongodb_connection(
                 mapping.target_host, mapping.target_port
             );
 
-            // Connect to the backend
-            let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
-            match TcpStream::connect(&backend_addr).await {
-                Ok(server_stream) => {
-                    // Forward the initial message and start proxying
-                    server_stream.writable().await?;
-                    server_stream.try_write(&buffer)?;
+            // Try DNS resolution first
+            let backend_addrs =
+                tokio::net::lookup_host(format!("{}:{}", mapping.target_host, mapping.target_port))
+                    .await?;
 
-                    info!("Successfully connected to backend, starting bidirectional proxy");
-                    proxy_connection(client_stream, server_stream, mapping.stats).await
-                }
-                Err(e) => {
-                    error!("Failed to connect to backend {}: {}", backend_addr, e);
-                    Err(e.into())
-                }
-            }
-        }
-        None => {
-            // If no backend found, use the first available one as fallback
-            if let Some(first_mapping) = available_mappings.values().next().cloned() {
-                info!(
-                    "No matching backend found, using default backend: {}:{}",
-                    first_mapping.target_host, first_mapping.target_port
-                );
-
-                let backend_addr = format!(
-                    "{}:{}",
-                    first_mapping.target_host, first_mapping.target_port
-                );
-                match TcpStream::connect(&backend_addr).await {
+            // Try each resolved address
+            for addr in backend_addrs {
+                match TcpStream::connect(addr).await {
                     Ok(server_stream) => {
                         server_stream.writable().await?;
                         server_stream.try_write(&buffer)?;
-                        proxy_connection(client_stream, server_stream, first_mapping.stats).await
+
+                        info!("Successfully connected to backend {}", addr);
+                        return proxy_connection(client_stream, server_stream, mapping.stats).await;
                     }
                     Err(e) => {
-                        error!(
-                            "Failed to connect to default backend {}: {}",
-                            backend_addr, e
+                        warn!(
+                            "Failed to connect to backend {} ({}): {}",
+                            mapping.target_host, addr, e
                         );
-                        Err(e.into())
+                        continue;
                     }
                 }
-            } else {
-                error!("No available backends found");
-                Err("No available backends".into())
             }
+
+            error!(
+                "Failed to connect to any resolved addresses for {}",
+                mapping.target_host
+            );
+            Err("Failed to connect to any backend addresses".into())
+        }
+        None => {
+            error!("No available backends found");
+            Err("No available backends".into())
         }
     }
 }
