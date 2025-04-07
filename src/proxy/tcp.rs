@@ -20,6 +20,8 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
+use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+use trust_dns_resolver::AsyncResolver;
 
 // Database type enum
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -433,6 +435,7 @@ impl Clone for TcpProxyService {
 }
 
 // Main accept loop for MongoDB connections with better connection tracking
+// Fix for the mongodb_accept_loop function
 async fn mongodb_accept_loop(
     listener: TcpListener,
     db_mappings: Arc<Mutex<Vec<DatabaseMapping>>>,
@@ -446,6 +449,7 @@ async fn mongodb_accept_loop(
 
     // Initialize MongoDB connection mappings
     {
+        // IMPORTANT: Scope the mutex guard so it's dropped before any await
         let mappings = db_mappings.lock().unwrap();
         if !mappings.is_empty() {
             info!("Available MongoDB backends:");
@@ -458,15 +462,12 @@ async fn mongodb_accept_loop(
         } else {
             warn!("No MongoDB backends are configured. Connections will fail.");
         }
+        // The mappings guard is dropped here when the scope ends
     }
 
     loop {
-        // Accept new connections with timeout to check for shutdown
-        let accept_future = listener.accept();
-        let timeout = tokio::time::sleep(Duration::from_secs(1));
-
         tokio::select! {
-            accept_result = accept_future => {
+            accept_result = listener.accept() => {
                 match accept_result {
                     Ok((client_stream, client_addr)) => {
                         let count = connection_count.fetch_add(1, Ordering::SeqCst);
@@ -504,10 +505,6 @@ async fn mongodb_accept_loop(
             _ = shutdown_rx.recv() => {
                 info!("Received shutdown signal, stopping MongoDB proxy accept loop");
                 break;
-            }
-            _ = timeout => {
-                // Timeout, just loop again
-                continue;
             }
         }
     }
@@ -554,6 +551,41 @@ impl MongoHeader {
     }
 }
 
+async fn resolve_mongodb_srv(
+    domain: &str,
+) -> Result<Vec<(String, u16)>, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a new resolver
+    let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
+
+    // Construct SRV query name: _mongodb._tcp.{domain}
+    let srv_name = format!("_mongodb._tcp.{}", domain);
+
+    // Lookup SRV records
+    match resolver.srv_lookup(srv_name).await {
+        Ok(srv_records) => {
+            let mut endpoints = Vec::new();
+
+            for srv in srv_records.iter() {
+                endpoints.push((
+                    srv.target().to_string().trim_end_matches('.').to_string(),
+                    srv.port(),
+                ));
+            }
+
+            if endpoints.is_empty() {
+                // Fallback to direct connection if no SRV records
+                endpoints.push((domain.to_string(), 27017));
+            }
+
+            Ok(endpoints)
+        }
+        Err(_) => {
+            // Fallback to direct connection if SRV lookup fails
+            Ok(vec![(domain.to_string(), 27017)])
+        }
+    }
+}
+
 // Handle a MongoDB connection
 async fn handle_mongodb_connection(
     mut client_stream: TcpStream,
@@ -584,7 +616,9 @@ async fn handle_mongodb_connection(
     );
 
     // Extract database information and find backend
+    // IMPORTANT: Clone all needed data out of the MutexGuard before any await
     let (backend, mapping) = {
+        // Scope the mutex guard so it's dropped before await points
         let mappings = db_mappings.lock().unwrap();
 
         // Try to extract database name from connection string or command
@@ -597,20 +631,34 @@ async fn handle_mongodb_connection(
                     "Found exact match for database '{}' -> {}:{}",
                     db_info, host, port
                 );
-                if let Some(mapping) = mappings.get(idx) {
-                    (Some((host, port)), Some(mapping.clone()))
+
+                // Get the backend host and port
+                let host_clone = host.clone();
+                let port_clone = port;
+
+                // Clone the mapping if it exists
+                let mapping_clone = if let Some(m) = mappings.get(idx) {
+                    Some(m.clone())
                 } else {
-                    (Some((host, port)), None)
+                    None
+                };
+
+                // Return the data outside the guard scope
+                if host.contains(".mongodb.koompi.cloud") {
+                    // We'll handle SRV resolution outside the guard scope
+                    (Some((host_clone, port_clone, true)), mapping_clone)
+                } else {
+                    (Some((host_clone, port_clone, false)), mapping_clone)
                 }
             } else {
                 // Fall back to default mapping if available
-                if let Some((idx, mapping)) = mappings
+                if let Some((_, mapping)) = mappings
                     .iter()
                     .enumerate()
                     .find(|(_, m)| m.domain_pattern == "default" || m.domain_pattern == "*")
                 {
                     (
-                        Some((mapping.target_host.clone(), mapping.target_port)),
+                        Some((mapping.target_host.clone(), mapping.target_port, false)),
                         Some(mapping.clone()),
                     )
                 } else {
@@ -621,27 +669,45 @@ async fn handle_mongodb_connection(
             warn!("Could not extract database info, falling back to IP routing");
             match route_by_client_ip(&client_addr, &mappings) {
                 Some((host, port, idx)) => {
-                    if let Some(mapping) = mappings.get(idx) {
-                        (Some((host, port)), Some(mapping.clone()))
+                    let mapping_clone = if let Some(m) = mappings.get(idx) {
+                        Some(m.clone())
                     } else {
-                        (Some((host, port)), None)
-                    }
+                        None
+                    };
+                    (Some((host, port, false)), mapping_clone)
                 }
                 None => (None, None),
             }
         }
-    };
+    }; // MutexGuard is dropped here
 
-    // Handle the connection routing
+    // Now handle the connection routing without the MutexGuard
     match backend {
-        Some((host, port)) => {
+        Some((host, port, needs_srv_lookup)) => {
+            // Perform SRV lookup if needed (now that we're outside the MutexGuard scope)
+            let (resolved_host, resolved_port) = if needs_srv_lookup {
+                match resolve_mongodb_srv(&host).await {
+                    Ok(endpoints) if !endpoints.is_empty() => {
+                        let (resolved_host, resolved_port) = &endpoints[0];
+                        info!(
+                            "Resolved MongoDB SRV record: {} -> {}:{}",
+                            host, resolved_host, resolved_port
+                        );
+                        (resolved_host.clone(), *resolved_port)
+                    }
+                    _ => (host, port),
+                }
+            } else {
+                (host, port)
+            };
+
             info!(
                 "Routing MongoDB connection from {} to {}:{}",
-                client_addr, host, port
+                client_addr, resolved_host, resolved_port
             );
 
             // Try to resolve the backend address first
-            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+            match tokio::net::lookup_host(format!("{}:{}", resolved_host, resolved_port)).await {
                 Ok(mut addrs) => {
                     if let Some(addr) = addrs.next() {
                         match TcpStream::connect(addr).await {
@@ -670,7 +736,7 @@ async fn handle_mongodb_connection(
                     }
                 }
                 Err(e) => {
-                    error!("Failed to resolve backend host {}: {}", host, e);
+                    error!("Failed to resolve backend host {}: {}", resolved_host, e);
                     Err(format!("DNS resolution failed: {}", e).into())
                 }
             }
