@@ -1,5 +1,7 @@
 // src/proxy/tcp.rs
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,7 +10,7 @@ use pingora::server::{Fds, ShutdownWatch};
 use pingora::services::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 use crate::config::model::ConfigStore;
@@ -257,10 +259,9 @@ impl TcpProxyService {
             ip_rules: DatabaseIpRules::new_with_storage().await?,
         })
     }
-
     // Initialize database mappings from config
     async fn initialize_mappings(&self) {
-        info!("Initializing database mappings");
+        info!("Initializing MongoDB database mappings");
 
         // Lock the mappings for update
         let mut db_mappings = self.db_mappings.lock().unwrap();
@@ -295,24 +296,27 @@ impl TcpProxyService {
                         (parts[0].to_string(), db_type.default_port())
                     };
 
-                    // Determine public port (same as target port by default)
-                    let public_port = target_port;
+                    // For MongoDB domains, we'll use our SNI-like hostname routing
+                    if db_type == DatabaseType::MongoDB {
+                        info!(
+                            "Adding MongoDB mapping: {} -> {}:{} (type: {:?})",
+                            domain, target_host, target_port, db_type
+                        );
 
-                    info!(
-                        "Adding database mapping: {} -> {}:{} (type: {:?})",
-                        domain, target_host, target_port, db_type
-                    );
-
-                    db_mappings.insert(
-                        domain.clone(),
-                        DatabaseMapping {
-                            public_port,
-                            target_host,
-                            target_port,
-                            db_type,
-                            stats: Arc::new(Mutex::new(ConnectionStats::default())),
-                        },
-                    );
+                        db_mappings.insert(
+                            domain.clone(),
+                            DatabaseMapping {
+                                public_port: 27017, // All MongoDB instances use the same port
+                                target_host,
+                                target_port,
+                                db_type,
+                                stats: Arc::new(Mutex::new(ConnectionStats::default())),
+                            },
+                        );
+                    } else {
+                        // For other database types, we'd handle them differently
+                        // (outside scope of current implementation)
+                    }
                 }
             }
         }
@@ -329,7 +333,7 @@ impl TcpProxyService {
         _target_port: u16,
         _db_type: DatabaseType,
         _stats: Arc<Mutex<ConnectionStats>>,
-        _shutdown_rx: mpsc::Receiver<()>,
+        mut _shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // For TLS implementation, you would need to:
         // 1. Create a TLS acceptor with the domain's certificate
@@ -342,68 +346,39 @@ impl TcpProxyService {
     // Run a regular TCP proxy for the given mapping
     async fn run_tcp_proxy(
         &self,
-        domain_name: String,
-        public_port: u16,
-        target_host: String,
-        target_port: u16,
-        db_type: DatabaseType,
-        stats: Arc<Mutex<ConnectionStats>>,
+        domain_mappings: HashMap<String, DatabaseMapping>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listen_addr = format!("0.0.0.0:{}", public_port);
-        let target_addr = format!("{}:{}", target_host, target_port);
+        // Create a single listener for all MongoDB connections
+        let listen_addr = "0.0.0.0:27017";
 
-        info!(
-            "TCP Proxy: Starting proxy for {} (type: {:?}) - listening on {}, forwarding to {}",
-            domain_name, db_type, listen_addr, target_addr
-        );
+        info!("MongoDB TCP Proxy: Starting proxy on {}", listen_addr);
 
         let listener = match TcpListener::bind(&listen_addr).await {
             Ok(l) => {
-                info!("TCP Proxy: Successfully bound to {}", listen_addr);
+                info!("MongoDB TCP Proxy: Successfully bound to {}", listen_addr);
                 l
             }
             Err(e) => {
-                error!("TCP Proxy: Failed to bind to {}: {}", listen_addr, e);
+                error!(
+                    "MongoDB TCP Proxy: Failed to bind to {}: {}",
+                    listen_addr, e
+                );
                 return Err(Box::new(e));
             }
         };
 
-        // Log current stats periodically
-        let stats_clone = Arc::clone(&stats);
-        let domain_clone = domain_name.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                if let Ok(stats) = stats_clone.lock() {
-                    info!(
-                        "TCP Proxy Stats for {}: Active: {}, Total: {}, Bytes In: {}, Bytes Out: {}",
-                        domain_clone,
-                        stats.active_connections,
-                        stats.total_connections,
-                        stats.bytes_in,
-                        stats.bytes_out
-                    );
-                }
-            }
-        });
+        let domain_mappings = Arc::new(Mutex::new(domain_mappings));
 
-        // Update stats
-        {
-            let mut stats_guard = stats.lock().unwrap();
-            stats_guard.active_connections = 0;
-            stats_guard.total_connections = 0;
-        }
-
+        // Process incoming connections
         loop {
             // Check for shutdown signal
             if let Ok(()) = shutdown_rx.try_recv() {
-                info!("Shutting down TCP proxy for {}", domain_name);
+                info!("Shutting down MongoDB TCP proxy");
                 break;
             }
 
-            // Accept with timeout to allow shutdown checks
+            // Accept new connections
             let accept_future = listener.accept();
             let timeout = tokio::time::sleep(Duration::from_secs(1));
 
@@ -411,49 +386,17 @@ impl TcpProxyService {
                 accept_result = accept_future => {
                     match accept_result {
                         Ok((inbound, client_addr)) => {
-                            // Check if the client IP is allowed for this specific database
-                            let client_ip = client_addr.ip().to_string();
-                            if !self.ip_rules.is_ip_allowed(&domain_name, &client_ip) {
-                                error!(
-                                    "TCP Proxy: Connection rejected - unauthorized IP {} for database {}",
-                                    client_ip, domain_name
-                                );
-                                continue;
-                            }
+                            info!("MongoDB TCP Proxy: New connection from {}", client_addr);
 
-                            info!(
-                                "TCP Proxy: Authorized connection from {} to {} (type: {:?})",
-                                client_addr, domain_name, db_type
-                            );
+                            // Clone the mappings for this connection
+                            let mappings = Arc::clone(&domain_mappings);
 
-                            // Update connection stats
-                            {
-                                let mut stats_guard = stats.lock().unwrap();
-                                stats_guard.active_connections += 1;
-                                stats_guard.total_connections += 1;
-                            }
-
-                            // Connect to the target
-                            match TcpStream::connect(&target_addr).await {
-                                Ok(outbound) => {
-                                    // Clone stats for the connection
-                                    let conn_stats = Arc::clone(&stats);
-
-                                    // Start proxying data
-                                    tokio::spawn(async move {
-                                        let _ = proxy_connection(inbound, outbound, conn_stats).await;
-                                    });
-                                },
-                                Err(e) => {
-                                    error!("Failed to connect to target {}: {}", target_addr, e);
-
-                                    // Update stats on failure
-                                    {
-                                        let mut stats_guard = stats.lock().unwrap();
-                                        stats_guard.active_connections -= 1;
-                                    }
+                            // Spawn a new task to handle this connection
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_mongodb_connection(inbound, client_addr, mappings).await {
+                                    error!("Error handling MongoDB connection: {}", e);
                                 }
-                            }
+                            });
                         }
                         Err(e) => {
                             error!("Failed to accept connection: {}", e);
@@ -645,107 +588,102 @@ impl Service for TcpProxyService {
         _fds: Option<Arc<tokio::sync::Mutex<Fds>>>,
         mut shutdown: ShutdownWatch,
     ) {
-        info!("Starting TCP Proxy service for database connections");
+        info!("Starting TCP Proxy service for MongoDB connections");
 
-        // Initialize mappings from config
+        // Initialize mappings
         self.initialize_mappings().await;
 
-        // Create shutdown channels for each proxy
-        let mut shutdown_channels = Vec::new();
+        // Get a copy of the domain mappings
+        let domain_mappings = {
+            let db_mappings = self.db_mappings.lock().unwrap();
+            db_mappings.clone()
+        };
 
-        // Start a proxy for each database mapping
-        let mut mappings = Vec::new();
-
-        // Extract mappings from mutex to avoid holding lock during async operations
-        if let Ok(db_mappings) = self.db_mappings.lock() {
-            for (domain, mapping) in db_mappings.iter() {
-                mappings.push((domain.clone(), mapping.clone()));
+        // Create a single TCP listener
+        let listener = match TcpListener::bind("0.0.0.0:27017").await {
+            Ok(listener) => {
+                info!("Successfully bound MongoDB proxy to 0.0.0.0:27017");
+                listener
             }
-        }
+            Err(e) => {
+                error!("Failed to bind MongoDB proxy to 0.0.0.0:27017: {}", e);
+                return;
+            }
+        };
 
-        // Process each mapping
-        for (domain, mapping) in mappings {
-            let (tx, rx) = mpsc::channel::<()>(1);
-            shutdown_channels.push(tx);
+        // Create a channel for graceful shutdown
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
-            let domain_clone = domain.clone();
-            let enable_tls = self.enable_tls;
+        // Shared domain mappings
+        let shared_mappings = Arc::new(Mutex::new(domain_mappings));
 
-            // Clone the service data for the task
-            let service_clone = TcpProxyService {
-                servers: Arc::clone(&self.servers),
-                db_mappings: Arc::clone(&self.db_mappings),
-                enable_tls,
-                ip_rules: self.ip_rules.clone(),
-            };
-
-            tokio::spawn(async move {
-                // Run either TLS or regular TCP proxy based on configuration
-                if enable_tls {
-                    if let Err(e) = service_clone
-                        .run_tls_proxy(
-                            domain_clone.clone(),
-                            mapping.public_port,
-                            mapping.target_host.clone(),
-                            mapping.target_port,
-                            mapping.db_type,
-                            mapping.stats.clone(),
-                            rx,
-                        )
-                        .await
-                    {
-                        error!("TLS proxy for {} failed: {}", domain_clone, e);
-                    }
-                } else {
-                    if let Err(e) = service_clone
-                        .run_tcp_proxy(
-                            domain_clone.clone(),
-                            mapping.public_port,
-                            mapping.target_host.clone(),
-                            mapping.target_port,
-                            mapping.db_type,
-                            mapping.stats.clone(),
-                            rx,
-                        )
-                        .await
-                    {
-                        error!("TCP proxy for {} failed: {}", domain_clone, e);
-                    }
-                }
-            });
-        }
-
-        info!("Started {} TCP proxies", shutdown_channels.len());
-
-        // Periodically check for config changes and update mappings
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-        loop {
-            tokio::select! {
+        // Spawn a task to handle accepting connections
+        let accept_task_handle = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx; // Make shutdown_rx mutable here
+            loop {
                 // Check for shutdown signal
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("Shutting down TCP Proxy service");
+                if shutdown_rx.try_recv().is_ok() {
+                    info!("Shutting down MongoDB proxy listener");
+                    break;
+                }
 
-                        // Signal all proxies to shut down
-                        for tx in shutdown_channels.iter() {
-                            let _ = tx.send(()).await;
+                // Accept with timeout to check for shutdown periodically
+                let accept_future = listener.accept();
+                let timeout = tokio::time::sleep(Duration::from_secs(1));
+
+                tokio::select! {
+                    accept_result = accept_future => {
+                        match accept_result {
+                            Ok((client_stream, client_addr)) => {
+                                info!("New MongoDB connection from {}", client_addr);
+
+                                // Clone the shared mappings
+                                let mappings_clone = Arc::clone(&shared_mappings);
+
+                                // Spawn a task to handle this connection
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_mongodb_connection(
+                                        client_stream,
+                                        client_addr,
+                                        mappings_clone
+                                    ).await {
+                                        error!("Error handling MongoDB connection: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("Error accepting MongoDB connection: {}", e);
+                            }
                         }
-
-                        // Wait a moment for proxies to clean up
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        break;
+                    }
+                    _ = timeout => {
+                        // Just a timeout to check for shutdown
+                        continue;
                     }
                 }
-
-                // Check for config changes periodically
-                _ = interval.tick() => {
-                    self.initialize_mappings().await;
-                }
             }
+
+            info!("MongoDB proxy listener stopped");
+        });
+
+        // Wait for shutdown signal
+        if let Ok(_) = shutdown.changed().await {
+            if *shutdown.borrow() {
+                info!("Shutdown signal received, stopping MongoDB proxy");
+
+                // Signal the accept task to stop
+                let _ = shutdown_tx.send(()).await;
+
+                // Wait for the accept task to complete
+                let _ = tokio::time::timeout(Duration::from_secs(5), accept_task_handle).await;
+            }
+        } else {
+            // Just await the task directly if shutdown channel is closed
+            let _ = accept_task_handle.await;
+            info!("MongoDB proxy accept task completed unexpectedly");
         }
 
-        info!("TCP Proxy service shutdown complete");
+        info!("MongoDB proxy service stopped");
     }
 
     fn name(&self) -> &'static str {
@@ -767,4 +705,351 @@ impl Clone for TcpProxyService {
             ip_rules: self.ip_rules.clone(),
         }
     }
+}
+
+// Helper function to parse the MongoDB wire protocol and extract the hostname
+fn parse_mongodb_hostname(data: &[u8]) -> Option<String> {
+    // This is a simplified parser for the MongoDB wire protocol
+    // In a real implementation, you would need to follow the MongoDB wire protocol specification
+
+    // MongoDB messages start with a header:
+    // messageLength (4 bytes) + requestID (4 bytes) + responseTo (4 bytes) + opCode (4 bytes)
+
+    // We need at least 16 bytes for the header
+    if data.len() < 16 {
+        return None;
+    }
+
+    // isMaster command is typically used for handshakes
+    // Look for "isMaster" or "ismaster" strings in the payload
+    let payload = std::str::from_utf8(&data[16..]).ok()?;
+
+    // Look for typical database connection strings or hostnames
+    // This is a simplified approach - a real implementation would properly parse BSON
+
+    // Look for domain names that match our MongoDB patterns
+    let patterns = ["mongodb.koompi.cloud", "selendra.mongodb", ".mongodb."];
+
+    for pattern in &patterns {
+        if let Some(pos) = payload.find(pattern) {
+            // Find the start of the hostname (likely before the pattern)
+            let start_pos = payload[..pos]
+                .rfind(&[' ', '"', '\'', ':', ',', '{', '}', '[', ']'][..])
+                .unwrap_or(0);
+
+            // Find the end of the hostname (likely after the pattern)
+            let end_pos = pos
+                + pattern.len()
+                + payload[pos + pattern.len()..]
+                    .find(&[' ', '"', '\'', ':', ',', '{', '}', '[', ']'][..])
+                    .unwrap_or(0);
+
+            // Extract the hostname
+            let hostname = payload[start_pos..end_pos].trim_matches(|c| " \"':,{}[]".contains(c));
+
+            if !hostname.is_empty() {
+                return Some(hostname.to_string());
+            }
+        }
+    }
+
+    // Alternative approach: extract anything that looks like a domain name
+    let domain_regex =
+        regex::Regex::new(r"[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z0-9][-a-zA-Z0-9]*)+").ok()?;
+    if let Some(captures) = domain_regex.captures(payload) {
+        if let Some(domain) = captures.get(0) {
+            return Some(domain.as_str().to_string());
+        }
+    }
+
+    None
+}
+
+// Helper function to extract hostname from MongoDB message
+fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
+    // First approach: Look for the "host" field in the isMaster command
+    if let Ok(payload_str) = std::str::from_utf8(&buffer[16..]) {
+        // Look for MongoDB connection string patterns
+        let connection_string_patterns = ["mongodb://", "mongodb+srv://"];
+
+        for pattern in &connection_string_patterns {
+            if let Some(pos) = payload_str.find(pattern) {
+                // Find the end of the connection string (likely a quote or whitespace)
+                let end_delimiters = ['"', '\'', ' ', ',', '}'];
+                let remaining = &payload_str[pos..];
+
+                // Find the hostname part of the connection string
+                let auth_separator = remaining.find('@');
+                let path_separator = remaining.find('/');
+
+                let start_idx = match auth_separator {
+                    Some(idx) => pos + idx + 1,
+                    None => pos + pattern.len(),
+                };
+
+                let end_idx = match path_separator {
+                    Some(idx) => pos + idx,
+                    None => {
+                        // Look for the next delimiter
+                        let mut idx = start_idx;
+                        while idx < payload_str.len() {
+                            if end_delimiters.contains(&(payload_str.as_bytes()[idx] as char)) {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        idx
+                    }
+                };
+
+                if end_idx > start_idx {
+                    let hostname = &payload_str[start_idx..end_idx];
+
+                    // Remove port if present
+                    let hostname = hostname.split(':').next().unwrap_or(hostname);
+
+                    return Some(hostname.to_string());
+                }
+            }
+        }
+
+        // Look for domain patterns that match our MongoDB servers
+        let domain_patterns = [".mongodb.koompi.cloud", ".selendra.mongodb."];
+
+        for pattern in &domain_patterns {
+            if let Some(pos) = payload_str.find(pattern) {
+                // Look for the start of the domain (likely a word boundary)
+                let mut start_pos = pos;
+                while start_pos > 0
+                    && (payload_str.as_bytes()[start_pos - 1] as char).is_alphanumeric()
+                {
+                    start_pos -= 1;
+                }
+
+                // Extract the full domain name
+                let end_pos = pos + pattern.len();
+                let domain = &payload_str[start_pos..end_pos];
+
+                return Some(domain.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+// Extract hostname based on client's IP address and known mappings
+async fn extract_hostname_from_client_addr(
+    client_addr: &SocketAddr,
+    _domain_mappings: &Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+) -> Option<String> {
+    // This could be enhanced to use a reverse lookup table
+    // For now, we'll use a simple approach
+
+    let _client_ip = client_addr.ip().to_string();
+
+    // You could maintain a mapping of client IPs to domains
+    // For now, we'll return None
+    None
+}
+
+// New function to handle MongoDB connections
+async fn handle_mongodb_connection(
+    mut client_stream: TcpStream,
+    client_addr: SocketAddr,
+    domain_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // For MongoDB protocol, we need to read the message length first (first 4 bytes)
+    let mut length_buffer = [0u8; 4];
+
+    // Read the message length
+    if let Err(e) = client_stream.read_exact(&mut length_buffer).await {
+        return Err(Box::new(e));
+    }
+
+    // Parse the message length (little-endian)
+    let message_length = u32::from_le_bytes(length_buffer);
+
+    // Ensure the message length is reasonable
+    if message_length < 16 || message_length > 48 * 1024 * 1024 {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid MongoDB message length: {}", message_length),
+        )));
+    }
+
+    // Allocate a buffer for the entire message
+    let mut buffer = vec![0u8; message_length as usize];
+
+    // Copy the length bytes we already read
+    buffer[0..4].copy_from_slice(&length_buffer);
+
+    // Read the rest of the message
+    if let Err(e) = client_stream.read_exact(&mut buffer[4..]).await {
+        return Err(Box::new(e));
+    }
+
+    // MongoDB connection string extraction - more reliable approach
+    // Try multiple strategies to extract the hostname
+    let hostname = if let Some(h) = extract_hostname_from_mongodb_message(&buffer) {
+        h
+    } else if let Some(h) = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await
+    {
+        h
+    } else {
+        // Fall back to a default if available
+        let mappings = domain_mappings.lock().unwrap();
+        if let Some((default_host, _)) = mappings.iter().next() {
+            info!("Using default hostname: {}", default_host);
+            default_host.clone()
+        } else {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine target hostname and no default available",
+            )));
+        }
+    };
+
+    info!("Resolved MongoDB connection to hostname: {}", hostname);
+
+    // Look up the backend for this hostname
+    let backend = {
+        let mappings = domain_mappings.lock().unwrap();
+
+        // Try direct match first
+        if let Some(mapping) = mappings.get(&hostname) {
+            mapping.clone()
+        } else {
+            // Try domain suffix matching
+            let matching_domain = mappings
+                .keys()
+                .filter(|&domain| hostname.ends_with(domain))
+                .max_by_key(|domain| domain.len()) // Take the longest matching suffix
+                .and_then(|domain| mappings.get(domain).cloned());
+
+            if let Some(mapping) = matching_domain {
+                mapping
+            } else {
+                // If no match found, take the first mapping as default (if any)
+                if let Some((_, mapping)) = mappings.iter().next() {
+                    info!("No specific mapping found for {}, using default", hostname);
+                    mapping.clone()
+                } else {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("No backend found for hostname: {}", hostname),
+                    )));
+                }
+            }
+        }
+    };
+
+    // Connect to the backend
+    let backend_addr = format!("{}:{}", backend.target_host, backend.target_port);
+    info!(
+        "Routing connection from {} to backend: {}",
+        hostname, backend_addr
+    );
+
+    let mut server_stream = match TcpStream::connect(&backend_addr).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to connect to backend {}: {}", backend_addr, e);
+            return Err(Box::new(e));
+        }
+    };
+
+    // Forward the initial message to the backend
+    if let Err(e) = server_stream.write_all(&buffer).await {
+        return Err(Box::new(e));
+    }
+
+    // Now set up bidirectional proxy between client and server
+    // First, we need to take ownership of the streams
+    // To fix the lifetime issues, we'll use a different approach instead of split
+
+    // Create a counter for tracking traffic
+    let bytes_counter = Arc::new(AtomicUsize::new(0));
+
+    // Clone streams for each direction
+    let mut client_read = client_stream;
+    let mut server_write = server_stream;
+
+    // Move these streams to a task
+    let bytes_counter_clone = bytes_counter.clone();
+
+    let client_to_server = tokio::spawn(async move {
+        let mut buffer = vec![0; 16384];
+        let mut total_bytes = 0;
+
+        loop {
+            match client_read.read(&mut buffer).await {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    if let Err(e) = server_write.write_all(&buffer[..n]).await {
+                        error!("Error writing to server: {}", e);
+                        break;
+                    }
+
+                    total_bytes += n;
+                    bytes_counter_clone.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!("Error reading from client: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Client to server proxy ended, total bytes: {}", total_bytes);
+    });
+
+    // Create new connections for the reverse direction
+    let mut server_read = TcpStream::connect(&backend_addr).await?;
+    let mut client_write = TcpStream::connect(client_addr).await?;
+
+    // Server to client
+    let server_to_client = tokio::spawn(async move {
+        let mut buffer = vec![0; 16384];
+        let mut total_bytes = 0;
+
+        loop {
+            match server_read.read(&mut buffer).await {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    if let Err(e) = client_write.write_all(&buffer[..n]).await {
+                        error!("Error writing to client: {}", e);
+                        break;
+                    }
+
+                    total_bytes += n;
+                }
+                Err(e) => {
+                    error!("Error reading from server: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Server to client proxy ended, total bytes: {}", total_bytes);
+    });
+
+    // Wait for either direction to complete
+    tokio::select! {
+        _ = client_to_server => {
+            info!("Client to server proxy completed first");
+        }
+        _ = server_to_client => {
+            info!("Server to client proxy completed first");
+        }
+    }
+
+    // Log the total bytes transferred
+    let total_bytes = bytes_counter.load(Ordering::Relaxed);
+    info!(
+        "Connection closed: {} <-> {}, total bytes: {}",
+        client_addr, backend_addr, total_bytes
+    );
+
+    Ok(())
 }
