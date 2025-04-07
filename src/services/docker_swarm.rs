@@ -43,7 +43,7 @@ use crate::{
         file_manager::{create_mappings_from_store, update_config},
         model::{ConfigStore, MappingOrigin, ServerMapping},
     },
-    proxy::tcp::{ConnectionStats, DatabaseMapping},
+    proxy::tcp::DatabaseMapping,
 };
 
 use super::lock::DistributedLock;
