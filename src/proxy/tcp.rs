@@ -859,104 +859,135 @@ async fn handle_mongodb_connection(
         client_addr, original_dst
     );
 
-    // Read a small buffer just to have something to start with
-    let mut length_buffer = [0u8; 4];
-
-    // Try to read at least the initial message length
-    if let Err(e) = client_stream.read_exact(&mut length_buffer).await {
-        return Err(Box::new(e));
-    }
-
-    // First try to get the hostname without holding the lock
-    let hostname_result = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await;
-
-    // Get all available mappings
-    let available_backends = {
-        // Now acquire the lock for a short scope
+    // Log available mappings
+    {
         let mappings = domain_mappings.lock().unwrap();
-
-        // Log available mappings for debugging
-        info!("Available MongoDB mappings:");
+        info!("Current MongoDB mappings:");
         for (domain, mapping) in mappings.iter() {
             info!(
                 "  {} -> {}:{}",
                 domain, mapping.target_host, mapping.target_port
             );
         }
-
-        // Get the hostname the client is trying to connect to - we already got it above
-        if let Some(hostname) = hostname_result {
-            // Look for exact match in our mappings
-            if let Some(mapping) = mappings.get(&hostname) {
-                info!("Found matching backend for hostname {}", hostname);
-                Ok((hostname, mapping.clone()))
-            } else {
-                // If no match found, log warning and fall back to default
-                warn!("No matching backend found for client connection, using default");
-                mappings
-                    .iter()
-                    .next()
-                    .map(|(d, m)| (d.clone(), m.clone()))
-                    .ok_or_else(|| {
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "No MongoDB backends configured",
-                        ))
-                    })
-            }
-        } else {
-            // If no hostname found, fall back to default
-            warn!("No hostname detected for client connection, using default");
-            mappings
-                .iter()
-                .next()
-                .map(|(d, m)| (d.clone(), m.clone()))
-                .ok_or_else(|| {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "No MongoDB backends configured",
-                    ))
-                })
-        }
-    }; // Lock is dropped here at end of block
-
-    // Default to the first available mapping if we can't determine anything else
-    let (hostname, backend) = match available_backends {
-        Ok((domain, mapping)) => {
-            info!(
-                "Using default MongoDB backend for {}: {}:{}",
-                domain, mapping.target_host, mapping.target_port
-            );
-            (domain, mapping)
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    };
-
-    // Connect to the backend
-    let backend_addr = format!("{}:{}", backend.target_host, backend.target_port);
-    info!("Routing MongoDB connection to backend: {}", backend_addr);
-
-    let mut server_stream = match TcpStream::connect(&backend_addr).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            error!("Failed to connect to backend {}: {}", backend_addr, e);
-            return Err(Box::new(e));
-        }
-    };
-
-    // Forward the initial message to the backend
-    let mut buffer = vec![0u8; 4];
-    buffer.copy_from_slice(&length_buffer);
-
-    if let Err(e) = server_stream.write_all(&buffer).await {
-        return Err(Box::new(e));
     }
 
-    // Now set up bidirectional proxy
-    info!("Setting up bidirectional proxy between client and MongoDB backend");
-    proxy_connection(client_stream, server_stream, backend.stats.clone()).await
+    // Read initial message length
+    let mut length_buffer = [0u8; 4];
+    match client_stream.read_exact(&mut length_buffer).await {
+        Ok(_) => {
+            info!("Successfully read initial MongoDB message length");
+        }
+        Err(e) => {
+            error!("Failed to read MongoDB message length: {}", e);
+            return Err(Box::new(e));
+        }
+    }
+
+    // Read the full message for hostname extraction
+    let message_length = u32::from_le_bytes(length_buffer) as usize;
+    if message_length < 4 || message_length > 1024 * 1024 {
+        error!("Invalid MongoDB message length: {}", message_length);
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid MongoDB message length",
+        )));
+    }
+
+    let mut buffer = vec![0u8; message_length];
+    buffer[..4].copy_from_slice(&length_buffer);
+
+    match client_stream.read_exact(&mut buffer[4..]).await {
+        Ok(_) => {
+            info!("Successfully read full MongoDB message");
+        }
+        Err(e) => {
+            error!("Failed to read full MongoDB message: {}", e);
+            return Err(Box::new(e));
+        }
+    }
+
+    // Try to extract hostname
+    if let Some(hostname) = parse_mongodb_hostname(&buffer) {
+        info!("Extracted MongoDB hostname: {}", hostname);
+
+        // Look up the backend mapping
+        let backend = {
+            let mappings = domain_mappings.lock().unwrap();
+            mappings.get(&hostname).cloned()
+        };
+
+        if let Some(mapping) = backend {
+            info!(
+                "Found backend mapping for {}: {}:{}",
+                hostname, mapping.target_host, mapping.target_port
+            );
+
+            // Connect to backend
+            let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
+            match TcpStream::connect(&backend_addr).await {
+                Ok(mut server_stream) => {
+                    // Forward the initial message
+                    if let Err(e) = server_stream.write_all(&buffer).await {
+                        error!("Failed to forward initial message to backend: {}", e);
+                        return Err(Box::new(e));
+                    }
+
+                    info!("Successfully connected to backend, starting proxy");
+                    return proxy_connection(client_stream, server_stream, mapping.stats).await;
+                }
+                Err(e) => {
+                    error!("Failed to connect to backend {}: {}", backend_addr, e);
+                    return Err(Box::new(e));
+                }
+            }
+        } else {
+            error!("No backend mapping found for hostname: {}", hostname);
+        }
+    } else {
+        error!("Failed to extract hostname from MongoDB message");
+    }
+
+    // Fall back to default backend if available
+    let default_backend = {
+        let mappings = domain_mappings.lock().unwrap();
+        mappings.iter().next().map(|(_, m)| m.clone())
+    };
+
+    if let Some(mapping) = default_backend {
+        info!(
+            "Using default backend: {}:{}",
+            mapping.target_host, mapping.target_port
+        );
+
+        let backend_addr = format!("{}:{}", mapping.target_host, mapping.target_port);
+        match TcpStream::connect(&backend_addr).await {
+            Ok(mut server_stream) => {
+                if let Err(e) = server_stream.write_all(&buffer).await {
+                    error!(
+                        "Failed to forward initial message to default backend: {}",
+                        e
+                    );
+                    return Err(Box::new(e));
+                }
+
+                info!("Successfully connected to default backend, starting proxy");
+                return proxy_connection(client_stream, server_stream, mapping.stats).await;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to connect to default backend {}: {}",
+                    backend_addr, e
+                );
+                return Err(Box::new(e));
+            }
+        }
+    }
+
+    error!("No available MongoDB backends");
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "No available MongoDB backends",
+    )))
 }
 
 async fn check_mongodb_health(target: &str) -> bool {
