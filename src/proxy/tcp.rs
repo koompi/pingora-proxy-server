@@ -964,20 +964,15 @@ async fn handle_mongodb_connection(
         return Err(Box::new(e));
     }
 
-    // Now set up bidirectional proxy between client and server
-    // First, we need to take ownership of the streams
-    // To fix the lifetime issues, we'll use a different approach instead of split
+    // Now set up bidirectional proxy using existing streams
+    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    let (mut server_read, mut server_write) = tokio::io::split(server_stream);
 
     // Create a counter for tracking traffic
     let bytes_counter = Arc::new(AtomicUsize::new(0));
-
-    // Clone streams for each direction
-    let mut client_read = client_stream;
-    let mut server_write = server_stream;
-
-    // Move these streams to a task
     let bytes_counter_clone = bytes_counter.clone();
 
+    // Client to server
     let client_to_server = tokio::spawn(async move {
         let mut buffer = vec![0; 16384];
         let mut total_bytes = 0;
@@ -992,7 +987,7 @@ async fn handle_mongodb_connection(
                     }
 
                     total_bytes += n;
-                    bytes_counter_clone.fetch_add(n, Ordering::Relaxed);
+                    bytes_counter.fetch_add(n, Ordering::Relaxed);
                 }
                 Err(e) => {
                     error!("Error reading from client: {}", e);
@@ -1003,10 +998,6 @@ async fn handle_mongodb_connection(
 
         info!("Client to server proxy ended, total bytes: {}", total_bytes);
     });
-
-    // Create new connections for the reverse direction
-    let mut server_read = TcpStream::connect(&backend_addr).await?;
-    let mut client_write = TcpStream::connect(client_addr).await?;
 
     // Server to client
     let server_to_client = tokio::spawn(async move {
@@ -1045,7 +1036,7 @@ async fn handle_mongodb_connection(
     }
 
     // Log the total bytes transferred
-    let total_bytes = bytes_counter.load(Ordering::Relaxed);
+    let total_bytes = bytes_counter_clone.load(Ordering::Relaxed);
     info!(
         "Connection closed: {} <-> {}, total bytes: {}",
         client_addr, backend_addr, total_bytes
