@@ -203,7 +203,6 @@ impl SwarmDiscoveryService {
             }
         }
     }
-
     async fn discover_services(&self) -> Result<()> {
         info!("Running Docker Swarm service discovery");
 
@@ -247,6 +246,13 @@ impl SwarmDiscoveryService {
         } else {
             HashSet::new()
         };
+
+        if !recently_deleted.is_empty() {
+            info!(
+                "Found {} recently deleted domains that will be excluded from discovery",
+                recently_deleted.len()
+            );
+        }
 
         let services = self
             .docker_client
@@ -392,8 +398,8 @@ impl SwarmDiscoveryService {
 
                     // Only update if the mapping doesn't exist or was created by Swarm
                     if !store.contains_key(domain)
-                        || store.get(domain).map_or(false, |(_, origin)| {
-                            *origin == MappingOrigin::SwarmDiscovery
+                        || store.get(domain).map_or(false, |(_, map_origin)| {
+                            *map_origin == MappingOrigin::SwarmDiscovery
                         })
                     {
                         store.insert(

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use log::{error, info};
+use log::{error, info, warn};
 use pingora::server::{Fds, ShutdownWatch};
 use pingora::services::Service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -637,15 +637,28 @@ impl Service for TcpProxyService {
                             Ok((client_stream, client_addr)) => {
                                 info!("New MongoDB connection from {}", client_addr);
 
-                                // Clone the shared mappings
+                                // Clone the mappings data OUTSIDE the spawned task
+                                // This ensures no MutexGuard crosses await points
                                 let mappings_clone = Arc::clone(&shared_mappings);
+                                let mappings_data = {
+                                    // Take a separate clone inside a block that ends
+                                    // so the MutexGuard is dropped immediately
+                                    let guard = mappings_clone.lock().unwrap();
+                                    let cloned_data = guard.clone();
+                                    cloned_data // Return the cloned data; guard is dropped at block end
+                                };
 
-                                // Spawn a task to handle this connection
+                                // Create a new Arc<Mutex<>> with the cloned data
+                                let task_mappings = Arc::new(Mutex::new(mappings_data));
+
+                                // Now spawn the task with the new Arc<Mutex<>>
+                                // Clone the necessary data before spawning the task
+                                let task_mappings_clone = Arc::clone(&task_mappings);
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_mongodb_connection(
                                         client_stream,
                                         client_addr,
-                                        mappings_clone
+                                        task_mappings_clone
                                     ).await {
                                         error!("Error handling MongoDB connection: {}", e);
                                     }
@@ -662,9 +675,9 @@ impl Service for TcpProxyService {
                     }
                 }
             }
-
-            info!("MongoDB proxy listener stopped");
         });
+
+        info!("MongoDB proxy listener stopped");
 
         // Wait for shutdown signal
         if let Ok(_) = shutdown.changed().await {
@@ -834,15 +847,26 @@ fn extract_hostname_from_mongodb_message(buffer: &[u8]) -> Option<String> {
 // Extract hostname based on client's IP address and known mappings
 async fn extract_hostname_from_client_addr(
     client_addr: &SocketAddr,
-    _domain_mappings: &Arc<Mutex<HashMap<String, DatabaseMapping>>>,
+    domain_mappings: &Arc<Mutex<HashMap<String, DatabaseMapping>>>,
 ) -> Option<String> {
-    // This could be enhanced to use a reverse lookup table
-    // For now, we'll use a simple approach
+    // Get the original destination address that the client was trying to connect to
+    if let Ok(sock) = TcpStream::connect(client_addr).await {
+        if let Ok(orig_dst) = sock.peer_addr() {
+            // Convert the original destination to a string and perform lookup
+            let lookup_result = tokio::net::lookup_host(orig_dst.to_string()).await;
 
-    let _client_ip = client_addr.ip().to_string();
-
-    // You could maintain a mapping of client IPs to domains
-    // For now, we'll return None
+            if let Ok(hostnames) = lookup_result {
+                // Check if any of the hostnames match our mappings
+                let mappings = domain_mappings.lock().unwrap();
+                for addr in hostnames {
+                    let hostname = addr.to_string();
+                    if mappings.contains_key(&hostname) {
+                        return Some(hostname);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -860,8 +884,12 @@ async fn handle_mongodb_connection(
         return Err(Box::new(e));
     }
 
+    // First try to get the hostname without holding the lock
+    let hostname_result = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await;
+
     // Get all available mappings
     let available_backends = {
+        // Now acquire the lock for a short scope
         let mappings = domain_mappings.lock().unwrap();
 
         // Log available mappings for debugging
@@ -873,24 +901,53 @@ async fn handle_mongodb_connection(
             );
         }
 
-        // Choose the default backend (first one in the list)
-        mappings.iter().next().map(|(d, m)| (d.clone(), m.clone()))
-    };
+        // Get the hostname the client is trying to connect to - we already got it above
+        if let Some(hostname) = hostname_result {
+            // Look for exact match in our mappings
+            if let Some(mapping) = mappings.get(&hostname) {
+                info!("Found matching backend for hostname {}", hostname);
+                Ok((hostname, mapping.clone()))
+            } else {
+                // If no match found, log warning and fall back to default
+                warn!("No matching backend found for client connection, using default");
+                mappings
+                    .iter()
+                    .next()
+                    .map(|(d, m)| (d.clone(), m.clone()))
+                    .ok_or_else(|| {
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "No MongoDB backends configured",
+                        ))
+                    })
+            }
+        } else {
+            // If no hostname found, fall back to default
+            warn!("No hostname detected for client connection, using default");
+            mappings
+                .iter()
+                .next()
+                .map(|(d, m)| (d.clone(), m.clone()))
+                .ok_or_else(|| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "No MongoDB backends configured",
+                    ))
+                })
+        }
+    }; // Lock is dropped here at end of block
 
     // Default to the first available mapping if we can't determine anything else
     let (hostname, backend) = match available_backends {
-        Some((domain, mapping)) => {
+        Ok((domain, mapping)) => {
             info!(
                 "Using default MongoDB backend for {}: {}:{}",
                 domain, mapping.target_host, mapping.target_port
             );
             (domain, mapping)
         }
-        None => {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No MongoDB backends configured",
-            )));
+        Err(e) => {
+            return Err(e);
         }
     };
 
