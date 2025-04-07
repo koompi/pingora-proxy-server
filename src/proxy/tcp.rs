@@ -561,27 +561,23 @@ async fn resolve_mongodb_srv(
         .splitn(2, ['@', '/', '?'])
         .next()
         .unwrap_or(domain)
+        .trim_end_matches(".mongodb.koompi.cloud")
         .to_lowercase();
 
-    // Extract the base service name for internal MongoDB instances
-    let service_name = if clean_domain.contains("-mongodb-") {
-        // Extract just the service name part (e.g., "weteka-mongodb-67e3df")
-        clean_domain
-            .split('.')
-            .next()
-            .unwrap_or(&clean_domain)
-            .to_string()
-    } else {
-        clean_domain.clone()
-    };
+    // Extract the service name for Docker Swarm services
+    if clean_domain.contains("-mongodb-") {
+        // Get just the service name without any UUID suffix
+        let service_base = clean_domain
+            .split('-')
+            .take_while(|&part| !part.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect::<Vec<_>>()
+            .join("-");
 
-    // If domain contains specific patterns, use Docker service DNS
-    if service_name.contains("-mongodb-") {
-        info!(
-            "Using Docker service DNS for MongoDB instance: {}",
-            service_name
-        );
-        return Ok(vec![(format!("tasks.{}", service_name), 27017)]);
+        if !service_base.is_empty() {
+            info!("Using Docker Swarm service DNS for: {}", service_base);
+            // Use the Docker Swarm DNS name format
+            return Ok(vec![(format!("{}.proxy-network", service_base), 27017)]);
+        }
     }
 
     // Standard SRV lookup for external domains
@@ -609,10 +605,7 @@ async fn resolve_mongodb_srv(
             }
         }
         Err(e) => {
-            info!(
-                "SRV lookup failed ({}), falling back to direct connection",
-                e
-            );
+            info!("SRV lookup failed ({}), using direct connection", e);
             Ok(vec![(clean_domain, 27017)])
         }
     }
