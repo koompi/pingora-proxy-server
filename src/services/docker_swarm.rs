@@ -39,8 +39,11 @@ pub enum SwarmError {
 }
 
 use crate::{
-    config::file_manager::{create_mappings_from_store, update_config},
-    config::model::{ConfigStore, MappingOrigin, ServerMapping},
+    config::{
+        file_manager::{create_mappings_from_store, update_config},
+        model::{ConfigStore, MappingOrigin, ServerMapping},
+    },
+    proxy::tcp::{ConnectionStats, DatabaseMapping},
 };
 
 use super::lock::DistributedLock;
@@ -335,43 +338,31 @@ impl SwarmDiscoveryService {
             }))
             .await?;
 
-        // Process MongoDB services for direct TCP routing
+        // Process MongoDB services
         for service in mongo_services {
             let service_spec = match service.spec {
                 Some(spec) => spec,
                 None => continue,
             };
 
-            // Get service labels
-            let labels = match service_spec.labels {
-                Some(labels) => labels,
-                None => continue,
-            };
-
-            // Get the service name and domain
+            // Get service name and domain pattern
             let service_name = service_spec.name.unwrap_or_default();
-            let domain = match labels.get("com.koompi.database.domain") {
-                Some(domain) => domain.clone(),
-                None => {
-                    // Use service ID as domain if not specified
-                    match service.id {
-                        Some(id) => format!("{}.mongodb.koompi.cloud", id),
-                        None => continue,
-                    }
-                }
+            let domain_pattern = match service_spec.labels {
+                Some(labels) => labels
+                    .get("com.koompi.database.name")
+                    .cloned()
+                    .unwrap_or_else(|| service_name.clone()),
+                None => service_name.clone(),
             };
 
-            // Skip if this domain was recently manually deleted
-            if recently_deleted.contains(&domain) {
-                info!("Skipping recently deleted MongoDB domain: {}", domain);
-                continue;
-            }
+            // Create target using Docker Swarm DNS
+            let target = format!("tasks.{}", service_name);
 
-            // Create target using Docker Swarm DNS format
-            let target = format!("tasks.{}:27017", service_name.replace('.', "-"));
-
-            info!("Discovered MongoDB service: {} -> {}", domain, target);
-            new_mappings.insert(domain, target);
+            info!(
+                "Discovered MongoDB service: {} -> {}",
+                domain_pattern, target
+            );
+            new_mappings.insert(domain_pattern.clone(), target);
         }
 
         // Update the organization services tracking

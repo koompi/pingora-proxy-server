@@ -58,20 +58,20 @@ impl DatabaseType {
 
 // Connection statistics
 #[derive(Debug, Default, Clone)]
-struct ConnectionStats {
-    active_connections: usize,
-    total_connections: usize,
-    bytes_in: usize,
-    bytes_out: usize,
+pub struct ConnectionStats {
+    pub active_connections: usize,
+    pub total_connections: usize,
+    pub bytes_in: usize,
+    pub bytes_out: usize,
 }
 
 // Database host mapping
 #[derive(Clone)]
-struct DatabaseMapping {
-    domain_pattern: String, // e.g., "riverbase-mongodb"
-    target_host: String,    // Docker service DNS name
-    target_port: u16,       // Always 27017 for MongoDB
-    stats: Arc<Mutex<ConnectionStats>>,
+pub struct DatabaseMapping {
+    pub domain_pattern: String, // e.g., "riverbase-mongodb"
+    pub target_host: String,    // Docker service DNS name
+    pub target_port: u16,       // Always 27017 for MongoDB
+    pub stats: Arc<Mutex<ConnectionStats>>,
 }
 
 impl DatabaseMapping {
