@@ -533,11 +533,23 @@ impl MongoHeader {
             return None;
         }
 
+        // Ensure we're reading valid MongoDB wire protocol message
+        let message_length = LittleEndian::read_i32(&buffer[0..4]);
+        let request_id = LittleEndian::read_i32(&buffer[4..8]);
+        let response_to = LittleEndian::read_i32(&buffer[8..12]);
+        let op_code = LittleEndian::read_i32(&buffer[12..16]);
+
+        // Validate message length and op_code
+        if message_length <= 0 || message_length > 48_000_000 {
+            // MongoDB max message size
+            return None;
+        }
+
         Some(MongoHeader {
-            message_length: LittleEndian::read_i32(&buffer[0..4]),
-            request_id: LittleEndian::read_i32(&buffer[4..8]),
-            response_to: LittleEndian::read_i32(&buffer[8..12]),
-            op_code: LittleEndian::read_i32(&buffer[12..16]),
+            message_length,
+            request_id,
+            response_to,
+            op_code,
         })
     }
 }
@@ -558,58 +570,58 @@ async fn handle_mongodb_connection(
     buffer.truncate(n);
 
     // Parse MongoDB wire protocol header
-    let header = MongoHeader::from_bytes(&buffer).ok_or("Invalid MongoDB protocol header")?;
+    let header = match MongoHeader::from_bytes(&buffer) {
+        Some(h) => h,
+        None => {
+            warn!("Invalid MongoDB protocol header, falling back to IP-based routing");
+            return Err("Invalid MongoDB protocol header".into());
+        }
+    };
 
     info!(
         "MongoDB message: length={}, opCode={}, reqID={}",
         header.message_length, header.op_code, header.request_id
     );
 
-    // Extract database information from the message
+    // Extract database information and find backend
     let (backend, mapping) = {
         let mappings = db_mappings.lock().unwrap();
 
+        // Try to extract database name from connection string or command
         if let Some(db_info) = extract_database_info(&buffer[16..], header.op_code) {
             info!("Detected database info: {}", db_info);
 
-            // Try to find matching backend based on database info
+            // First try exact domain pattern match
             if let Some((host, port, idx)) = find_backend_for_database(&db_info, &mappings) {
                 info!(
-                    "Found matching backend for database '{}': {}:{}",
+                    "Found exact match for database '{}' -> {}:{}",
                     db_info, host, port
                 );
-
-                // Increment active connections counter
                 if let Some(mapping) = mappings.get(idx) {
-                    mapping.active_connections.fetch_add(1, Ordering::SeqCst);
                     (Some((host, port)), Some(mapping.clone()))
                 } else {
                     (Some((host, port)), None)
                 }
             } else {
-                // Fall back to IP-based routing
-                match route_by_client_ip(&client_addr, &mappings) {
-                    Some((host, port, idx)) => {
-                        info!(
-                            "Using IP-based routing for client {} -> {}:{}",
-                            client_addr, host, port
-                        );
-                        if let Some(mapping) = mappings.get(idx) {
-                            mapping.active_connections.fetch_add(1, Ordering::SeqCst);
-                            (Some((host, port)), Some(mapping.clone()))
-                        } else {
-                            (Some((host, port)), None)
-                        }
-                    }
-                    None => (None, None),
+                // Fall back to default mapping if available
+                if let Some((idx, mapping)) = mappings
+                    .iter()
+                    .enumerate()
+                    .find(|(_, m)| m.domain_pattern == "default" || m.domain_pattern == "*")
+                {
+                    (
+                        Some((mapping.target_host.clone(), mapping.target_port)),
+                        Some(mapping.clone()),
+                    )
+                } else {
+                    (None, None)
                 }
             }
         } else {
-            // Fall back to IP-based routing if we can't extract database info
+            warn!("Could not extract database info, falling back to IP routing");
             match route_by_client_ip(&client_addr, &mappings) {
                 Some((host, port, idx)) => {
                     if let Some(mapping) = mappings.get(idx) {
-                        mapping.active_connections.fetch_add(1, Ordering::SeqCst);
                         (Some((host, port)), Some(mapping.clone()))
                     } else {
                         (Some((host, port)), None)
@@ -620,6 +632,7 @@ async fn handle_mongodb_connection(
         }
     };
 
+    // Handle the connection routing
     match backend {
         Some((host, port)) => {
             info!(
@@ -627,32 +640,38 @@ async fn handle_mongodb_connection(
                 client_addr, host, port
             );
 
-            match TcpStream::connect(format!("{}:{}", host, port)).await {
-                Ok(mut server_stream) => {
-                    if let Err(e) = server_stream.write_all(&buffer).await {
-                        // Decrease connection count on error
-                        if let Some(m) = &mapping {
-                            m.active_connections.fetch_sub(1, Ordering::SeqCst);
+            // Try to resolve the backend address first
+            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        match TcpStream::connect(addr).await {
+                            Ok(server_stream) => {
+                                // Connection successful, proceed with proxying
+                                if let Some(m) = &mapping {
+                                    m.active_connections.fetch_add(1, Ordering::SeqCst);
+                                }
+
+                                let result =
+                                    proxy_bidirectional(client_stream, server_stream).await;
+
+                                if let Some(m) = &mapping {
+                                    m.active_connections.fetch_sub(1, Ordering::SeqCst);
+                                }
+
+                                result
+                            }
+                            Err(e) => {
+                                error!("Failed to connect to resolved address {}: {}", addr, e);
+                                Err(format!("Connection failed: {}", e).into())
+                            }
                         }
-                        return Err(format!("Failed to write to server: {}", e).into());
+                    } else {
+                        Err("No addresses resolved for backend".into())
                     }
-
-                    let result = proxy_bidirectional(client_stream, server_stream).await;
-
-                    // Decrease connection count after proxy ends
-                    if let Some(m) = &mapping {
-                        m.active_connections.fetch_sub(1, Ordering::SeqCst);
-                    }
-
-                    result
                 }
                 Err(e) => {
-                    // Decrease connection count on error
-                    if let Some(m) = &mapping {
-                        m.active_connections.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    error!("Failed to connect to backend {}:{}: {}", host, port, e);
-                    Err(format!("Failed to connect to backend: {}", e).into())
+                    error!("Failed to resolve backend host {}: {}", host, e);
+                    Err(format!("DNS resolution failed: {}", e).into())
                 }
             }
         }
