@@ -221,7 +221,7 @@ impl SwarmDiscoveryService {
             vec!["com.koompi.proxy=true".to_string()],
         );
 
-        // Load recently deleted domains to avoid auto-readding them
+        // Load recently deleted domains
         let recently_deleted_file = PathBuf::from("/pingora-proxy/locks/recently_deleted.json");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -248,13 +248,6 @@ impl SwarmDiscoveryService {
             HashSet::new()
         };
 
-        if !recently_deleted.is_empty() {
-            info!(
-                "Found {} recently deleted domains that will be excluded from discovery",
-                recently_deleted.len()
-            );
-        }
-
         let services = self
             .docker_client
             .list_services(Some(ListServicesOptions {
@@ -266,7 +259,7 @@ impl SwarmDiscoveryService {
         let mut new_mappings = HashMap::new();
         let mut org_services = HashMap::new();
 
-        // Discover and collect services
+        // Process regular HTTP/HTTPS services
         for service in services {
             let service_spec = match service.spec {
                 Some(spec) => spec,
@@ -321,7 +314,61 @@ impl SwarmDiscoveryService {
             new_mappings.insert(domain, target);
         }
 
-        // Update the organization services tracking - carefully scope the mutex lock
+        // Add MongoDB service discovery
+        let mut mongo_filters: HashMap<String, Vec<String>> = HashMap::new();
+        mongo_filters.insert(
+            "label".to_string(),
+            vec!["com.koompi.database.mongodb=true".to_string()],
+        );
+
+        let mongo_services = self
+            .docker_client
+            .list_services(Some(ListServicesOptions {
+                filters: mongo_filters.clone(),
+                status: true,
+            }))
+            .await?;
+
+        // Process MongoDB services for direct TCP routing
+        for service in mongo_services {
+            let service_spec = match service.spec {
+                Some(spec) => spec,
+                None => continue,
+            };
+
+            // Get service labels
+            let labels = match service_spec.labels {
+                Some(labels) => labels,
+                None => continue,
+            };
+
+            // Get the service name and domain
+            let service_name = service_spec.name.unwrap_or_default();
+            let domain = match labels.get("com.koompi.database.domain") {
+                Some(domain) => domain.clone(),
+                None => {
+                    // Use service ID as domain if not specified
+                    match service.id {
+                        Some(id) => format!("{}.mongodb.koompi.cloud", id),
+                        None => continue,
+                    }
+                }
+            };
+
+            // Skip if this domain was recently manually deleted
+            if recently_deleted.contains(&domain) {
+                info!("Skipping recently deleted MongoDB domain: {}", domain);
+                continue;
+            }
+
+            // Create target using Docker Swarm DNS format
+            let target = format!("tasks.{}:27017", service_name.replace('.', "-"));
+
+            info!("Discovered MongoDB service: {} -> {}", domain, target);
+            new_mappings.insert(domain, target);
+        }
+
+        // Update the organization services tracking
         {
             if let Ok(mut org_networks) = self.org_networks.lock() {
                 for (org, services) in org_services.clone() {

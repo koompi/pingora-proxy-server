@@ -852,115 +852,51 @@ async fn handle_mongodb_connection(
     client_addr: SocketAddr,
     domain_mappings: Arc<Mutex<HashMap<String, DatabaseMapping>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // For MongoDB protocol, we need to read the message length first (first 4 bytes)
+    // Read a small buffer just to have something to start with
     let mut length_buffer = [0u8; 4];
 
-    // Read the message length
+    // Try to read at least the initial message length
     if let Err(e) = client_stream.read_exact(&mut length_buffer).await {
         return Err(Box::new(e));
     }
 
-    // Parse the message length (little-endian)
-    let message_length = u32::from_le_bytes(length_buffer);
-
-    // Ensure the message length is reasonable
-    if message_length < 16 || message_length > 48 * 1024 * 1024 {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid MongoDB message length: {}", message_length),
-        )));
-    }
-
-    // Allocate a buffer for the entire message
-    let mut buffer = vec![0u8; message_length as usize];
-
-    info!(
-        "First 100 bytes of MongoDB message: {:?}",
-        &buffer[0..100.min(buffer.len())]
-    );
-    if let Ok(str_data) = std::str::from_utf8(&buffer[16..]) {
-        info!(
-            "MongoDB message as string (first 200 chars): {}",
-            &str_data[0..200.min(str_data.len())]
-        );
-    }
-    // Copy the length bytes we already read
-    buffer[0..4].copy_from_slice(&length_buffer);
-
-    // Read the rest of the message
-    if let Err(e) = client_stream.read_exact(&mut buffer[4..]).await {
-        return Err(Box::new(e));
-    }
-
-    // MongoDB connection string extraction - more reliable approach
-    // Try multiple strategies to extract the hostname
-    let hostname = if let Some(h) = extract_hostname_from_mongodb_message(&buffer) {
-        info!(
-            "Successfully extracted hostname from MongoDB message: {}",
-            h
-        );
-        h
-    } else {
-        info!("Failed to extract hostname from MongoDB message, trying client address mapping");
-        if let Some(h) = extract_hostname_from_client_addr(&client_addr, &domain_mappings).await {
-            info!("Found hostname mapping for client address: {}", h);
-            h
-        } else {
-            info!("No hostname mapping found for client address, using default");
-            // Fall back to a default if available
-            let mappings = domain_mappings.lock().unwrap();
-            if let Some((default_host, _)) = mappings.iter().next() {
-                info!("Using default hostname: {}", default_host);
-                default_host.clone()
-            } else {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine target hostname and no default available",
-                )));
-            }
-        }
-    };
-
-    info!("Resolved MongoDB connection to hostname: {}", hostname);
-
-    // Look up the backend for this hostname
-    let backend = {
+    // Get all available mappings
+    let available_backends = {
         let mappings = domain_mappings.lock().unwrap();
 
-        // Try direct match first
-        if let Some(mapping) = mappings.get(&hostname) {
-            mapping.clone()
-        } else {
-            // Try domain suffix matching
-            let matching_domain = mappings
-                .keys()
-                .filter(|&domain| hostname.ends_with(domain))
-                .max_by_key(|domain| domain.len()) // Take the longest matching suffix
-                .and_then(|domain| mappings.get(domain).cloned());
+        // Log available mappings for debugging
+        info!("Available MongoDB mappings:");
+        for (domain, mapping) in mappings.iter() {
+            info!(
+                "  {} -> {}:{}",
+                domain, mapping.target_host, mapping.target_port
+            );
+        }
 
-            if let Some(mapping) = matching_domain {
-                mapping
-            } else {
-                // If no match found, take the first mapping as default (if any)
-                if let Some((_, mapping)) = mappings.iter().next() {
-                    info!("No specific mapping found for {}, using default", hostname);
-                    mapping.clone()
-                } else {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("No backend found for hostname: {}", hostname),
-                    )));
-                }
-            }
+        // Choose the default backend (first one in the list)
+        mappings.iter().next().map(|(d, m)| (d.clone(), m.clone()))
+    };
+
+    // Default to the first available mapping if we can't determine anything else
+    let (hostname, backend) = match available_backends {
+        Some((domain, mapping)) => {
+            info!(
+                "Using default MongoDB backend for {}: {}:{}",
+                domain, mapping.target_host, mapping.target_port
+            );
+            (domain, mapping)
+        }
+        None => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No MongoDB backends configured",
+            )));
         }
     };
 
     // Connect to the backend
     let backend_addr = format!("{}:{}", backend.target_host, backend.target_port);
-    info!(
-        "Routing connection from {} to backend: {}",
-        hostname, backend_addr
-    );
+    info!("Routing MongoDB connection to backend: {}", backend_addr);
 
     let mut server_stream = match TcpStream::connect(&backend_addr).await {
         Ok(stream) => stream,
@@ -971,87 +907,24 @@ async fn handle_mongodb_connection(
     };
 
     // Forward the initial message to the backend
+    let mut buffer = vec![0u8; 4];
+    buffer.copy_from_slice(&length_buffer);
+
     if let Err(e) = server_stream.write_all(&buffer).await {
         return Err(Box::new(e));
     }
 
-    // Now set up bidirectional proxy using existing streams
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut server_read, mut server_write) = tokio::io::split(server_stream);
+    // Now set up bidirectional proxy
+    info!("Setting up bidirectional proxy between client and MongoDB backend");
+    proxy_connection(client_stream, server_stream, backend.stats.clone()).await
+}
 
-    // Create a counter for tracking traffic
-    let bytes_counter = Arc::new(AtomicUsize::new(0));
-    let bytes_counter_clone = bytes_counter.clone();
-
-    // Client to server
-    let client_to_server = tokio::spawn(async move {
-        let mut buffer = vec![0; 16384];
-        let mut total_bytes = 0;
-
-        loop {
-            match client_read.read(&mut buffer).await {
-                Ok(0) => break, // Connection closed
-                Ok(n) => {
-                    if let Err(e) = server_write.write_all(&buffer[..n]).await {
-                        error!("Error writing to server: {}", e);
-                        break;
-                    }
-
-                    total_bytes += n;
-                    bytes_counter.fetch_add(n, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    error!("Error reading from client: {}", e);
-                    break;
-                }
-            }
-        }
-
-        info!("Client to server proxy ended, total bytes: {}", total_bytes);
-    });
-
-    // Server to client
-    let server_to_client = tokio::spawn(async move {
-        let mut buffer = vec![0; 16384];
-        let mut total_bytes = 0;
-
-        loop {
-            match server_read.read(&mut buffer).await {
-                Ok(0) => break, // Connection closed
-                Ok(n) => {
-                    if let Err(e) = client_write.write_all(&buffer[..n]).await {
-                        error!("Error writing to client: {}", e);
-                        break;
-                    }
-
-                    total_bytes += n;
-                }
-                Err(e) => {
-                    error!("Error reading from server: {}", e);
-                    break;
-                }
-            }
-        }
-
-        info!("Server to client proxy ended, total bytes: {}", total_bytes);
-    });
-
-    // Wait for either direction to complete
-    tokio::select! {
-        _ = client_to_server => {
-            info!("Client to server proxy completed first");
-        }
-        _ = server_to_client => {
-            info!("Server to client proxy completed first");
+async fn check_mongodb_health(target: &str) -> bool {
+    match TcpStream::connect(target).await {
+        Ok(_) => true,
+        Err(e) => {
+            error!("MongoDB health check failed for {}: {}", target, e);
+            false
         }
     }
-
-    // Log the total bytes transferred
-    let total_bytes = bytes_counter_clone.load(Ordering::Relaxed);
-    info!(
-        "Connection closed: {} <-> {}, total bytes: {}",
-        client_addr, backend_addr, total_bytes
-    );
-
-    Ok(())
 }
