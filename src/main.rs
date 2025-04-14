@@ -4,8 +4,6 @@ use services::letsencrypt::LetsEncryptService;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time::sleep;
 
 use config::file_manager::get_config;
 use config::model::{ConfigStore, MappingOrigin};
@@ -22,13 +20,15 @@ use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::metrics_service::MetricsService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
+use proxy::tcp::{TcpSniApp, TcpSniProxy};
+
 use rustls::crypto::ring::default_provider;
 
 const MAX_RETRIES: u32 = 3;
 
 async fn get_config_with_retry() -> Result<ConfigStore> {
-    let mut retries = 0;
-    let mut last_error = None;
+    let retries = 0;
+    let last_error = None;
 
     while retries < MAX_RETRIES {
         match get_config().await {
@@ -157,6 +157,30 @@ fn main() {
     server.add_service(http_service);
     server.add_service(manager_service);
 
+    // Create TCP SNI proxy service for MongoDB and other TCP protocols
+    let tcp_port = std::env::var("TCP_PORT")
+        .map(|p| p.parse::<u16>().unwrap_or(27017))
+        .unwrap_or(27017);
+
+    // Create the TCP SNI proxy service
+    let tcp_sni_proxy = proxy::tcp::TcpSniProxy::new(config_store.clone());
+    let tcp_app = proxy::tcp::TcpSniApp::new(tcp_sni_proxy);
+    let mut tcp_service =
+        pingora::services::listening::Service::new("TCP SNI Proxy".to_string(), tcp_app);
+
+    // Add TCP binding for the TCP SNI proxy
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tcp_service.add_tcp(&format!("0.0.0.0:{}", tcp_port));
+    })) {
+        Ok(_) => {
+            println!("TCP SNI proxy service configured on port {}", tcp_port);
+            server.add_service(tcp_service);
+        }
+        Err(e) => {
+            println!("Error binding TCP SNI proxy to port {}: {:?}", tcp_port, e);
+        }
+    }
+
     // Initialize Let's Encrypt service
     let certbot_dir = PathBuf::from("/certbot/letsencrypt");
     let email =
@@ -260,7 +284,7 @@ fn main() {
                                         &cert.cert_path,
                                         &cert.key_path,
                                     ) {
-                                        Ok(additional_tls) => {
+                                        Ok(_additional_tls) => {
                                             // We won't actually try to bind to the port again - this is just to register the cert for SNI
                                             println!("Added SNI certificate for {}", cert.domain);
                                             added += 1;
