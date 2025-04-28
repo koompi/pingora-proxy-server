@@ -23,7 +23,6 @@ use crate::{config::model::ConfigStore, metrics::PROXY_METRICS, proxy::utils::pa
 #[derive(Clone)]
 pub struct MongoDBProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
-    pub cert_dir: String,
 }
 
 /// Structure to hold the MongoDB proxy service
@@ -35,10 +34,7 @@ pub struct MongoDBProxyService {
 impl MongoDBProxyService {
     /// Create a new MongoDB proxy service
     pub fn new(servers: Arc<Mutex<ConfigStore>>, _conf: &ServerConf) -> Self {
-        let proxy = MongoDBProxy {
-            servers,
-            cert_dir: "/certbot/letsencrypt/live".to_string(),
-        };
+        let proxy = MongoDBProxy { servers };
 
         // Create a service with the proxy
         let mut service = Service::new("MongoDB Proxy Service".to_string(), proxy.clone());
@@ -291,8 +287,8 @@ impl MongoDBProxy {
 
     /// Handle duplex connection between client and server
     async fn handle_duplex(&self, mut client_stream: Stream, mut server_stream: Stream) {
-        let mut upstream_buf = [0; 8192];
-        let mut downstream_buf = [0; 8192];
+        let mut upstream_buf = [0; 16384]; // Larger buffer for MongoDB protocol
+        let mut downstream_buf = [0; 16384];
 
         // Track connection statistics
         let mut client_bytes_read = 0;
@@ -300,30 +296,75 @@ impl MongoDBProxy {
         let mut client_bytes_written = 0;
         let mut server_bytes_written = 0;
         let start_time = Instant::now();
+        let mut last_activity = Instant::now();
 
         info!("Starting MongoDB duplex connection");
 
-        loop {
-            let downstream_read = client_stream.read(&mut upstream_buf);
-            let upstream_read = server_stream.read(&mut downstream_buf);
+        // We can't easily set TCP_NODELAY on the Pingora Stream
+        // But that's okay, the default settings should work fine
 
-            let event: DuplexEvent;
-            select! {
-                n = downstream_read => event = DuplexEvent::DownstreamRead(n.unwrap_or(0)),
-                n = upstream_read => event = DuplexEvent::UpstreamRead(n.unwrap_or(0)),
+        // Set longer timeouts for MongoDB connections
+        let timeout_duration = Duration::from_secs(30);
+
+        loop {
+            // Check for inactivity timeout
+            if last_activity.elapsed() > timeout_duration {
+                info!(
+                    "MongoDB connection timed out after {} seconds of inactivity",
+                    timeout_duration.as_secs()
+                );
+                break;
             }
 
+            // Use select with timeout to avoid blocking forever
+            let downstream_read = tokio::time::timeout(
+                Duration::from_secs(5),
+                client_stream.read(&mut upstream_buf),
+            );
+            let upstream_read = tokio::time::timeout(
+                Duration::from_secs(5),
+                server_stream.read(&mut downstream_buf),
+            );
+
+            let event: Option<DuplexEvent> = select! {
+                result = downstream_read => match result {
+                    Ok(Ok(n)) => Some(DuplexEvent::DownstreamRead(n)),
+                    Ok(Err(e)) => {
+                        error!("Error reading from client: {}", e);
+                        None
+                    },
+                    Err(_) => {
+                        // Timeout, continue the loop
+                        continue;
+                    }
+                },
+                result = upstream_read => match result {
+                    Ok(Ok(n)) => Some(DuplexEvent::UpstreamRead(n)),
+                    Ok(Err(e)) => {
+                        error!("Error reading from server: {}", e);
+                        None
+                    },
+                    Err(_) => {
+                        // Timeout, continue the loop
+                        continue;
+                    }
+                },
+            };
+
+            // Update last activity timestamp
+            last_activity = Instant::now();
+
             match event {
-                DuplexEvent::DownstreamRead(0) => {
+                Some(DuplexEvent::DownstreamRead(0)) => {
                     info!(
                         "Client closed MongoDB connection after {:?}",
                         start_time.elapsed()
                     );
                     info!("Connection stats: client read: {} bytes, server read: {} bytes, client written: {} bytes, server written: {} bytes",
                           client_bytes_read, server_bytes_read, client_bytes_written, server_bytes_written);
-                    return;
+                    break;
                 }
-                DuplexEvent::UpstreamRead(0) => {
+                Some(DuplexEvent::UpstreamRead(0)) => {
                     info!(
                         "Server closed MongoDB connection after {:?}",
                         start_time.elapsed()
@@ -338,16 +379,10 @@ impl MongoDBProxy {
                         error!("2. Authentication failure - incorrect username/password");
                         error!("3. Network configuration issue - the server is configured to reject connections from this IP");
                         error!("4. MongoDB server is configured to only accept connections from specific IPs");
-
-                        // Suggest a retry with a longer timeout
-                        error!(
-                            "Try increasing connection timeout to at least {} seconds",
-                            Duration::from_secs(30).as_secs()
-                        );
                     }
-                    return;
+                    break;
                 }
-                DuplexEvent::DownstreamRead(n) => {
+                Some(DuplexEvent::DownstreamRead(n)) => {
                     client_bytes_read += n;
 
                     // Log first few bytes of client data for debugging
@@ -358,7 +393,7 @@ impl MongoDBProxy {
                             .map(|b| format!("{:#04x}", b))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        info!("First {} bytes from client: [{}]", log_bytes, bytes_str);
+                        debug!("Read {} bytes from client: [{}]", log_bytes, bytes_str);
                     }
 
                     debug!(
@@ -366,18 +401,31 @@ impl MongoDBProxy {
                         n, client_bytes_read
                     );
 
-                    if let Err(e) = server_stream.write_all(&upstream_buf[0..n]).await {
-                        error!("Error writing to server: {}", e);
-                        return;
+                    // Write to server with retry logic
+                    let mut bytes_written = 0;
+                    while bytes_written < n {
+                        match server_stream.write(&upstream_buf[bytes_written..n]).await {
+                            Ok(written) => {
+                                if written == 0 {
+                                    error!("Server write returned 0 bytes");
+                                    return;
+                                }
+                                bytes_written += written;
+                                server_bytes_written += written;
+                            }
+                            Err(e) => {
+                                error!("Error writing to server: {}", e);
+                                return;
+                            }
+                        }
                     }
-                    server_bytes_written += n;
 
                     if let Err(e) = server_stream.flush().await {
                         error!("Error flushing server stream: {}", e);
                         return;
                     }
                 }
-                DuplexEvent::UpstreamRead(n) => {
+                Some(DuplexEvent::UpstreamRead(n)) => {
                     server_bytes_read += n;
 
                     // Log first few bytes of server data for debugging
@@ -388,7 +436,7 @@ impl MongoDBProxy {
                             .map(|b| format!("{:#04x}", b))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        info!("First {} bytes from server: [{}]", log_bytes, bytes_str);
+                        debug!("Read {} bytes from server: [{}]", log_bytes, bytes_str);
                     }
 
                     debug!(
@@ -396,19 +444,43 @@ impl MongoDBProxy {
                         n, server_bytes_read
                     );
 
-                    if let Err(e) = client_stream.write_all(&downstream_buf[0..n]).await {
-                        error!("Error writing to client: {}", e);
-                        return;
+                    // Write to client with retry logic
+                    let mut bytes_written = 0;
+                    while bytes_written < n {
+                        match client_stream.write(&downstream_buf[bytes_written..n]).await {
+                            Ok(written) => {
+                                if written == 0 {
+                                    error!("Client write returned 0 bytes");
+                                    return;
+                                }
+                                bytes_written += written;
+                                client_bytes_written += written;
+                            }
+                            Err(e) => {
+                                error!("Error writing to client: {}", e);
+                                return;
+                            }
+                        }
                     }
-                    client_bytes_written += n;
 
                     if let Err(e) = client_stream.flush().await {
                         error!("Error flushing client stream: {}", e);
                         return;
                     }
                 }
+                None => {
+                    // Error occurred, exit the loop
+                    break;
+                }
             }
         }
+
+        // Log final connection statistics
+        info!("MongoDB connection closed after {:?}", start_time.elapsed());
+        info!(
+            "Final stats: client read: {} bytes, server read: {} bytes, client written: {} bytes, server written: {} bytes",
+            client_bytes_read, server_bytes_read, client_bytes_written, server_bytes_written
+        );
     }
 }
 
