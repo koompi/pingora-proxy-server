@@ -290,6 +290,15 @@ impl MongoDBProxy {
         let mut upstream_buf = [0; 8192];
         let mut downstream_buf = [0; 8192];
 
+        // Track connection statistics
+        let mut client_bytes_read = 0;
+        let mut server_bytes_read = 0;
+        let mut client_bytes_written = 0;
+        let mut server_bytes_written = 0;
+        let start_time = Instant::now();
+
+        info!("Starting MongoDB duplex connection");
+
         loop {
             let downstream_read = client_stream.read(&mut upstream_buf);
             let upstream_read = server_stream.read(&mut downstream_buf);
@@ -302,28 +311,78 @@ impl MongoDBProxy {
 
             match event {
                 DuplexEvent::DownstreamRead(0) => {
-                    debug!("Client closed connection");
+                    info!(
+                        "Client closed MongoDB connection after {:?}",
+                        start_time.elapsed()
+                    );
+                    info!("Connection stats: client read: {} bytes, server read: {} bytes, client written: {} bytes, server written: {} bytes",
+                          client_bytes_read, server_bytes_read, client_bytes_written, server_bytes_written);
                     return;
                 }
                 DuplexEvent::UpstreamRead(0) => {
-                    debug!("Server closed connection");
+                    info!(
+                        "Server closed MongoDB connection after {:?}",
+                        start_time.elapsed()
+                    );
+                    info!("Connection stats: client read: {} bytes, server read: {} bytes, client written: {} bytes, server written: {} bytes",
+                          client_bytes_read, server_bytes_read, client_bytes_written, server_bytes_written);
                     return;
                 }
                 DuplexEvent::DownstreamRead(n) => {
+                    client_bytes_read += n;
+
+                    // Log first few bytes of client data for debugging
+                    if client_bytes_read <= n && n > 0 {
+                        let log_bytes = std::cmp::min(n, 10);
+                        let bytes_str = upstream_buf[0..log_bytes]
+                            .iter()
+                            .map(|b| format!("{:#04x}", b))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        info!("First {} bytes from client: [{}]", log_bytes, bytes_str);
+                    }
+
+                    debug!(
+                        "Read {} bytes from client (total: {})",
+                        n, client_bytes_read
+                    );
+
                     if let Err(e) = server_stream.write_all(&upstream_buf[0..n]).await {
                         error!("Error writing to server: {}", e);
                         return;
                     }
+                    server_bytes_written += n;
+
                     if let Err(e) = server_stream.flush().await {
                         error!("Error flushing server stream: {}", e);
                         return;
                     }
                 }
                 DuplexEvent::UpstreamRead(n) => {
+                    server_bytes_read += n;
+
+                    // Log first few bytes of server data for debugging
+                    if server_bytes_read <= n && n > 0 {
+                        let log_bytes = std::cmp::min(n, 10);
+                        let bytes_str = downstream_buf[0..log_bytes]
+                            .iter()
+                            .map(|b| format!("{:#04x}", b))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        info!("First {} bytes from server: [{}]", log_bytes, bytes_str);
+                    }
+
+                    debug!(
+                        "Read {} bytes from server (total: {})",
+                        n, server_bytes_read
+                    );
+
                     if let Err(e) = client_stream.write_all(&downstream_buf[0..n]).await {
                         error!("Error writing to client: {}", e);
                         return;
                     }
+                    client_bytes_written += n;
+
                     if let Err(e) = client_stream.flush().await {
                         error!("Error flushing client stream: {}", e);
                         return;
@@ -347,7 +406,10 @@ impl ServerApp for MongoDBProxy {
         // Read the first chunk to extract SNI hostname
         let mut buf = [0; 8192];
         let n = match client_stream.read(&mut buf).await {
-            Ok(n) => n,
+            Ok(n) => {
+                info!("Read {} bytes from client for MongoDB connection", n);
+                n
+            }
             Err(e) => {
                 error!("Error reading from client: {}", e);
                 return None;
@@ -359,6 +421,32 @@ impl ServerApp for MongoDBProxy {
             return None;
         }
 
+        // Log the first few bytes for debugging
+        if n >= 5 {
+            info!("First 5 bytes of MongoDB connection: [{:#04x}, {:#04x}, {:#04x}, {:#04x}, {:#04x}]",
+                buf[0], buf[1], buf[2], buf[3], buf[4]);
+
+            // Check if this looks like a TLS ClientHello (should start with 0x16)
+            if buf[0] == 0x16 {
+                info!("Detected TLS ClientHello for MongoDB connection");
+
+                // Log TLS version if available
+                if n >= 7 {
+                    info!("TLS version: {}.{}", buf[1], buf[2]);
+
+                    // Log handshake type if available (should be 1 for ClientHello)
+                    if n >= 9 {
+                        info!("Handshake type: {}", buf[5]);
+                    }
+                }
+            } else {
+                info!(
+                    "Not a TLS ClientHello for MongoDB, first byte: {:#04x}",
+                    buf[0]
+                );
+            }
+        }
+
         // Extract SNI hostname
         let hostname = match Self::extract_sni_hostname(&buf[0..n]) {
             Some(hostname) => {
@@ -367,6 +455,18 @@ impl ServerApp for MongoDBProxy {
             }
             None => {
                 error!("Could not extract SNI hostname from MongoDB connection");
+
+                // Log more details about the failure
+                if n >= 5 && buf[0] == 0x16 {
+                    error!("Failed to extract SNI from what appears to be a TLS ClientHello");
+                    // Try to determine why SNI extraction failed
+                    if n < 50 {
+                        error!("ClientHello might be too short: {} bytes", n);
+                    }
+                } else {
+                    error!("Not a TLS ClientHello or malformed TLS message");
+                }
+
                 // Increment failed requests counter
                 PROXY_METRICS
                     .requests_total
@@ -398,20 +498,41 @@ impl ServerApp for MongoDBProxy {
 
                 // Create connection to the target
                 let server_addr = format!("{}:{}", host, port);
+                info!(
+                    "Attempting to connect to MongoDB backend at {}",
+                    server_addr
+                );
 
                 // Try to connect with the original host
+                let connect_start = Instant::now();
                 let connect_result = tokio::net::TcpStream::connect(&server_addr).await;
+                let connect_duration = connect_start.elapsed();
 
                 // If the original connection fails, try alternative connection methods
-                let server_stream = match connect_result {
+                let mut server_stream = match connect_result {
                     Ok(stream) => {
+                        info!(
+                            "Successfully connected to MongoDB backend {} in {:?}",
+                            server_addr, connect_duration
+                        );
+
+                        // Get peer address if possible
+                        if let Ok(peer_addr) = stream.peer_addr() {
+                            info!("Connected to peer address: {}", peer_addr);
+                        }
+
+                        // Get local address if possible
+                        if let Ok(local_addr) = stream.local_addr() {
+                            info!("Using local address: {}", local_addr);
+                        }
+
                         // Convert TcpStream to boxed Stream
                         Box::new(pingora::protocols::l4::stream::Stream::from(stream))
                     }
                     Err(e) => {
                         error!(
-                            "Failed to connect to MongoDB backend {}: {}",
-                            server_addr, e
+                            "Failed to connect to MongoDB backend {} after {:?}: {}",
+                            server_addr, connect_duration, e
                         );
 
                         // Try alternative connection methods if DNS resolution failed
@@ -490,7 +611,20 @@ impl ServerApp for MongoDBProxy {
                     }
                 };
 
-                // Handle the duplex connection
+                // Forward the initial ClientHello to the server
+                if let Err(e) = server_stream.write_all(&buf[0..n]).await {
+                    error!("Error forwarding initial ClientHello to server: {}", e);
+                    return None;
+                }
+
+                if let Err(e) = server_stream.flush().await {
+                    error!("Error flushing initial data to server: {}", e);
+                    return None;
+                }
+
+                info!("Successfully forwarded initial {} bytes to server", n);
+
+                // Handle the rest of the duplex connection
                 self.handle_duplex(client_stream, server_stream).await;
 
                 // Increment successful requests counter
