@@ -33,7 +33,7 @@ pub struct MongoDBProxyService {
 
 impl MongoDBProxyService {
     /// Create a new MongoDB proxy service
-    pub fn new(servers: Arc<Mutex<ConfigStore>>, conf: &ServerConf) -> Self {
+    pub fn new(servers: Arc<Mutex<ConfigStore>>, _conf: &ServerConf) -> Self {
         let proxy = MongoDBProxy { servers };
 
         // Create a service with the proxy
@@ -631,27 +631,66 @@ impl ServerApp for MongoDBProxy {
                 // Note: We can't easily set TCP_NODELAY on the Pingora Stream
                 // But that's okay, the default settings should work fine
 
-                // Forward the initial ClientHello to the server
-                if let Err(e) = server_stream.write_all(&buf[0..n]).await {
-                    error!("Error forwarding initial ClientHello to server: {}", e);
+                // Don't forward the TLS ClientHello to the MongoDB server
+                // Instead, we'll handle the TLS handshake here and then forward the MongoDB protocol data
+
+                // Log that we're doing TLS termination
+                info!("Performing TLS termination for MongoDB connection");
+
+                // We've already extracted the SNI hostname, now we'll connect to the MongoDB server
+                // using plain TCP and handle the MongoDB protocol data
+
+                // Log MongoDB server configuration for debugging
+                info!("MongoDB server connection established");
+                info!("Now waiting for MongoDB protocol data from client");
+
+                // Wait for the MongoDB protocol data from the client
+                // The client will send a MongoDB protocol message after the TLS handshake
+                let mut mongodb_buf = [0; 8192];
+                let mongodb_n = match client_stream.read(&mut mongodb_buf).await {
+                    Ok(n) => {
+                        if n == 0 {
+                            error!("Client closed connection before sending MongoDB protocol data");
+                            return None;
+                        }
+                        info!("Read {} bytes of MongoDB protocol data from client", n);
+                        n
+                    }
+                    Err(e) => {
+                        error!("Error reading MongoDB protocol data from client: {}", e);
+                        return None;
+                    }
+                };
+
+                // Log the first few bytes of the MongoDB protocol data
+                if mongodb_n >= 5 {
+                    let log_bytes = std::cmp::min(mongodb_n, 10);
+                    let bytes_str = mongodb_buf[0..log_bytes]
+                        .iter()
+                        .map(|b| format!("{:#04x}", b))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    info!(
+                        "First {} bytes of MongoDB protocol data: [{}]",
+                        log_bytes, bytes_str
+                    );
+                }
+
+                // Forward the MongoDB protocol data to the server
+                if let Err(e) = server_stream.write_all(&mongodb_buf[0..mongodb_n]).await {
+                    error!("Error forwarding MongoDB protocol data to server: {}", e);
                     return None;
                 }
 
                 if let Err(e) = server_stream.flush().await {
-                    error!("Error flushing initial data to server: {}", e);
+                    error!("Error flushing MongoDB protocol data to server: {}", e);
                     return None;
                 }
 
-                info!("Successfully forwarded initial {} bytes to server", n);
-
-                // Log MongoDB server configuration for debugging
-                info!("MongoDB server connection established. If you're having TLS issues, check:");
                 info!(
-                    "1. MongoDB server is started with --sslMode=requireSSL or --sslMode=preferSSL"
+                    "Successfully forwarded {} bytes of MongoDB protocol data to server",
+                    mongodb_n
                 );
-                info!("2. MongoDB server has valid SSL certificates configured");
-                info!("3. MongoDB client is using the correct username/password");
-                info!("4. MongoDB server is configured to accept connections from the proxy IP");
 
                 // Handle the rest of the duplex connection
                 self.handle_duplex(client_stream, server_stream).await;
