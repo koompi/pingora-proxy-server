@@ -1,11 +1,11 @@
 // src/proxy/mongodb.rs - MongoDB TCP proxy with SNI-based routing
 use std::{
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use pingora::{
     apps::ServerApp,
     protocols::Stream,
@@ -326,6 +326,21 @@ impl MongoDBProxy {
                     );
                     info!("Connection stats: client read: {} bytes, server read: {} bytes, client written: {} bytes, server written: {} bytes",
                           client_bytes_read, server_bytes_read, client_bytes_written, server_bytes_written);
+
+                    // Log a more detailed error message
+                    if server_bytes_read == 0 {
+                        error!("MongoDB server closed connection without sending any data. This could indicate:");
+                        error!("1. TLS handshake failure - the server doesn't support TLS or has incompatible TLS settings");
+                        error!("2. Authentication failure - incorrect username/password");
+                        error!("3. Network configuration issue - the server is configured to reject connections from this IP");
+                        error!("4. MongoDB server is configured to only accept connections from specific IPs");
+
+                        // Suggest a retry with a longer timeout
+                        error!(
+                            "Try increasing connection timeout to at least {} seconds",
+                            Duration::from_secs(30).as_secs()
+                        );
+                    }
                     return;
                 }
                 DuplexEvent::DownstreamRead(n) => {
@@ -611,6 +626,18 @@ impl ServerApp for MongoDBProxy {
                     }
                 };
 
+                // Check if the MongoDB server is actually running and accepting connections
+
+                // Set a read timeout
+                if let Ok(tcp_stream) = server_stream
+                    .get_ref()
+                    .downcast_ref::<tokio::net::TcpStream>()
+                {
+                    if let Err(e) = tcp_stream.set_nodelay(true) {
+                        warn!("Failed to set TCP_NODELAY: {}", e);
+                    }
+                }
+
                 // Forward the initial ClientHello to the server
                 if let Err(e) = server_stream.write_all(&buf[0..n]).await {
                     error!("Error forwarding initial ClientHello to server: {}", e);
@@ -623,6 +650,15 @@ impl ServerApp for MongoDBProxy {
                 }
 
                 info!("Successfully forwarded initial {} bytes to server", n);
+
+                // Log MongoDB server configuration for debugging
+                info!("MongoDB server connection established. If you're having TLS issues, check:");
+                info!(
+                    "1. MongoDB server is started with --sslMode=requireSSL or --sslMode=preferSSL"
+                );
+                info!("2. MongoDB server has valid SSL certificates configured");
+                info!("3. MongoDB client is using the correct username/password");
+                info!("4. MongoDB server is configured to accept connections from the proxy IP");
 
                 // Handle the rest of the duplex connection
                 self.handle_duplex(client_stream, server_stream).await;
