@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  stunnel:
+    image: stunnel/stunnel:latest
+    volumes:
+      - ./stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - /certbot/letsencrypt/live:/certs:ro
+      - /certbot/letsencrypt/archive:/archive:ro
+    ports:
+      - "27017:27017"
+    networks:
+      - proxy-network
+      - org_67f5328089fe29ee0784698a_overlay
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 5s
+    command: /bin/sh -c "stunnel"
+
+networks:
+  proxy-network:
+    external: true
+  org_67f5328089fe29ee0784698a_overlay:
+    external: true

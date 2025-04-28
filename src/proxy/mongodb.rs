@@ -23,6 +23,7 @@ use crate::{config::model::ConfigStore, metrics::PROXY_METRICS, proxy::utils::pa
 #[derive(Clone)]
 pub struct MongoDBProxy {
     pub servers: Arc<Mutex<ConfigStore>>,
+    pub cert_dir: String,
 }
 
 /// Structure to hold the MongoDB proxy service
@@ -34,7 +35,10 @@ pub struct MongoDBProxyService {
 impl MongoDBProxyService {
     /// Create a new MongoDB proxy service
     pub fn new(servers: Arc<Mutex<ConfigStore>>, _conf: &ServerConf) -> Self {
-        let proxy = MongoDBProxy { servers };
+        let proxy = MongoDBProxy {
+            servers,
+            cert_dir: "/certbot/letsencrypt/live".to_string(),
+        };
 
         // Create a service with the proxy
         let mut service = Service::new("MongoDB Proxy Service".to_string(), proxy.clone());
@@ -640,57 +644,57 @@ impl ServerApp for MongoDBProxy {
                 // We've already extracted the SNI hostname, now we'll connect to the MongoDB server
                 // using plain TCP and handle the MongoDB protocol data
 
-                // Log MongoDB server configuration for debugging
+                // Log MongoDB server connection established
                 info!("MongoDB server connection established");
-                info!("Now waiting for MongoDB protocol data from client");
 
-                // Wait for the MongoDB protocol data from the client
-                // The client will send a MongoDB protocol message after the TLS handshake
-                let mut mongodb_buf = [0; 8192];
-                let mongodb_n = match client_stream.read(&mut mongodb_buf).await {
+                // Now we need to tell the client that we're ready to receive MongoDB protocol data
+                // We do this by sending a simple message to the server
+                let test_message = b"ping";
+                if let Err(e) = server_stream.write_all(test_message).await {
+                    error!("Error sending test message to server: {}", e);
+                    return None;
+                }
+
+                if let Err(e) = server_stream.flush().await {
+                    error!("Error flushing test message to server: {}", e);
+                    return None;
+                }
+
+                info!("Sent test message to MongoDB server");
+
+                // Now we'll read the response from the server
+                let mut response_buf = [0; 8192];
+                let response_n = match server_stream.read(&mut response_buf).await {
                     Ok(n) => {
                         if n == 0 {
-                            error!("Client closed connection before sending MongoDB protocol data");
+                            error!("Server closed connection before sending response");
                             return None;
                         }
-                        info!("Read {} bytes of MongoDB protocol data from client", n);
+                        info!("Read {} bytes of response from MongoDB server", n);
                         n
                     }
                     Err(e) => {
-                        error!("Error reading MongoDB protocol data from client: {}", e);
+                        error!("Error reading response from MongoDB server: {}", e);
                         return None;
                     }
                 };
 
-                // Log the first few bytes of the MongoDB protocol data
-                if mongodb_n >= 5 {
-                    let log_bytes = std::cmp::min(mongodb_n, 10);
-                    let bytes_str = mongodb_buf[0..log_bytes]
+                // Log the first few bytes of the response
+                if response_n >= 5 {
+                    let log_bytes = std::cmp::min(response_n, 10);
+                    let bytes_str = response_buf[0..log_bytes]
                         .iter()
                         .map(|b| format!("{:#04x}", b))
                         .collect::<Vec<_>>()
                         .join(", ");
                     info!(
-                        "First {} bytes of MongoDB protocol data: [{}]",
+                        "First {} bytes of response from MongoDB server: [{}]",
                         log_bytes, bytes_str
                     );
                 }
 
-                // Forward the MongoDB protocol data to the server
-                if let Err(e) = server_stream.write_all(&mongodb_buf[0..mongodb_n]).await {
-                    error!("Error forwarding MongoDB protocol data to server: {}", e);
-                    return None;
-                }
-
-                if let Err(e) = server_stream.flush().await {
-                    error!("Error flushing MongoDB protocol data to server: {}", e);
-                    return None;
-                }
-
-                info!(
-                    "Successfully forwarded {} bytes of MongoDB protocol data to server",
-                    mongodb_n
-                );
+                // Now we'll start the duplex connection
+                info!("Starting duplex connection between client and MongoDB server");
 
                 // Handle the rest of the duplex connection
                 self.handle_duplex(client_stream, server_stream).await;

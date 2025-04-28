@@ -2009,7 +2009,7 @@ dependencies = [
  "prometheus",
  "rand 0.9.0",
  "regex",
- "rustls",
+ "rustls 0.23.23",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -2018,6 +2018,7 @@ dependencies = [
  "sha256",
  "thiserror 2.0.12",
  "tokio",
+ "tokio-rustls 0.25.0",
  "tower",
  "uuid",
 ]
@@ -2044,11 +2045,11 @@ dependencies = [
  "no_debug",
  "pingora-error",
  "ring",
- "rustls",
+ "rustls 0.23.23",
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
- "tokio-rustls",
+ "tokio-rustls 0.26.2",
 ]
 
 [[package]]
@@ -2368,6 +2369,20 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustls"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
+dependencies = [
+ "log",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2907,11 +2922,22 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775e0c0f0adb3a2f22a00c4745d728b479985fc15ee7ca6a2608388c5569860f"
+dependencies = [
+ "rustls 0.22.4",
+ "rustls-pki-types",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-rustls"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
 dependencies = [
- "rustls",
+ "rustls 0.23.23",
  "tokio",
 ]
 
@@ -3068,7 +3094,7 @@ dependencies = [
  "flate2",
  "log",
  "once_cell",
- "rustls",
+ "rustls 0.23.23",
  "rustls-pki-types",
  "url",
  "webpki-roots",
