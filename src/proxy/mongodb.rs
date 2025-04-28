@@ -635,63 +635,21 @@ impl ServerApp for MongoDBProxy {
                 // Note: We can't easily set TCP_NODELAY on the Pingora Stream
                 // But that's okay, the default settings should work fine
 
-                // Don't forward the TLS ClientHello to the MongoDB server
-                // Instead, we'll handle the TLS handshake here and then forward the MongoDB protocol data
-
-                // Log that we're doing TLS termination
-                info!("Performing TLS termination for MongoDB connection");
-
-                // We've already extracted the SNI hostname, now we'll connect to the MongoDB server
-                // using plain TCP and handle the MongoDB protocol data
-
-                // Log MongoDB server connection established
-                info!("MongoDB server connection established");
-
-                // Now we need to tell the client that we're ready to receive MongoDB protocol data
-                // We do this by sending a simple message to the server
-                let test_message = b"ping";
-                if let Err(e) = server_stream.write_all(test_message).await {
-                    error!("Error sending test message to server: {}", e);
+                // Forward the ClientHello to the MongoDB server
+                if let Err(e) = server_stream.write_all(&buf[0..n]).await {
+                    error!("Error forwarding ClientHello to server: {}", e);
                     return None;
                 }
 
                 if let Err(e) = server_stream.flush().await {
-                    error!("Error flushing test message to server: {}", e);
+                    error!("Error flushing ClientHello to server: {}", e);
                     return None;
                 }
 
-                info!("Sent test message to MongoDB server");
+                info!("Successfully forwarded initial {} bytes to server", n);
 
-                // Now we'll read the response from the server
-                let mut response_buf = [0; 8192];
-                let response_n = match server_stream.read(&mut response_buf).await {
-                    Ok(n) => {
-                        if n == 0 {
-                            error!("Server closed connection before sending response");
-                            return None;
-                        }
-                        info!("Read {} bytes of response from MongoDB server", n);
-                        n
-                    }
-                    Err(e) => {
-                        error!("Error reading response from MongoDB server: {}", e);
-                        return None;
-                    }
-                };
-
-                // Log the first few bytes of the response
-                if response_n >= 5 {
-                    let log_bytes = std::cmp::min(response_n, 10);
-                    let bytes_str = response_buf[0..log_bytes]
-                        .iter()
-                        .map(|b| format!("{:#04x}", b))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    info!(
-                        "First {} bytes of response from MongoDB server: [{}]",
-                        log_bytes, bytes_str
-                    );
-                }
+                // Log MongoDB server connection established
+                info!("MongoDB server connection established");
 
                 // Now we'll start the duplex connection
                 info!("Starting duplex connection between client and MongoDB server");
