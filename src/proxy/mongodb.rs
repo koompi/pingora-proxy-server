@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use pingora::{
     apps::ServerApp,
     protocols::Stream,
@@ -628,15 +628,8 @@ impl ServerApp for MongoDBProxy {
 
                 // Check if the MongoDB server is actually running and accepting connections
 
-                // Set a read timeout
-                if let Ok(tcp_stream) = server_stream
-                    .get_ref()
-                    .downcast_ref::<tokio::net::TcpStream>()
-                {
-                    if let Err(e) = tcp_stream.set_nodelay(true) {
-                        warn!("Failed to set TCP_NODELAY: {}", e);
-                    }
-                }
+                // Note: We can't easily set TCP_NODELAY on the Pingora Stream
+                // But that's okay, the default settings should work fine
 
                 // Forward the initial ClientHello to the server
                 if let Err(e) = server_stream.write_all(&buf[0..n]).await {
