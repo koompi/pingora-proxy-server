@@ -27,7 +27,7 @@ pub struct MongoDBProxy {
 
 /// Structure to hold the MongoDB proxy service
 pub struct MongoDBProxyService {
-    proxy: MongoDBProxy,
+    _proxy: MongoDBProxy, // Renamed to _proxy to indicate it's intentionally unused
     service: Service<MongoDBProxy>,
 }
 
@@ -42,7 +42,10 @@ impl MongoDBProxyService {
         // Add TCP listener on the MongoDB port
         service.add_tcp("0.0.0.0:27017");
 
-        Self { proxy, service }
+        Self {
+            _proxy: proxy,
+            service,
+        }
     }
 
     /// Get the service
@@ -55,6 +58,88 @@ impl MongoDBProxyService {
 enum DuplexEvent {
     DownstreamRead(usize),
     UpstreamRead(usize),
+}
+
+/// Try to get the IP address of a Docker service
+fn try_get_service_ip(service_name: &str) -> Option<String> {
+    // Use the Docker API to get the service IP
+    // This requires the proxy to have access to the Docker socket
+    let output = match std::process::Command::new("docker")
+        .args(&["service", "ps", "--format", "{{.Node}}", service_name])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            error!("Failed to execute docker command: {}", e);
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        error!(
+            "Docker command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+
+    // Parse the output to get the node name
+    let node_name = match String::from_utf8(output.stdout) {
+        Ok(stdout) => {
+            let lines: Vec<&str> = stdout.trim().lines().collect();
+            if lines.is_empty() {
+                error!("No nodes found for service {}", service_name);
+                return None;
+            }
+            lines[0].to_string()
+        }
+        Err(e) => {
+            error!("Failed to parse docker command output: {}", e);
+            return None;
+        }
+    };
+
+    // Now get the IP address of the node
+    let output = match std::process::Command::new("docker")
+        .args(&[
+            "node",
+            "inspect",
+            "--format",
+            "{{.Status.Addr}}",
+            &node_name,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            error!("Failed to execute docker node inspect command: {}", e);
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        error!(
+            "Docker node inspect command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+
+    // Parse the output to get the IP address
+    match String::from_utf8(output.stdout) {
+        Ok(stdout) => {
+            let ip = stdout.trim();
+            if ip.is_empty() {
+                error!("No IP address found for node {}", node_name);
+                return None;
+            }
+            Some(ip.to_string())
+        }
+        Err(e) => {
+            error!("Failed to parse docker node inspect output: {}", e);
+            None
+        }
+    }
 }
 
 impl MongoDBProxy {
@@ -257,7 +342,7 @@ impl ServerApp for MongoDBProxy {
         _shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         // Start timing the request
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
 
         // Read the first chunk to extract SNI hostname
         let mut buf = [0; 8192];
@@ -308,12 +393,17 @@ impl ServerApp for MongoDBProxy {
                 info!("Routing MongoDB request to backend: {}", to);
 
                 // Handle Swarm service discovery
-                let (host, port, org_id) = parse_swarm_target(&to);
+                let (host, port, _org_id) = parse_swarm_target(&to);
                 info!("Using Swarm DNS target: {}", host);
 
                 // Create connection to the target
                 let server_addr = format!("{}:{}", host, port);
-                let server_stream = match tokio::net::TcpStream::connect(&server_addr).await {
+
+                // Try to connect with the original host
+                let connect_result = tokio::net::TcpStream::connect(&server_addr).await;
+
+                // If the original connection fails, try alternative connection methods
+                let server_stream = match connect_result {
                     Ok(stream) => {
                         // Convert TcpStream to boxed Stream
                         Box::new(pingora::protocols::l4::stream::Stream::from(stream))
@@ -323,12 +413,80 @@ impl ServerApp for MongoDBProxy {
                             "Failed to connect to MongoDB backend {}: {}",
                             server_addr, e
                         );
-                        // Increment failed requests counter
-                        PROXY_METRICS
-                            .requests_total
-                            .with_label_values(&[&hostname, "502"])
-                            .inc();
-                        return None;
+
+                        // Try alternative connection methods if DNS resolution failed
+                        if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                            || e.kind() == std::io::ErrorKind::Other
+                                && e.to_string().contains("lookup")
+                        {
+                            // Try direct connection to the service without 'tasks.' prefix
+                            let service_name = if host.starts_with("tasks.") {
+                                host[6..].to_string() // Remove "tasks." prefix
+                            } else {
+                                host.clone()
+                            };
+
+                            let alt_addr = format!("{}:{}", service_name, port);
+                            info!("Trying alternative connection to: {}", alt_addr);
+
+                            match tokio::net::TcpStream::connect(&alt_addr).await {
+                                Ok(stream) => {
+                                    info!(
+                                        "Successfully connected to alternative address: {}",
+                                        alt_addr
+                                    );
+                                    Box::new(pingora::protocols::l4::stream::Stream::from(stream))
+                                }
+                                Err(alt_e) => {
+                                    error!("Alternative connection also failed: {}", alt_e);
+
+                                    // Try one more approach - try to find the IP directly from Docker
+                                    // This requires the proxy to have access to the Docker socket
+                                    if let Some(ip) = try_get_service_ip(&service_name) {
+                                        let ip_addr = format!("{}:{}", ip, port);
+                                        info!("Trying direct IP connection to: {}", ip_addr);
+
+                                        match tokio::net::TcpStream::connect(&ip_addr).await {
+                                            Ok(stream) => {
+                                                info!(
+                                                    "Successfully connected to IP address: {}",
+                                                    ip_addr
+                                                );
+                                                Box::new(
+                                                    pingora::protocols::l4::stream::Stream::from(
+                                                        stream,
+                                                    ),
+                                                )
+                                            }
+                                            Err(ip_e) => {
+                                                error!("IP connection also failed: {}", ip_e);
+
+                                                // All attempts failed
+                                                PROXY_METRICS
+                                                    .requests_total
+                                                    .with_label_values(&[&hostname, "502"])
+                                                    .inc();
+                                                return None;
+                                            }
+                                        }
+                                    } else {
+                                        // Couldn't get IP, all attempts failed
+                                        PROXY_METRICS
+                                            .requests_total
+                                            .with_label_values(&[&hostname, "502"])
+                                            .inc();
+                                        return None;
+                                    }
+                                }
+                            }
+                        } else {
+                            // For other types of errors, just fail
+                            PROXY_METRICS
+                                .requests_total
+                                .with_label_values(&[&hostname, "502"])
+                                .inc();
+                            return None;
+                        }
                     }
                 };
 
