@@ -351,12 +351,9 @@ impl CertificateIssuer {
 
         println!("Issuing certificate for: {}", domain);
 
-        // Build certbot command - use webroot directly, don't try to handle tokens yourself
+        // Build certbot command with common arguments
         let mut cmd = Command::new("certbot");
         cmd.arg("certonly")
-            .arg("--webroot")
-            .arg("-w")
-            .arg("/var/www/html")
             .arg("--email")
             .arg(email)
             .arg("--agree-tos")
