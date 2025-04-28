@@ -34,7 +34,7 @@ scrape_configs:
   # Add Docker metrics if you're using Docker
   - job_name: "docker"
     static_configs:
-      - targets: ["localhost:9323"]  # For Docker for Mac
+      - targets: ["docker.for.mac.host.internal:9323"]  # For Docker for Mac
         # For Linux, use: ["localhost:9323"]
 
   # Add Node Exporter metrics if you have it installed
