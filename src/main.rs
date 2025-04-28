@@ -22,6 +22,7 @@ use crate::services::docker_swarm::SwarmDiscoveryService;
 use crate::services::metrics_service::MetricsService;
 use proxy::http::HttpProxy;
 use proxy::manager::ManagerProxy;
+use proxy::mongodb::MongoDBProxyService;
 use rustls::crypto::ring::default_provider;
 
 const MAX_RETRIES: u32 = 3;
@@ -346,10 +347,23 @@ fn main() {
         }
     }
 
+    // Add MongoDB proxy service if enabled
+    let mongodb_enabled = std::env::var("ENABLE_MONGODB_PROXY")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if mongodb_enabled {
+        // Create and add MongoDB proxy service
+        let mongodb_service = MongoDBProxyService::new(config_store.clone(), &server.configuration);
+        server.add_service(mongodb_service.service());
+        println!("MongoDB proxy service added on port 27017");
+    }
+
     // Add more detailed logging before server start
     println!("Starting server with the following configuration:");
     println!("- SSL Enabled: {}", !disable_ssl);
     println!("- Swarm Mode: {}", swarm_mode);
+    println!("- MongoDB Proxy: {}", mongodb_enabled);
 
     // Start the server with run_forever
     println!("Starting server with configured services");

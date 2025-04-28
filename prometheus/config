@@ -1,0 +1,43 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: "prometheus"
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Scrape configuration for the Pingora proxy
+  - job_name: "pingora-proxy"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["proxy:9100"]
+        labels:
+          instance: "proxy"
+
+  # Add Docker metrics if you're using Docker
+  - job_name: "docker"
+    static_configs:
+      - targets: ["localhost:9323"]  # For Docker for Mac
+        # For Linux, use: ["localhost:9323"]
+
+  # Add Node Exporter metrics if you have it installed
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]

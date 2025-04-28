@@ -16,6 +16,7 @@ services:
       - "443:443"
       - "81:81"
       - "9100:9100"
+      - "27017:27017"
     networks:
       - proxy-network
     volumes:
@@ -50,6 +51,7 @@ services:
       - CONFIG_REFRESH_INTERVAL=30
       - DISTRIBUTED_LOCK_TTL=60
       - HOSTNAME_FOR_LOCKS=${HOSTNAME}
+      - ENABLE_MONGODB_PROXY=true
       # Add this to use local lock directory
       - LOCK_DIR=/pingora-proxy/local-locks
     deploy:

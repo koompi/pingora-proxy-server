@@ -19,6 +19,7 @@ This project implements a high-performance reverse proxy built with [Pingora](ht
 ### Key Features
 
 - **HTTP/HTTPS Proxying**: Route traffic to backend services based on hostname
+- **TCP/MongoDB Proxying**: Route MongoDB connections (port 27017) based on SNI hostname
 - **Dynamic Configuration**: Update routing rules without restarting the proxy
 - **Automatic TLS**: Integration with Let's Encrypt for automatic certificate issuance
 - **Zero-Downtime Certificate Reloading**: Update SSL certificates without service interruption
@@ -77,6 +78,48 @@ The proxy integrates with Let's Encrypt to automatically obtain and renew TLS ce
 ### Zero-Downtime Certificate Reloading
 
 The proxy supports reloading SSL certificates without service interruption, ensuring continuous availability during certificate renewals. When a new certificate is issued or updated, it's automatically propagated to all nodes in the swarm.
+
+## 🍃 MongoDB Proxy
+
+The proxy supports routing MongoDB connections (port 27017) based on SNI hostname, allowing multiple MongoDB instances to be served on a single port. This works similar to how HTTP routing works on ports 80/443.
+
+### How It Works
+
+1. MongoDB clients connect to the proxy on port 27017 using TLS
+2. The proxy extracts the SNI hostname from the TLS handshake
+3. Based on the hostname, the proxy routes the connection to the appropriate backend MongoDB server
+4. The same configuration used for HTTP/HTTPS routing is used for MongoDB routing
+
+### Example Configuration
+
+```json
+{
+  "servers": [
+    {
+      "from": "mongodb1.example.com",
+      "to": "internal-mongodb1:27017",
+      "origin": "Manual"
+    },
+    {
+      "from": "mongodb2.example.com",
+      "to": "internal-mongodb2:27017",
+      "origin": "Manual"
+    }
+  ]
+}
+```
+
+### Client Connection Example
+
+```
+mongodb://username:password@mongodb1.example.com:27017/database?ssl=true
+```
+
+### Requirements
+
+- MongoDB clients must use TLS/SSL connections
+- Clients must support SNI (Server Name Indication)
+- Enable the MongoDB proxy with `ENABLE_MONGODB_PROXY=true`
 
 ## 🛠️ API Reference
 
@@ -154,9 +197,10 @@ The proxy consists of several key components:
 
 1. **HTTP Proxy**: Handles HTTP traffic and Let's Encrypt challenges
 2. **HTTPS Proxy**: Handles HTTPS traffic with TLS termination
-3. **Manager Proxy**: Provides the configuration API
-4. **Certificate Watcher Service**: Monitors and reloads certificates across nodes
-5. **Swarm Discovery Service**: Automatically detects services in Docker Swarm mode
+3. **MongoDB Proxy**: Routes MongoDB connections based on SNI hostname
+4. **Manager Proxy**: Provides the configuration API
+5. **Certificate Watcher Service**: Monitors and reloads certificates across nodes
+6. **Swarm Discovery Service**: Automatically detects services in Docker Swarm mode
 
 ## 📊 Advanced Features
 
@@ -235,15 +279,16 @@ docker buildx build --platform linux/amd64,linux/arm64 -t localhost:5000/library
 
 ### Environment Variables
 
-| Variable             | Description                     | Default                       |
-| -------------------- | ------------------------------- | ----------------------------- |
-| `DOCKER_ENDPOINT`    | Docker API endpoint             | `unix:///var/run/docker.sock` |
-| `SWARM_MODE`         | Enable Docker Swarm discovery   | `false`                       |
-| `SWARM_NETWORKS`     | Networks to check for services  | `ingress`                     |
-| `LOG_LEVEL`          | Logging verbosity               | `info`                        |
-| `CONFIG_PATH`        | Path to configuration file      | `/app/config/config.json`     |
-| `DISABLE_SSL`        | Disable SSL/TLS functionality   | `false`                       |
-| `PROXY_SERVICE_NAME` | Docker service name for updates | `proxy_proxy`                 |
+| Variable               | Description                     | Default                       |
+| ---------------------- | ------------------------------- | ----------------------------- |
+| `DOCKER_ENDPOINT`      | Docker API endpoint             | `unix:///var/run/docker.sock` |
+| `SWARM_MODE`           | Enable Docker Swarm discovery   | `false`                       |
+| `SWARM_NETWORKS`       | Networks to check for services  | `ingress`                     |
+| `LOG_LEVEL`            | Logging verbosity               | `info`                        |
+| `CONFIG_PATH`          | Path to configuration file      | `/app/config/config.json`     |
+| `DISABLE_SSL`          | Disable SSL/TLS functionality   | `false`                       |
+| `ENABLE_MONGODB_PROXY` | Enable MongoDB proxy on 27017   | `false`                       |
+| `PROXY_SERVICE_NAME`   | Docker service name for updates | `proxy_proxy`                 |
 
 ## 📝 License
 
