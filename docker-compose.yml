@@ -55,9 +55,8 @@ services:
     deploy:
       mode: replicated
       replicas: 1
-      placement:
-        constraints:
-          - node.hostname == wg2
+      constraints:
+        - node.hostname == wg2
       update_config:
         parallelism: 1
         delay: 10s
