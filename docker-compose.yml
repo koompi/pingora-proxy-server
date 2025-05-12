@@ -55,8 +55,9 @@ services:
     deploy:
       mode: replicated
       replicas: 1
-      constraints:
-        - node.hostname == wg2
+      placement:
+        constraints:
+          - node.hostname == wg2
       update_config:
         parallelism: 1
         delay: 10s
@@ -66,8 +67,6 @@ services:
         condition: any
         delay: 5s
       endpoint_mode: vip
-      placement:
-        max_replicas_per_node: 1
     configs:
       - source: proxy-security-policy
         target: /etc/security-policy.json
