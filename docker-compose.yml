@@ -54,7 +54,10 @@ services:
       - LOCK_DIR=/pingora-proxy/local-locks
     deploy:
       mode: replicated
-      replicas: 3
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == wg2
       update_config:
         parallelism: 1
         delay: 10s
@@ -105,7 +108,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.role == manager
+          - node.hostname == wg2
       resources:
         limits:
           memory: 512M
